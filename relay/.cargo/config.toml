@@ -13,7 +13,11 @@
 # If a future workerd ever rejects one of these, the worker would fail to
 # instantiate (a clean error, not silent corruption) — verify with `wrangler dev`
 # / `deploy --dry-run` after changing.
+# `+reference-types` (and `+multivalue`) are also required since worker-build
+# 0.8.5 / wasm-bindgen 0.2.127: the `--force-enable-abort-handler` catch-wrapper
+# pass needs the externref intrinsics, which are only emitted when the module is
+# compiled with reference-types enabled. workerd/V8 supports both features.
 [target.wasm32-unknown-unknown]
 rustflags = [
-    "-C", "target-feature=+bulk-memory,+sign-ext,+nontrapping-fptoint,+mutable-globals,+simd128",
+    "-C", "target-feature=+bulk-memory,+sign-ext,+nontrapping-fptoint,+mutable-globals,+simd128,+reference-types,+multivalue",
 ]

@@ -60,7 +60,11 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+# Do NOT strip: wasm-bindgen ≥ 0.2.125 detects `+reference-types` from the
+# `target_features` custom section and refuses to generate its abort-handler
+# catch wrappers without it (`externref table required for catch wrappers`).
+# `strip = true` removes that section. wasm-opt still drops debug info below.
+strip = false
 
 [profile.release.package."*"]
 opt-level = 3
