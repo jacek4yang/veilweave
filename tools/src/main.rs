@@ -1,6 +1,6 @@
+use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand, ValueEnum};
-use base64::{Engine as _, engine::general_purpose};
-use rand::{RngCore, seq::SliceRandom};
+use rand::{seq::SliceRandom, RngCore};
 use std::net::Ipv4Addr;
 
 mod codec;
@@ -13,8 +13,9 @@ use codec::UuidCodec;
 #[command(name = "veilweave-tools")]
 #[command(about = "VLESS subscription link generator for veilweave")]
 struct Cli {
+    /// No subcommand (e.g. double-clicking the .exe) runs `bundle` with defaults.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -52,6 +53,24 @@ enum Commands {
     /// sub blob (public key) goes in veilweave-sub's `VEILWEAVE_NODES` as
     /// `domain|<blob>`. Same single-value fill as before — just paste each blob.
     GenSecret,
+    /// Pack the prebuilt workers (shipped next to this binary in `bundle/`) into
+    /// ready-to-deploy folders: fresh secrets, randomized worker names, and a
+    /// per-run nonce injected into each script so every user's artifact is unique.
+    /// No Rust toolchain or source build required — just `wrangler deploy`.
+    Bundle {
+        /// Output directory for the generated deploy folders
+        #[arg(long, default_value = "dist")]
+        out: String,
+        /// Domain of the relay worker, e.g. veilweave.<sub>.workers.dev.
+        /// Defaults to "<relay-name>.<your-subdomain>.workers.dev" — edit
+        /// VEILWEAVE_NODES in the generated sub/wrangler.toml after deploying.
+        #[arg(long)]
+        relay_domain: Option<String>,
+        /// Directory containing the prebuilt workers. Defaults to `bundle/`
+        /// next to the executable (as shipped in the release archive).
+        #[arg(long)]
+        bundle_dir: Option<String>,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -64,7 +83,25 @@ enum ProxyType {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    // Double-click (no subcommand) defaults to `bundle` — that is the path
+    // release-archive users take.
+    let command = cli.command.unwrap_or(Commands::Bundle {
+        out: "dist".to_string(),
+        relay_domain: None,
+        bundle_dir: None,
+    });
+    let pause = matches!(command, Commands::Bundle { .. });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(command)));
+    if pause {
+        pause_before_exit();
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run(command: Commands) {
+    match command {
         Commands::GenLink {
             address,
             port,
@@ -151,6 +188,215 @@ fn main() {
             println!("# ── veilweave-sub ──  use in  VEILWEAVE_NODES  as  <domain>|<blob>:");
             println!("{sub}");
         }
+        Commands::Bundle {
+            out,
+            relay_domain,
+            bundle_dir,
+        } => {
+            run_bundle(&out, relay_domain.as_deref(), bundle_dir.as_deref());
+        }
+    }
+}
+
+// ─── bundle: pack prebuilt workers into ready-to-deploy folders ─────────────────
+
+/// End-to-end "no source build" path. Copies the prebuilt worker bundles shipped
+/// next to the binary, generates fresh secrets, randomizes worker names, and
+/// injects a per-run nonce comment into each `index.js` so every user's artifact
+/// has a unique content hash.
+fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>) {
+    use std::path::{Path, PathBuf};
+
+    let bundle_root: PathBuf = match bundle_dir {
+        Some(d) => PathBuf::from(d),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("bundle")))
+            .unwrap_or_else(|| PathBuf::from("bundle")),
+    };
+    for unit in ["relay", "sub"] {
+        let src = bundle_root.join(unit);
+        if !src.join("build/index.js").is_file() {
+            eprintln!(
+                "error: prebuilt worker not found at {}\n\
+                 Download the full release archive (it contains bundle/{unit}/) or pass --bundle-dir.",
+                src.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Fresh matched secrets: relay blob (X25519 private) + sub blob (public).
+    let (relay_blob, sub_blob) = gen_secret_pair();
+    let token = generate_hex_id(32);
+    let relay_name = random_worker_name();
+    let sub_name = random_worker_name();
+    let relay_domain = relay_domain
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{relay_name}.<your-subdomain>.workers.dev"));
+
+    let out_root = Path::new(out);
+    let relay_out = out_root.join(&relay_name);
+    let sub_out = out_root.join(&sub_name);
+
+    pack_worker(&bundle_root.join("relay"), &relay_out);
+    pack_worker(&bundle_root.join("sub"), &sub_out);
+
+    std::fs::write(
+        relay_out.join("wrangler.toml"),
+        relay_wrangler_toml(&relay_name, &relay_blob),
+    )
+    .expect("write relay wrangler.toml");
+    std::fs::write(
+        sub_out.join("wrangler.toml"),
+        sub_wrangler_toml(&sub_name, &relay_domain, &sub_blob, &token),
+    )
+    .expect("write sub wrangler.toml");
+
+    println!(
+        "✔ Generated deploy-ready workers in {}/",
+        out_root.display()
+    );
+    println!();
+    println!(
+        "  relay  →  {}  (worker name: {relay_name})",
+        relay_out.display()
+    );
+    println!(
+        "  sub    →  {}  (worker name: {sub_name})",
+        sub_out.display()
+    );
+    println!();
+    println!("Next steps:");
+    println!("  1. cd {} && wrangler deploy", relay_out.display());
+    println!("     → note the https://<name>.<your-subdomain>.workers.dev domain");
+    println!(
+        "  2. Edit {}/wrangler.toml: set VEILWEAVE_NODES domain to that domain,",
+        sub_out.display()
+    );
+    println!("     then run:  wrangler kv:namespace create VEILWEAVE_KV");
+    println!("     and paste the printed id into [[kv_namespaces]].id");
+    println!("  3. cd {} && wrangler deploy", sub_out.display());
+    println!("  4. Subscription URL:  https://<sub-domain>/sub?token={token}");
+    println!();
+    println!("Every run randomizes worker names and re-signs the scripts, so your");
+    println!("deployment never shares a content hash with anyone else's.");
+}
+
+/// Copy the prebuilt worker (`build/`) into `dst` and inject a random nonce
+/// comment at the top of `index.js` (per-run unique content hash).
+fn pack_worker(src: &std::path::Path, dst: &std::path::Path) {
+    copy_dir(&src.join("build"), &dst.join("build"));
+    let index = dst.join("build/index.js");
+    let js = std::fs::read_to_string(&index).expect("read build/index.js");
+    let nonce = generate_hex_id(64);
+    std::fs::write(&index, format!("/* vw:{nonce} */\n{js}")).expect("write build/index.js");
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).expect("create output dir");
+    for entry in std::fs::read_dir(src).expect("read bundle dir") {
+        let entry = entry.expect("read bundle entry");
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy bundle file");
+        }
+    }
+}
+
+fn gen_secret_pair() -> (String, String) {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let mut uuid_secret = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut uuid_secret);
+    let x = StaticSecret::random_from_rng(rand::thread_rng());
+    let relay = encode_blob(0, &uuid_secret, &x.to_bytes());
+    let sub = encode_blob(1, &uuid_secret, &PublicKey::from(&x).to_bytes());
+    (relay, sub)
+}
+
+/// Random, innocuous worker name — a new one every run.
+fn random_worker_name() -> String {
+    use rand::Rng;
+    const WORDS: &[&str] = &[
+        "edge", "api", "cdn", "cache", "media", "data", "sync", "hub", "core", "node", "link",
+        "stream", "relay", "proxy", "gate", "mesh", "orbit",
+    ];
+    const KINDS: &[&str] = &[
+        "service", "worker", "backend", "endpoint", "gateway", "bridge", "feed",
+    ];
+    let mut rng = rand::thread_rng();
+    format!(
+        "{}-{}-{}",
+        WORDS[rng.gen_range(0..WORDS.len())],
+        KINDS[rng.gen_range(0..KINDS.len())],
+        generate_hex_id(4)
+    )
+}
+
+fn relay_wrangler_toml(name: &str, relay_blob: &str) -> String {
+    format!(
+        r#"name = "{name}"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[observability]
+enabled = true
+
+# Generated by `veilweave-tools bundle`. SECRET_KEY is the relay blob — it carries
+# the UUID-signing secret AND the X25519 private key for VLESS Encryption
+# (mlkem768x25519plus). Keep it private; regenerate with a fresh bundle if leaked.
+[vars]
+SECRET_KEY = "{relay_blob}"
+
+[[durable_objects.bindings]]
+name = "VEILWEAVE_SESSION"
+class_name = "VeilweaveSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VeilweaveSession"]
+"#
+    )
+}
+
+fn sub_wrangler_toml(name: &str, relay_domain: &str, sub_blob: &str, token: &str) -> String {
+    format!(
+        r#"name = "{name}"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Run:  wrangler kv:namespace create VEILWEAVE_KV   and paste the id below.
+[[kv_namespaces]]
+binding = "VEILWEAVE_KV"
+id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# <relay domain>|<sub blob> — replace the domain with your deployed relay's.
+VEILWEAVE_NODES = "{relay_domain}|{sub_blob}"
+SUBSCRIPTION_TOKEN = "{token}"
+MAX_NODES = "100"
+FP = "chrome"
+DISABLE_BUILTIN_PROXYIP = "false"
+"#
+    )
+}
+
+/// Keep the console window open when the binary was double-clicked, so the
+/// generated paths stay visible. Skipped when stdin is piped (scripts, CI).
+fn pause_before_exit() {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        println!();
+        println!("Press Enter to exit / 按回车退出…");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
     }
 }
 
@@ -255,42 +501,137 @@ fn generate_realistic_path() -> String {
 
     let resources: &[&str] = &[
         // 通信
-        "chat", "messages", "notifications", "alerts", "mentions",
-        "inbox", "conversations", "threads", "replies",
+        "chat",
+        "messages",
+        "notifications",
+        "alerts",
+        "mentions",
+        "inbox",
+        "conversations",
+        "threads",
+        "replies",
         // 金融
-        "market", "trades", "tickers", "orders", "transactions",
-        "positions", "balances", "funding", "liquidation", "candles",
+        "market",
+        "trades",
+        "tickers",
+        "orders",
+        "transactions",
+        "positions",
+        "balances",
+        "funding",
+        "liquidation",
+        "candles",
         // 媒体
-        "video", "audio", "screen", "camera", "microphone",
-        "stream", "broadcast", "recording", "playback", "media",
+        "video",
+        "audio",
+        "screen",
+        "camera",
+        "microphone",
+        "stream",
+        "broadcast",
+        "recording",
+        "playback",
+        "media",
         // 游戏
-        "game", "match", "lobby", "room", "session",
-        "party", "squad", "team", "leaderboard", "ranking",
+        "game",
+        "match",
+        "lobby",
+        "room",
+        "session",
+        "party",
+        "squad",
+        "team",
+        "leaderboard",
+        "ranking",
         // IoT
-        "device", "sensor", "telemetry", "iot", "gateway",
-        "controller", "actuator", "beacon", "tracker", "monitor",
+        "device",
+        "sensor",
+        "telemetry",
+        "iot",
+        "gateway",
+        "controller",
+        "actuator",
+        "beacon",
+        "tracker",
+        "monitor",
         // 协作
-        "document", "editor", "whiteboard", "presentation", "spreadsheet",
-        "cursor", "selection", "annotation", "comment", "revision",
+        "document",
+        "editor",
+        "whiteboard",
+        "presentation",
+        "spreadsheet",
+        "cursor",
+        "selection",
+        "annotation",
+        "comment",
+        "revision",
         // 用户/社交
-        "user", "presence", "status", "activity", "profile",
-        "friend", "follower", "contact", "group", "community",
+        "user",
+        "presence",
+        "status",
+        "activity",
+        "profile",
+        "friend",
+        "follower",
+        "contact",
+        "group",
+        "community",
         // 数据/监控
-        "data", "metrics", "logs", "analytics", "monitoring",
-        "health", "performance", "trace", "span", "event",
+        "data",
+        "metrics",
+        "logs",
+        "analytics",
+        "monitoring",
+        "health",
+        "performance",
+        "trace",
+        "span",
+        "event",
         // 位置
-        "location", "tracking", "geo", "map", "navigation",
-        "route", "delivery", "shipment", "fleet", "vehicle",
+        "location",
+        "tracking",
+        "geo",
+        "map",
+        "navigation",
+        "route",
+        "delivery",
+        "shipment",
+        "fleet",
+        "vehicle",
         // 系统
-        "system", "config", "state", "cache", "queue",
-        "job", "task", "workflow", "pipeline", "build",
+        "system",
+        "config",
+        "state",
+        "cache",
+        "queue",
+        "job",
+        "task",
+        "workflow",
+        "pipeline",
+        "build",
     ];
 
     let actions: &[&str] = &[
-        "stream", "live", "realtime", "feed", "websocket",
-        "events", "sync", "push", "pull", "subscribe",
-        "broadcast", "publish", "connect", "channel", "negotiate",
-        "handshake", "heartbeat", "ping", "update", "delta",
+        "stream",
+        "live",
+        "realtime",
+        "feed",
+        "websocket",
+        "events",
+        "sync",
+        "push",
+        "pull",
+        "subscribe",
+        "broadcast",
+        "publish",
+        "connect",
+        "channel",
+        "negotiate",
+        "handshake",
+        "heartbeat",
+        "ping",
+        "update",
+        "delta",
     ];
 
     let template = templates.choose(&mut rng).unwrap();
@@ -321,10 +662,19 @@ fn generate_realistic_path() -> String {
     } else if path.contains("graphql") {
         params.push(format!("query={}", generate_graphql_query()));
         if rng.gen_bool(0.5) {
-            params.push(format!("operationName={}", [
-                "SubscribePrices", "SubscribeTrades", "SubscribeOrders", "OnMessageReceived",
-                "OnPresenceUpdate", "OnNotification",
-            ].choose(&mut rng).unwrap()));
+            params.push(format!(
+                "operationName={}",
+                [
+                    "SubscribePrices",
+                    "SubscribeTrades",
+                    "SubscribeOrders",
+                    "OnMessageReceived",
+                    "OnPresenceUpdate",
+                    "OnNotification",
+                ]
+                .choose(&mut rng)
+                .unwrap()
+            ));
         }
     } else if path.contains("signalr") {
         params.push(format!("id={}", generate_ws_uuid()));
@@ -332,22 +682,48 @@ fn generate_realistic_path() -> String {
     } else if path.contains("pusher") {
         params.push(format!("protocol={}", rng.gen_range(5..=7)));
         params.push("client=js".to_string());
-        params.push(format!("version={}", ["7.0.0", "7.6.0", "8.0.0"].choose(&mut rng).unwrap()));
+        params.push(format!(
+            "version={}",
+            ["7.0.0", "7.6.0", "8.0.0"].choose(&mut rng).unwrap()
+        ));
     } else {
         let pool = vec![
             format!("token={}", generate_jwt_token()),
             format!("session={}", generate_ws_uuid()),
             format!("client_id={}", generate_hex_id(16)),
             format!("connection_id={}", generate_ws_uuid()),
-            format!("format={}", ["json", "protobuf", "binary", "msgpack"].choose(&mut rng).unwrap()),
+            format!(
+                "format={}",
+                ["json", "protobuf", "binary", "msgpack"]
+                    .choose(&mut rng)
+                    .unwrap()
+            ),
             format!("encoding={}", ["utf8", "base64"].choose(&mut rng).unwrap()),
-            format!("compress={}", ["zstd", "deflate", "gzip", "none"].choose(&mut rng).unwrap()),
+            format!(
+                "compress={}",
+                ["zstd", "deflate", "gzip", "none"]
+                    .choose(&mut rng)
+                    .unwrap()
+            ),
             format!("heartbeat={}", [30, 60, 120].choose(&mut rng).unwrap()),
             format!("ping_interval={}", [30, 60, 120].choose(&mut rng).unwrap()),
             format!("protocol={}", ["wss", "ws"].choose(&mut rng).unwrap()),
-            format!("transport={}", ["websocket", "polling"].choose(&mut rng).unwrap()),
-            format!("version={}", ["2.1.0", "3.0.1", "1.4.2", "2.5.0"].choose(&mut rng).unwrap()),
-            format!("client={}", ["web-3.2.1", "ios-4.1.0", "android-2.8.3", "desktop-1.5.0"].choose(&mut rng).unwrap()),
+            format!(
+                "transport={}",
+                ["websocket", "polling"].choose(&mut rng).unwrap()
+            ),
+            format!(
+                "version={}",
+                ["2.1.0", "3.0.1", "1.4.2", "2.5.0"]
+                    .choose(&mut rng)
+                    .unwrap()
+            ),
+            format!(
+                "client={}",
+                ["web-3.2.1", "ios-4.1.0", "android-2.8.3", "desktop-1.5.0"]
+                    .choose(&mut rng)
+                    .unwrap()
+            ),
             format!("api_key={}", generate_hex_id(32)),
             format!("room={}", generate_room_id()),
             format!("channel={}", generate_channel_name()),
@@ -448,9 +824,8 @@ fn generate_channel_name() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let names = [
-        "global", "general", "random", "dev", "ops", "alerts",
-        "trades", "prices", "orders", "system", "logs", "events",
-        "private", "direct", "group", "team", "project",
+        "global", "general", "random", "dev", "ops", "alerts", "trades", "prices", "orders",
+        "system", "logs", "events", "private", "direct", "group", "team", "project",
     ];
     let name = names[rng.gen_range(0..names.len())];
     let suffix: u32 = rng.gen();

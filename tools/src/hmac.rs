@@ -68,7 +68,8 @@ mod tests {
         let key = [0x0bu8; 20];
         let msg = b"Hi There";
         let result = hmac_sha256(&key, msg);
-        let expected = hex_to_bytes("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        let expected =
+            hex_to_bytes("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
         assert_eq!(&result[..], &expected[..]);
     }
 
@@ -77,14 +78,16 @@ mod tests {
         let key = [0x0cu8; 20];
         let msg = b"Test With Truncation";
         let result = hmac_sha256(&key, msg);
-        let expected = hex_to_bytes("a3b6167473100ee06e0c796c2955552bfa6f7c0a6a8aef8b93f860aab0cd20c5");
+        let expected =
+            hex_to_bytes("a3b6167473100ee06e0c796c2955552bfa6f7c0a6a8aef8b93f860aab0cd20c5");
         assert_eq!(&result[..], &expected[..]);
     }
 
     #[test]
     fn test_hmac_sha256_empty_key() {
         let result = hmac_sha256(b"", b"");
-        let expected = hex_to_bytes("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad");
+        let expected =
+            hex_to_bytes("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad");
         assert_eq!(&result[..], &expected[..]);
     }
 
@@ -93,7 +96,8 @@ mod tests {
         let key = [0xaa; 131];
         let msg = b"Test Using Larger Than Block-Size Key - Hash Key First";
         let result = hmac_sha256(&key, msg);
-        let expected = hex_to_bytes("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        let expected =
+            hex_to_bytes("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
         assert_eq!(&result[..], &expected[..]);
     }
 

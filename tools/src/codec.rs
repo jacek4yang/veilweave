@@ -62,8 +62,8 @@ impl FromStr for Uuid {
         }
         let mut bytes = [0u8; 16];
         for i in 0..16 {
-            bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| Error::InvalidFormat)?;
+            bytes[i] =
+                u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| Error::InvalidFormat)?;
         }
         Ok(Self(bytes))
     }

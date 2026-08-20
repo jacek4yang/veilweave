@@ -57,8 +57,8 @@ impl Sha256 {
     pub fn new() -> Self {
         Self {
             state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buffer: [0u8; 64],
             buffer_len: 0,
@@ -215,14 +215,16 @@ mod tests {
     #[test]
     fn test_sha256_empty() {
         let result = sha256(b"");
-        let expected = hex_literal!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        let expected =
+            hex_literal!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_sha256_abc() {
         let result = sha256(b"abc");
-        let expected = hex_literal!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let expected =
+            hex_literal!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(result, expected);
     }
 
@@ -230,7 +232,8 @@ mod tests {
     fn test_sha256_long() {
         let data = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
         let result = sha256(data);
-        let expected = hex_literal!("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+        let expected =
+            hex_literal!("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
         assert_eq!(result, expected);
     }
 }
