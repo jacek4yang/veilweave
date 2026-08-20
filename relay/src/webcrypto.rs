@@ -96,7 +96,13 @@ fn build_ctx() -> Option<Ctx> {
 /// Run `subtle.<encrypt|decrypt>(params, key, data)` and await the result. The
 /// synchronous part (assemble args, `apply`) holds the `CTX` borrow; the await
 /// happens after, on the returned Promise — so no borrow is held across `await`.
-async fn run(key: &JsValue, nonce: &[u8; 12], aad: &[u8], data: &JsValue, enc: bool) -> Result<JsValue> {
+async fn run(
+    key: &JsValue,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    data: &JsValue,
+    enc: bool,
+) -> Result<JsValue> {
     let promise = CTX.with(|c| -> Result<Promise> {
         let ctx = c.get_or_init(build_ctx).as_ref().ok_or_else(fb)?;
         let args = Array::of3(&ctx.gcm_params(nonce, aad), key, data);
@@ -138,12 +144,22 @@ pub async fn import_aes_gcm_key(raw: &[u8; 32]) -> Result<JsValue> {
 // wasm. This is the bulk data path.
 
 /// Seal a JS buffer source → ciphertext`‖`tag `ArrayBuffer` (no WASM copy).
-pub async fn encrypt_view(key: &JsValue, nonce: &[u8; 12], aad: &[u8], data: &JsValue) -> Result<JsValue> {
+pub async fn encrypt_view(
+    key: &JsValue,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    data: &JsValue,
+) -> Result<JsValue> {
     run(key, nonce, aad, data, true).await
 }
 
 /// Open a JS buffer source (`ciphertext‖tag`) → plaintext `ArrayBuffer` (no WASM copy).
-pub async fn decrypt_view(key: &JsValue, nonce: &[u8; 12], aad: &[u8], data: &JsValue) -> Result<JsValue> {
+pub async fn decrypt_view(
+    key: &JsValue,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    data: &JsValue,
+) -> Result<JsValue> {
     run(key, nonce, aad, data, false).await
 }
 
@@ -151,7 +167,12 @@ pub async fn decrypt_view(key: &JsValue, nonce: &[u8; 12], aad: &[u8], data: &Js
 
 /// AES-256-GCM seal: returns `ciphertext ‖ tag`. Used only for the tiny one-shot
 /// VLESS-response / proxy-leftover records and the self-test.
-pub async fn encrypt(key: &JsValue, nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub async fn encrypt(
+    key: &JsValue,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     let data: JsValue = Uint8Array::from(plaintext).into();
     let out = run(key, nonce, aad, &data, true).await?;
     let ab = out.dyn_into::<ArrayBuffer>().map_err(|_| fb())?;
@@ -159,7 +180,12 @@ pub async fn encrypt(key: &JsValue, nonce: &[u8; 12], aad: &[u8], plaintext: &[u
 }
 
 /// AES-256-GCM open of `ciphertext ‖ tag` → plaintext. Self-test only.
-pub async fn decrypt(key: &JsValue, nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub async fn decrypt(
+    key: &JsValue,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
     let data: JsValue = Uint8Array::from(ciphertext).into();
     let out = run(key, nonce, aad, &data, false).await?;
     let ab = out.dyn_into::<ArrayBuffer>().map_err(|_| fb())?;

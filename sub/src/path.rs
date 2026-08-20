@@ -41,19 +41,69 @@ fn alnum(rng: &mut Xorshift64, len: usize) -> String {
 }
 
 const RESOURCES: &[&str] = &[
-    "chat", "messages", "notifications", "presence", "inbox", "threads",
-    "market", "trades", "tickers", "orders", "candles", "positions",
-    "video", "audio", "stream", "broadcast", "media", "playback",
-    "game", "match", "lobby", "room", "session", "leaderboard",
-    "device", "sensor", "telemetry", "tracker", "monitor",
-    "document", "editor", "whiteboard", "cursor", "comment",
-    "user", "status", "activity", "feed", "events", "data", "metrics",
-    "location", "delivery", "fleet", "channel", "topic", "queue",
+    "chat",
+    "messages",
+    "notifications",
+    "presence",
+    "inbox",
+    "threads",
+    "market",
+    "trades",
+    "tickers",
+    "orders",
+    "candles",
+    "positions",
+    "video",
+    "audio",
+    "stream",
+    "broadcast",
+    "media",
+    "playback",
+    "game",
+    "match",
+    "lobby",
+    "room",
+    "session",
+    "leaderboard",
+    "device",
+    "sensor",
+    "telemetry",
+    "tracker",
+    "monitor",
+    "document",
+    "editor",
+    "whiteboard",
+    "cursor",
+    "comment",
+    "user",
+    "status",
+    "activity",
+    "feed",
+    "events",
+    "data",
+    "metrics",
+    "location",
+    "delivery",
+    "fleet",
+    "channel",
+    "topic",
+    "queue",
 ];
 
 const ACTIONS: &[&str] = &[
-    "stream", "live", "realtime", "feed", "events", "sync", "push",
-    "subscribe", "broadcast", "connect", "channel", "updates", "delta",
+    "stream",
+    "live",
+    "realtime",
+    "feed",
+    "events",
+    "sync",
+    "push",
+    "subscribe",
+    "broadcast",
+    "connect",
+    "channel",
+    "updates",
+    "delta",
 ];
 
 /// Build one realistic WS path. Variety is chosen per call from the PRNG.
@@ -88,13 +138,21 @@ pub fn realistic_ws_path(rng: &mut Xorshift64) -> String {
             (format!("/ws/{}/{}", resource, action), Vec::new())
         }
         6 => (
-            format!("/api/v{}/{}/{}", between(rng, 1, 4), resource, pick(rng, ACTIONS)),
+            format!(
+                "/api/v{}/{}/{}",
+                between(rng, 1, 4),
+                resource,
+                pick(rng, ACTIONS)
+            ),
             Vec::new(),
         ),
         7 => {
             let action = pick(rng, ACTIONS);
             let id_len = between(rng, 8, 14) as usize;
-            (format!("/{}/{}/{}", resource, action, alnum(rng, id_len)), Vec::new())
+            (
+                format!("/{}/{}/{}", resource, action, alnum(rng, id_len)),
+                Vec::new(),
+            )
         }
         8 => (format!("/realtime/{}", resource), Vec::new()),
         _ => (format!("/{}/{}", pick(rng, ACTIONS), resource), Vec::new()),

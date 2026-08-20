@@ -54,7 +54,10 @@ pub async fn connect_target(
             let (c, leftover) = http_connect(host, port, p).await?;
             Ok((c, leftover, "http"))
         }
-        Egress::ProxyIp { host: pip_host, port: pip_port } => {
+        Egress::ProxyIp {
+            host: pip_host,
+            port: pip_port,
+        } => {
             // Direct first: ordinary (non-CF) sites connect straight through on the
             // fast path. Targets that live in Cloudflare's own ranges fail the direct
             // dial (Workers can't reach CF IPs) and fall back to the proxyip — so
@@ -88,7 +91,11 @@ async fn socks5_connect(target_host: &str, target_port: u16, p: &ProxyAuth) -> R
     let mut s = try_connect(&p.host, p.port).await?;
 
     let authed = p.user.is_some();
-    let greeting: &[u8] = if authed { &[0x05, 0x02, 0x00, 0x02] } else { &[0x05, 0x01, 0x00] };
+    let greeting: &[u8] = if authed {
+        &[0x05, 0x02, 0x00, 0x02]
+    } else {
+        &[0x05, 0x01, 0x00]
+    };
     s.write_all(greeting).await?;
 
     let mut sel = [0u8; 2];
@@ -155,7 +162,11 @@ async fn socks5_connect(target_host: &str, target_port: u16, p: &ProxyAuth) -> R
 
 // ─── HTTP CONNECT egress ─────────────────────────────────────────────────────────
 
-async fn http_connect(target_host: &str, target_port: u16, p: &ProxyAuth) -> Result<(Conn, Vec<u8>)> {
+async fn http_connect(
+    target_host: &str,
+    target_port: u16,
+    p: &ProxyAuth,
+) -> Result<(Conn, Vec<u8>)> {
     let mut s = try_connect(&p.host, p.port).await?;
 
     let mut req = format!(
@@ -165,7 +176,9 @@ async fn http_connect(target_host: &str, target_port: u16, p: &ProxyAuth) -> Res
         let cred = general_purpose::STANDARD.encode(format!("{u}:{pw}"));
         req.push_str(&format!("Proxy-Authorization: Basic {cred}\r\n"));
     }
-    req.push_str("User-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n");
+    req.push_str(
+        "User-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
+    );
     s.write_all(req.as_bytes()).await?;
 
     let mut buf = [0u8; 8192];

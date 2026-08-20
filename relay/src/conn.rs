@@ -16,7 +16,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::FutureExt;
-use js_sys::{Boolean as JsBoolean, JsString, Number as JsNumber, Object as JsObject, Reflect, Uint8Array};
+use js_sys::{
+    Boolean as JsBoolean, JsString, Number as JsNumber, Object as JsObject, Reflect, Uint8Array,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -59,12 +61,28 @@ impl Conn {
     /// our socket only carries already-encrypted bytes.
     pub fn connect(host: &str, port: u16) -> Result<Self> {
         let address = JsObject::new();
-        Reflect::set(&address, &JsValue::from_str("hostname"), &JsString::from(host).into())?;
-        Reflect::set(&address, &JsValue::from_str("port"), &JsNumber::from(port as f64).into())?;
+        Reflect::set(
+            &address,
+            &JsValue::from_str("hostname"),
+            &JsString::from(host).into(),
+        )?;
+        Reflect::set(
+            &address,
+            &JsValue::from_str("port"),
+            &JsNumber::from(port as f64).into(),
+        )?;
 
         let options = JsObject::new();
-        Reflect::set(&options, &JsValue::from_str("allowHalfOpen"), &JsBoolean::from(false).into())?;
-        Reflect::set(&options, &JsValue::from_str("secureTransport"), &JsString::from("off").into())?;
+        Reflect::set(
+            &options,
+            &JsValue::from_str("allowHalfOpen"),
+            &JsBoolean::from(false).into(),
+        )?;
+        Reflect::set(
+            &options,
+            &JsValue::from_str("secureTransport"),
+            &JsString::from("off").into(),
+        )?;
 
         let inner = worker_sys::connect(address.into(), options.into())?;
         let readable = inner.readable()?;
@@ -122,7 +140,11 @@ impl Conn {
 fn js_err(value: JsValue) -> IoError {
     let s = value
         .as_string()
-        .or_else(|| value.dyn_ref::<js_sys::Error>().map(|e| e.to_string().into()))
+        .or_else(|| {
+            value
+                .dyn_ref::<js_sys::Error>()
+                .map(|e| e.to_string().into())
+        })
         .unwrap_or_else(|| format!("{value:?}"));
     IoError::other(s)
 }
@@ -176,10 +198,11 @@ impl AsyncRead for Conn {
 
         let (new_reading, poll) = match self.read.take().unwrap_or_default() {
             Reading::None => {
-                let reader: ReadableStreamDefaultReader = match self.readable.get_reader().dyn_into() {
-                    Ok(r) => r,
-                    Err(e) => return Poll::Ready(Err(js_err(e.into()))),
-                };
+                let reader: ReadableStreamDefaultReader =
+                    match self.readable.get_reader().dyn_into() {
+                        Ok(r) => r,
+                        Err(e) => return Poll::Ready(Err(js_err(e.into()))),
+                    };
                 handle_future(cx, buf, JsFuture::from(reader.read()), reader)
             }
             Reading::Pending(fut, reader) => handle_future(cx, buf, fut, reader),
@@ -221,7 +244,12 @@ impl AsyncWrite for Conn {
                     Ok(w) => w,
                     Err(e) => return Poll::Ready(Err(js_err(e))),
                 };
-                handle_future(cx, JsFuture::from(writer.write_with_chunk(&chunk)), writer, buf.len())
+                handle_future(
+                    cx,
+                    JsFuture::from(writer.write_with_chunk(&chunk)),
+                    writer,
+                    buf.len(),
+                )
             }
             Writing::Pending(fut, writer, len) => handle_future(cx, fut, writer, len),
         };

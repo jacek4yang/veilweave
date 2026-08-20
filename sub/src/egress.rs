@@ -20,7 +20,10 @@ pub fn parse_egress_list(list_str: &str) -> Vec<EgressEntry> {
         }
         let mut parts = raw.splitn(3, '#');
         let hostport = parts.next().unwrap_or("").trim();
-        let country = parts.next().map(|s| s.trim().to_uppercase()).unwrap_or_default();
+        let country = parts
+            .next()
+            .map(|s| s.trim().to_uppercase())
+            .unwrap_or_default();
         if hostport.is_empty() {
             continue;
         }
@@ -30,7 +33,11 @@ pub fn parse_egress_list(list_str: &str) -> Vec<EgressEntry> {
             None => (hostport.to_string(), 443),
         };
 
-        entries.push(EgressEntry { host, port, country });
+        entries.push(EgressEntry {
+            host,
+            port,
+            country,
+        });
     }
     entries
 }

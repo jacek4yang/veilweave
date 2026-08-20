@@ -1,9 +1,10 @@
-use worker::*;
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
-use serde::Deserialize;
+use worker::*;
 
+mod apache_mock;
 mod codec;
 mod egress;
 mod encoding;
@@ -14,11 +15,10 @@ mod optimized_ip;
 mod path;
 mod secret;
 mod sha256;
-mod apache_mock;
 
 use codec::{UuidCodec, TYPE_PROXYIP};
-use egress::{EgressEntry, parse_egress_list};
-use encoding::{percent_encode, format_uuid};
+use egress::{parse_egress_list, EgressEntry};
+use encoding::{format_uuid, percent_encode};
 use optimized_ip::fetch_optimized_ips;
 
 use crate::apache_mock::apache_default_page;
@@ -57,15 +57,12 @@ async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
 
     // Validate token from query params
     let token = extract_param(query, "token").or_else(|| extract_param(query, "t"));
-    let expected_token = env
-        .var("SUBSCRIPTION_TOKEN")
-        .ok()
-        .map(|v| v.to_string());
+    let expected_token = env.var("SUBSCRIPTION_TOKEN").ok().map(|v| v.to_string());
 
     if let Some(expected) = &expected_token {
         if !expected.trim().is_empty() {
             match token {
-                Some(t) if t == *expected => {},
+                Some(t) if t == *expected => {}
                 _ => return not_found(),
             }
         }
@@ -83,8 +80,7 @@ async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
 
     // Detect user geography (Cloudflare native)
     let user_country = extract_cf_header(req, "CF-IPCountry").unwrap_or_else(|| "XX".to_string());
-    let user_asn = extract_cf_header(req, "CF-ASN")
-        .and_then(|asn| asn.parse::<u32>().ok());
+    let user_asn = extract_cf_header(req, "CF-ASN").and_then(|asn| asn.parse::<u32>().ok());
     let user_geo = geo::detect_user_geo(&user_country, user_asn);
 
     // ISP-aware cache: users on the same country+carrier share a rendered body.
@@ -147,9 +143,7 @@ async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
         .unwrap_or(true);
 
     // Fetch carrier-optimized entry IPs (优选IP); empty on failure → domain fallback.
-    let optimized_ips = fetch_optimized_ips(kv.as_ref())
-        .await
-        .unwrap_or_default();
+    let optimized_ips = fetch_optimized_ips(kv.as_ref()).await.unwrap_or_default();
 
     let body = build_subscription(
         env,
@@ -173,10 +167,7 @@ async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
     build_response(&body, false).await
 }
 
-async fn fetch_proxyip_list(
-    kv: Option<&KvStore>,
-    env: &Env,
-) -> Result<Vec<EgressEntry>> {
+async fn fetch_proxyip_list(kv: Option<&KvStore>, env: &Env) -> Result<Vec<EgressEntry>> {
     // Check cache first
     if let Some(kv_ref) = kv {
         if let Ok(Some(cached)) = kv_ref.get(PROXYIP_CACHE_KEY).text().await {
@@ -208,7 +199,11 @@ async fn fetch_proxyip_list(
                 for item in parsed.data {
                     let port = item.port.first().copied().unwrap_or(item.meta.port);
                     let country = normalize_country(&item.meta.country);
-                    entries.push(EgressEntry { host: item.ip, port, country });
+                    entries.push(EgressEntry {
+                        host: item.ip,
+                        port,
+                        country,
+                    });
                 }
             }
         }
@@ -342,7 +337,11 @@ async fn build_subscription(
         let path = PRNG.with(|p| path::realistic_ws_path(&mut p.borrow_mut()));
         // Name reflects the proxyip's location — that is what `filter` selects on,
         // so the user sees the egress country of each node.
-        let cc = if proxy_entry.country.is_empty() { "XX" } else { &proxy_entry.country };
+        let cc = if proxy_entry.country.is_empty() {
+            "XX"
+        } else {
+            &proxy_entry.country
+        };
         let counter = country_counters.entry(cc.to_string()).or_insert(0);
         *counter += 1;
         let label = format!("{}-{:02}", cc, counter);
@@ -670,7 +669,11 @@ fn parse_cached_proxyip(text: &str) -> Vec<EgressEntry> {
             let hostport = parts.next()?;
             let country = parts.next().unwrap_or("").to_uppercase();
             let (host, port) = split_host_port(hostport, 443);
-            Some(EgressEntry { host, port, country })
+            Some(EgressEntry {
+                host,
+                port,
+                country,
+            })
         })
         .collect()
 }

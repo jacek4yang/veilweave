@@ -8,8 +8,8 @@
 // A Cloudflare Worker `fetch()` reaches CF-hosted endpoints fine (it goes through
 // the HTTP stack, not a raw socket), so no proxyip indirection is needed here.
 
-use worker::*;
 use serde::{Deserialize, Serialize};
+use worker::*;
 
 const OPTIMIZED_IP_CACHE_KEY: &str = "optimized_ips_v4";
 const OPTIMIZED_IP_CACHE_TTL: u64 = 86400; // 24 hours
@@ -99,12 +99,11 @@ fn dedup_keep_order(list: &mut Vec<String>) {
 }
 
 async fn fetch_text(url: &str) -> Result<String, String> {
-    let mut resp = Fetch::Request(
-        Request::new(url, Method::Get).map_err(|_| "bad request".to_string())?,
-    )
-    .send()
-    .await
-    .map_err(|_| "fetch failed".to_string())?;
+    let mut resp =
+        Fetch::Request(Request::new(url, Method::Get).map_err(|_| "bad request".to_string())?)
+            .send()
+            .await
+            .map_err(|_| "fetch failed".to_string())?;
     if resp.status_code() != 200 {
         return Err(format!("status {}", resp.status_code()));
     }

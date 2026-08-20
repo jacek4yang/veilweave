@@ -29,8 +29,8 @@ use worker::*;
 use crate::conn::Conn;
 use crate::datapath::{relay_download, target_write_js};
 use crate::egress::{connect_target, Egress};
-use crate::log::vlog;
 use crate::enc::{get_header, next_nonce, seal_record_wasm, server_handshake, EncConfig};
+use crate::log::vlog;
 use crate::vless::{parse_vless_header, Command, VLESS_RESPONSE};
 use crate::wsio::WsReader;
 
@@ -201,7 +201,11 @@ impl DurableObject for VeilweaveSession {
         Response::from_websocket(pair.client)
     }
 
-    async fn websocket_message(&self, ws: WebSocket, message: WebSocketIncomingMessage) -> Result<()> {
+    async fn websocket_message(
+        &self,
+        ws: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
         let data = match message {
             WebSocketIncomingMessage::Binary(d) => d,
             WebSocketIncomingMessage::String(_) => return Ok(()), // VLESS is binary
@@ -244,7 +248,13 @@ impl DurableObject for VeilweaveSession {
         Ok(())
     }
 
-    async fn websocket_close(&self, _ws: WebSocket, _code: usize, _reason: String, _clean: bool) -> Result<()> {
+    async fn websocket_close(
+        &self,
+        _ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _clean: bool,
+    ) -> Result<()> {
         vlog!("ws close: code={_code} clean={_clean} reason={:?}", _reason);
         self.cleanup().await;
         Ok(())
@@ -341,7 +351,8 @@ impl VeilweaveSession {
                     Some(r) => r,
                     None => return Ok(()), // need more bytes
                 };
-                let pt = crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
+                let pt =
+                    crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
                 let pt = Uint8Array::new(&pt).to_vec();
                 self.inner.borrow_mut().acc_header.extend_from_slice(&pt);
 
@@ -385,11 +396,11 @@ impl VeilweaveSession {
                     nrec += 1;
                     nbytes += body.length() as u64;
                 }
-                let pt = crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
+                let pt =
+                    crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
                 target_write_js(&writer, &pt).await?;
             }
         }
-
 
         // ── Data (UDP / DNS) ──
         if self.phase() == Phase::Udp {
@@ -400,7 +411,8 @@ impl VeilweaveSession {
                     Some(r) => r,
                     None => return Ok(()),
                 };
-                let pt = crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
+                let pt =
+                    crate::webcrypto::decrypt_view(&key_r, &nonce, &hdr, body.as_ref()).await?;
                 let pt = Uint8Array::new(&pt).to_vec();
                 self.handle_udp_frames(ws, &pt).await?;
             }
@@ -432,7 +444,10 @@ impl VeilweaveSession {
                 Egress::Socks5(_) => "socks5",
                 Egress::Http(_) => "http",
             };
-            vlog!("establish: {cmd} {host}:{port} via {eg} ({} initial bytes)", initial.len());
+            vlog!(
+                "establish: {cmd} {host}:{port} via {eg} ({} initial bytes)",
+                initial.len()
+            );
         }
 
         let key_w = self.inner.borrow().key_w.clone().ok_or_else(fb)?;

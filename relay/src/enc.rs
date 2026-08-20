@@ -96,7 +96,13 @@ impl Aead {
     }
 
     #[inline]
-    fn open_detached(&self, nonce: &[u8; 12], aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<()> {
+    fn open_detached(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        data: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<()> {
         let n = GenericArray::from_slice(nonce);
         let t = GenericArray::from_slice(tag);
         self.cipher
@@ -180,7 +186,9 @@ pub struct EncConfig {
 
 impl EncConfig {
     pub fn new(private_key: [u8; 32]) -> EncConfig {
-        EncConfig { nfs_secret: StaticSecret::from(private_key) }
+        EncConfig {
+            nfs_secret: StaticSecret::from(private_key),
+        }
     }
 }
 
@@ -344,7 +352,9 @@ pub async fn server_handshake(
     peer_x.copy_from_slice(&enc_pfs[MLKEM_EK..MLKEM_EK + X25519_LEN]);
     let server_eph = EphemeralSecret::random_from_rng(rng);
     let server_eph_pub = PublicKey::from(&server_eph).to_bytes();
-    let x_ss = server_eph.diffie_hellman(&PublicKey::from(peer_x)).to_bytes();
+    let x_ss = server_eph
+        .diffie_hellman(&PublicKey::from(peer_x))
+        .to_bytes();
 
     // pfsKey = mlkemShared ‖ x25519Shared ; unitedKey = pfsKey ‖ nfsKey
     let mut pfs_key = Vec::with_capacity(MLKEM_SS + X25519_LEN);
@@ -381,7 +391,11 @@ pub async fn server_handshake(
     // pfsPublic sealed by nfsAEAD at MaxNonce (does not advance the nfs counter).
     nfs_aead.seal_with_nonce(&MAX_NONCE, &pfs_public, &[], &mut hello[..pfs_kex_len]);
     // ticket sealed by write AEAD (nonce 1).
-    write_aead.seal(&ticket, &[], &mut hello[pfs_kex_len..pfs_kex_len + ticket_len]);
+    write_aead.seal(
+        &ticket,
+        &[],
+        &mut hello[pfs_kex_len..pfs_kex_len + ticket_len],
+    );
     // padding: 18-byte sealed length (nonce 2) then sealed body (nonce 3). The
     // body is zero-filled; its content is discarded by the peer.
     {

@@ -133,7 +133,9 @@ struct DecodeCache {
 
 impl DecodeCache {
     const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     fn get(&mut self, key: &[u8; 16]) -> Option<Payload> {
@@ -195,9 +197,22 @@ fn build_egress(payload: &Payload) -> Egress {
         )
     };
     match payload.type_byte {
-        0x01 => Egress::ProxyIp { host: ip(), port: payload.port },
-        0x02 => Egress::Socks5(ProxyAuth { host: ip(), port: payload.port, user: None, pass: None }),
-        0x03 => Egress::Http(ProxyAuth { host: ip(), port: payload.port, user: None, pass: None }),
+        0x01 => Egress::ProxyIp {
+            host: ip(),
+            port: payload.port,
+        },
+        0x02 => Egress::Socks5(ProxyAuth {
+            host: ip(),
+            port: payload.port,
+            user: None,
+            pass: None,
+        }),
+        0x03 => Egress::Http(ProxyAuth {
+            host: ip(),
+            port: payload.port,
+            user: None,
+            pass: None,
+        }),
         // 0x00 (direct) and any unknown byte fall back to direct.
         _ => Egress::Direct,
     }
@@ -300,5 +315,13 @@ pub(crate) fn parse_vless_header(buf: &[u8], env: &Env) -> Result<(VlessRequest,
         }
     };
 
-    Ok((VlessRequest { command, host, port }, pos, egress))
+    Ok((
+        VlessRequest {
+            command,
+            host,
+            port,
+        },
+        pos,
+        egress,
+    ))
 }

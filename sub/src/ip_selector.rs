@@ -22,7 +22,11 @@ pub fn select_best_ips(
 
     // Domestic users: CN-country egress first, then the rest — stable to keep the
     // upstream speed ordering inside each group.
-    let mut out: Vec<EgressEntry> = all_ips.iter().filter(|e| e.country == "CN").cloned().collect();
+    let mut out: Vec<EgressEntry> = all_ips
+        .iter()
+        .filter(|e| e.country == "CN")
+        .cloned()
+        .collect();
     if out.len() < max_count {
         out.extend(all_ips.iter().filter(|e| e.country != "CN").cloned());
     }

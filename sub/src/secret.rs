@@ -55,9 +55,17 @@ impl Secret {
 /// Parse a configured secret string into its UUID + encryption parts.
 pub fn parse(s: &str) -> Secret {
     if let Some((kind, uuid, key)) = decode_blob(s) {
-        Secret { uuid_key: uuid.to_vec(), kind: Some(kind), key: Some(key) }
+        Secret {
+            uuid_key: uuid.to_vec(),
+            kind: Some(kind),
+            key: Some(key),
+        }
     } else {
-        Secret { uuid_key: s.as_bytes().to_vec(), kind: None, key: None }
+        Secret {
+            uuid_key: s.as_bytes().to_vec(),
+            kind: None,
+            key: None,
+        }
     }
 }
 

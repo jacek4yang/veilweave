@@ -1,6 +1,6 @@
-use worker::*;
 use core::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use worker::*;
 
 // ========== 配置常量：模拟 Debian 12 + Apache 2.4.62 ==========
 const SERVER_SIGNATURE: &str = "Apache/2.4.62 (Debian)";
@@ -79,9 +79,7 @@ fn base_headers() -> Headers {
 
 fn parse_host(host: &str) -> (String, String) {
     match host.rsplit_once(':') {
-        Some((name, port)) if port.parse::<u16>().is_ok() => {
-            (name.to_string(), port.to_string())
-        }
+        Some((name, port)) if port.parse::<u16>().is_ok() => (name.to_string(), port.to_string()),
         _ => (host.to_string(), "80".to_string()),
     }
 }
