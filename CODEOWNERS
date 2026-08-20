@@ -1,0 +1,32 @@
+# CODEOWNERS — veilweave
+# Lines prefixed with `#` are comments. The last match wins.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: all files require a maintainer review.
+/                                   @veilweave/maintainers
+
+# Relay-worker (data plane) — any change here is wire-relevant.
+/relay/                             @veilweave/maintainers
+/relay/src/enc.rs                   @veilweave/maintainers
+/relay/src/session.rs               @veilweave/maintainers
+/relay/src/vless.rs                 @veilweave/maintainers
+/relay/src/codec.rs                 @veilweave/maintainers
+/relay/wrangler.toml                @veilweave/maintainers
+
+# Subscription worker.
+/sub/                               @veilweave/maintainers
+/sub/wrangler.toml                  @veilweave/maintainers
+
+# CLI (tools).
+/tools/                             @veilweave/maintainers
+
+# Docs.
+/docs/                              @veilweave/maintainers
+/README.md                          @veilweave/maintainers
+
+# CI templates — only the @infra group.
+# Replace @veilweave/infra with your team's handle.
+/.github/                           @veilweave/infra
+
+# Security policy is owned only by the security maintainer.
+/SECURITY.md                        @veilweave/security

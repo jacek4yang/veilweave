@@ -1,0 +1,9 @@
+# Disable blank issues; require a template.
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/<owner>/veilweave/security/advisories/new
+    about: Please do not file security-sensitive issues here — use the private advisory channel.
+  - name: Discussions
+    url: https://github.com/<owner>/veilweave/discussions
+    about: Questions, ideas, and "how do I…" — open a discussion first.

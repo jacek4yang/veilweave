@@ -1,0 +1,30 @@
+# Reference wrangler.toml for the sub worker. The committed `wrangler.toml` is
+# safe to copy as-is, but the VEILWEAVE_NODES / SUBSCRIPTION_TOKEN / KV id
+# values there are placeholders.
+#
+# Steps to get a real one:
+#   1. cargo run --manifest-path tools/Cargo.toml -- gen-secret
+#   2. wrangler kv:namespace create VEILWEAVE_KV   # paste id below
+#   3. Paste the SUB blob into VEILWEAVE_NODES
+#   4. wrangler secret put SUBSCRIPTION_TOKEN       # production
+#      (or paste a random token into the [vars] line for local dev)
+
+name = "veilweave-sub"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+cwd = "."
+
+[[kv_namespaces]]
+binding = "VEILWEAVE_KV"
+id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+[vars]
+VEILWEAVE_NODES = "your-relay.example.com|REPLACE_ME_WITH_SUB_BLOB"
+SUBSCRIPTION_TOKEN = "REPLACE_ME_WITH_RANDOM_TOKEN"
+MAX_NODES = "100"
+FP = "chrome"
+DISABLE_BUILTIN_PROXYIP = "false"

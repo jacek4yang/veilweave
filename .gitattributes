@@ -1,0 +1,14 @@
+# ─── Linguist overrides ────────────────────────────────────────────────────
+# Force specific languages for stats
+*.wasm   binary linguist-generated=true
+*.rs     linguist-language=Rust
+*.toml   linguist-language=TOML
+
+# ─── Line endings ──────────────────────────────────────────────────────────
+# Normalize text to LF in the repo, but keep CRLF on Windows checkouts for
+# shell scripts that some Windows tools still mishandle.
+*               text=auto eol=lf
+
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf

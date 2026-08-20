@@ -1,0 +1,47 @@
+# ─── Rust / Cargo ───────────────────────────────────────────────────────────
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# ─── Cloudflare / wrangler ─────────────────────────────────────────────────
+.wrangler/
+.dev.vars
+.mf/
+build/
+dist/
+
+# Worker compiled output (regenerated on every wrangler build)
+/**/build/
+/**/worker/
+/**/*.wasm
+/**/*.wasm.map
+!**/relay/.cargo/*
+!**/sub/.cargo/*
+
+# ─── Local secrets & dev overrides ────────────────────────────────────────
+*.local.toml
+*.local
+.env
+.env.*
+!.env.example
+
+# ─── Editors & IDEs ────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.code-workspace
+*.iml
+
+# ─── OS junk ───────────────────────────────────────────────────────────────
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ─── Project: tooling side-effects ────────────────────────────────────────
+# `veilweave-tools` is a native binary; ignore its build artifacts only.
+tools/target/

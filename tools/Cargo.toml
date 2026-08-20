@@ -1,0 +1,10 @@
+[package]
+name = "veilweave-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

@@ -1,0 +1,71 @@
+[package]
+name = "veilweave"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Off by default — a normal build/deploy carries no logging code whatsoever.
+default = []
+# Compile-time switch that turns on console logging for performance profiling.
+# Build a one-off profiling worker with it and watch the data path via
+# `wrangler tail`:
+#
+#     worker-build --release --features perf-log   # (forwarded to `cargo build`)
+#
+# With this OFF, every `vlog!` in the crate expands to nothing — no string
+# formatting, no `Date::now()`, no console FFI — so there is zero runtime cost on
+# the hot path in long-term use. See `src/log.rs`.
+perf-log = []
+
+[dependencies]
+worker        = { version = "0.8", default-features = false, features = ['http'] }
+worker-macros = { version = "0.8", default-features = false, features = ['http'] }
+futures-util  = { version = "0.3", default-features = false }
+base64        = { version = "0.22", default-features = false, features = ["alloc"] }
+tokio         = { version = "1",    default-features = false, features = ["io-util"] }
+web-sys       = { version = "0.3",  default-features = false, features = [
+    "WebSocket", "BinaryType", "ReadableStream", "WritableStream",
+    "ReadableStreamDefaultReader", "WritableStreamDefaultWriter"
+] }
+js-sys        = { version = "0.3",  default-features = false }
+wasm-bindgen  = { version = "0.2",  default-features = false }
+wasm-bindgen-futures = { version = "0.4", default-features = false }
+worker-sys    = { version = "0.8", default-features = false }
+
+# ─── VLESS Encryption (xray-core `mlkem768x25519plus`) ───────────────────────
+# Pure-Rust, wasm-compatible crypto for the in-stream encryption layer. All keys
+# are derived with BLAKE3 (matching Go's lukechampine.com/blake3), the per-record
+# AEAD is AES-256-GCM or ChaCha20-Poly1305, and the per-connection PFS handshake
+# is hybrid ML-KEM-768 + X25519 — byte-for-byte interoperable with xray-core.
+# `wasm32_simd` enables BLAKE3's hand-vectorized WebAssembly-SIMD backend (pure
+# Rust `core::arch::wasm32` intrinsics, no C toolchain needed). Requires the
+# `+simd128` target feature (.cargo/config.toml). ~2× faster derive_key on wasm.
+blake3            = { version = "1",  default-features = false, features = ["wasm32_simd"] }
+ml-kem            = { version = "0.2", default-features = false }
+kem               = { version = "=0.3.0-pre.0", default-features = false }
+x25519-dalek      = { version = "2",  default-features = false, features = ["static_secrets"] }
+aes-gcm           = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+rand_core         = { version = "0.6", default-features = false }
+
+# Our own glue code is tiny and mostly orchestration, so keep IT small ("z").
+# But the dependencies include the per-connection ML-KEM-768 + X25519 + BLAKE3
+# handshake, which is CPU-bound — at "z" a single handshake can blow Cloudflare's
+# free-tier 10 ms CPU budget. Compile all deps for SPEED (opt-level 3) so the
+# handshake stays well under a millisecond.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = 3
+
+# Let wasm-opt optimize for speed (-O2) rather than size; the crypto hot path's
+# CPU time matters far more than a few hundred KB of wasm here.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O2", "--enable-bulk-memory", "--enable-sign-ext", "--enable-simd"]

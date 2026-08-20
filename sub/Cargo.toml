@@ -1,0 +1,31 @@
+[package]
+name = "veilweave-sub"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker        = { version = "0.8", default-features = false, features = ['http'] }
+worker-macros = { version = "0.8", default-features = false, features = ['http'] }
+base64        = { version = "0.22", default-features = false, features = ["alloc"] }
+serde         = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+serde_json    = { version = "1.0", default-features = false, features = ["alloc"] }
+js-sys        = { version = "0.3", default-features = false }
+wasm-bindgen  = { version = "0.2", default-features = false }
+wasm-bindgen-futures = { version = "0.4", default-features = false }
+worker-sys    = { version = "0.8", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext"]

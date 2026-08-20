@@ -1,0 +1,44 @@
+name = "veilweave-sub"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+cwd = "."
+
+# Subscriptions are read-heavy and cache-heavy; KV is the right backing store.
+# Run `wrangler kv:namespace create VEILWEAVE_KV` to obtain an id; paste below.
+[[kv_namespaces]]
+binding = "VEILWEAVE_KV"
+id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# Relay nodes for load balancing. Each node is `domain|secret`, comma-separated.
+# `secret` is the SUB blob from `veilweave-tools gen-secret` (must pair with
+# the relay's SECRET_KEY blob). The subscription signs each node's UUID with
+# the blob's UUID secret AND advertises VLESS Encryption from the blob's
+# X25519 public key, so every link is
+# `encryption=mlkem768x25519plus.native.1rtt.<pubkey>` automatically.
+# A legacy raw secret still works and emits `encryption=none`.
+#
+# Multiple nodes, comma-separated:
+#   VEILWEAVE_NODES = "node-a.example.com|<sub blob a>,node-b.example.com|<sub blob b>"
+VEILWEAVE_NODES = "REPLACE_ME.example.com|REPLACE_ME_WITH_SUB_BLOB"
+
+# Subscription access token (independent of any relay secret).
+# For production, prefer:  wrangler secret put SUBSCRIPTION_TOKEN
+SUBSCRIPTION_TOKEN = "REPLACE_ME_WITH_RANDOM_TOKEN"
+
+# Maximum number of nodes to return in a single subscription response.
+MAX_NODES = "100"
+
+# TLS fingerprint advertised to clients.
+FP = "chrome"
+
+# ProxyIP source. Fetched once and cached in KV for 24 h.
+# Disable by setting to "true" if you only want to use PROXYIP_LIST below.
+DISABLE_BUILTIN_PROXYIP = "false"
+
+# Extra inline proxyips (host:port#CC[, ...]). Optional, complements the API.
+# PROXYIP_LIST = "1.2.3.4:443#CN, 5.6.7.8:8443#US"

@@ -1,0 +1,19 @@
+# Emit modern wasm features that current workerd supports. Lets std's
+# memcpy/memset lower to native `memory.copy`/`memory.fill` (smaller + faster
+# small copies) and use sign-extension ops instead of emulation sequences.
+#
+# `+simd128` enables 128-bit WebAssembly SIMD (workerd/V8 has supported it for
+# years). This is the only way to speed up the *software* handshake crypto — the
+# post-quantum ML-KEM-768 is unavailable in WebCrypto, so it must run in wasm.
+# With SIMD on: BLAKE3 uses its hand-vectorized `wasm32_simd` path (~2× per the
+# crate's own bench) and LLVM can auto-vectorize the ml-kem NTT and
+# curve25519-dalek field arithmetic. Pair it with the blake3 `wasm32_simd` feature
+# and `--enable-simd` for wasm-opt (both in Cargo.toml).
+#
+# If a future workerd ever rejects one of these, the worker would fail to
+# instantiate (a clean error, not silent corruption) — verify with `wrangler dev`
+# / `deploy --dry-run` after changing.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+bulk-memory,+sign-ext,+nontrapping-fptoint,+mutable-globals,+simd128",
+]

@@ -1,0 +1,57 @@
+name = "veilweave"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+# Production build: no logging compiled in (zero hot-path overhead). To profile a
+# deploy with `wrangler tail`, build with `--features perf-log` and tail live:
+#   cd relay
+#   worker-build --release --features perf-log
+#   wrangler deploy
+#   wrangler tail
+# See src/log.rs for the on/off semantics. Turn it back off for long-term use.
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+cwd = "."
+
+# Surface uncaught errors / console output in the dashboard. Workers Logs is
+# available on the free plan (sampled), and costs nothing while idle.
+[observability]
+enabled = true
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+# `SECRET_KEY` is the SINGLE configuration value. Generate it once with
+# `veilweave-tools gen-secret` (see tools/README.md) and paste the
+# **relay blob** below. The blob carries both the UUID-signing secret AND the
+# X25519 private key the VLESS Encryption handshake needs, so PQ-PFS
+# (`mlkem768x25519plus`) is enabled automatically — no extra variables.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  ⚠️  NEVER commit a real blob to this file.                               │
+# │  For production, run:                                                    │
+# │      wrangler secret put SECRET_KEY                                      │
+# │  and remove the `[vars].SECRET_KEY` line below entirely.                 │
+# └─────────────────────────────────────────────────────────────────────────┘
+[vars]
+# Replace with your relay blob from `cargo run -p veilweave-tools -- gen-secret`.
+# Format: base64url, starts with "Vlcx..." (kind=0 relay blob).
+# A legacy raw secret (any non-blob string) still works but disables encryption.
+SECRET_KEY = "REPLACE_ME_WITH_RELAY_BLOB_FROM_gen-secret"
+
+# ─── Durable Object: per-connection VLESS Encryption session ────────────────
+# Every encrypted WS connection is handled by its own `VeilweaveSession` instance
+# under the WebSocket Hibernation API, so each inbound frame gets its own CPU
+# budget — the key to staying under the free plan's per-invocation 10 ms CPU cap
+# on bulk upload.
+[[durable_objects.bindings]]
+name = "VEILWEAVE_SESSION"
+class_name = "VeilweaveSession"
+
+# Free-plan Durable Objects REQUIRE the SQLite storage backend, so the class
+# must be introduced with `new_sqlite_classes` (not `new_classes`, which is
+# paid key-value storage). VeilweaveSession keeps only in-memory connection
+# state and never touches storage, but the SQLite backend is still the one
+# the free plan allows.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VeilweaveSession"]

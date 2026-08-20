@@ -1,0 +1,479 @@
+use clap::{Parser, Subcommand, ValueEnum};
+use base64::{Engine as _, engine::general_purpose};
+use rand::{RngCore, seq::SliceRandom};
+use std::net::Ipv4Addr;
+
+mod codec;
+mod hmac;
+mod sha256;
+
+use codec::UuidCodec;
+
+#[derive(Parser)]
+#[command(name = "veilweave-tools")]
+#[command(about = "VLESS subscription link generator for veilweave")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Generate a single VLESS subscription link
+    GenLink {
+        /// Worker address (hostname or IP)
+        #[arg(long)]
+        address: String,
+        /// Worker port
+        #[arg(long)]
+        port: u16,
+        /// Proxy type
+        #[arg(long, value_enum)]
+        r#type: ProxyType,
+        /// Proxy IPv4 address (required for non-direct types)
+        #[arg(long)]
+        proxy_ip: Option<String>,
+        /// Proxy port (default: 443 for proxyip, 1080 for socks5, 80 for http)
+        #[arg(long, default_value_t = 0)]
+        proxy_port: u16,
+        /// TLS SNI (defaults to address)
+        #[arg(long)]
+        sni: Option<String>,
+        /// Node display name (defaults to address)
+        #[arg(long)]
+        name: Option<String>,
+        /// Secret key used for UUID encoding
+        #[arg(long)]
+        secret_key: String,
+    },
+    /// Generate a matched pair of combined secrets. Each bundles the UUID-signing
+    /// secret and the VLESS Encryption (mlkem768x25519plus) X25519 key into one
+    /// string: the relay blob (private key) goes in veilweave's `SECRET_KEY`, the
+    /// sub blob (public key) goes in veilweave-sub's `VEILWEAVE_NODES` as
+    /// `domain|<blob>`. Same single-value fill as before — just paste each blob.
+    GenSecret,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ProxyType {
+    Direct,
+    Proxyip,
+    Socks5,
+    Http,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::GenLink {
+            address,
+            port,
+            r#type,
+            proxy_ip,
+            proxy_port,
+            sni,
+            name,
+            secret_key,
+        } => {
+            // SECRET_KEY may be a combined blob (UUID secret + X25519 key) or a
+            // legacy raw secret. Either way the codec is seeded from the UUID part;
+            // a blob additionally yields the encryption public key for the link.
+            let (uuid_key, enc_pubkey) = parse_secret_for_link(&secret_key);
+            let codec = UuidCodec::new(&uuid_key);
+            let (type_byte, proxy_ipv4, effective_proxy_port) = match r#type {
+                ProxyType::Direct => (0x00, Ipv4Addr::new(0, 0, 0, 0), 0),
+                ProxyType::Proxyip => {
+                    let ip = proxy_ip
+                        .expect("--proxy-ip is required for proxyip type")
+                        .parse::<Ipv4Addr>()
+                        .expect("invalid IPv4 address");
+                    let port = if proxy_port == 0 { 443 } else { proxy_port };
+                    (0x01, ip, port)
+                }
+                ProxyType::Socks5 => {
+                    let ip = proxy_ip
+                        .expect("--proxy-ip is required for socks5 type")
+                        .parse::<Ipv4Addr>()
+                        .expect("invalid IPv4 address");
+                    let port = if proxy_port == 0 { 1080 } else { proxy_port };
+                    (0x02, ip, port)
+                }
+                ProxyType::Http => {
+                    let ip = proxy_ip
+                        .expect("--proxy-ip is required for http type")
+                        .parse::<Ipv4Addr>()
+                        .expect("invalid IPv4 address");
+                    let port = if proxy_port == 0 { 80 } else { proxy_port };
+                    (0x03, ip, port)
+                }
+            };
+            let uuid = codec.encode(type_byte, proxy_ipv4, effective_proxy_port);
+            let sni = sni.unwrap_or_else(|| address.clone());
+            let name = name.unwrap_or_else(|| address.clone());
+            let path = generate_realistic_path();
+
+            let encoded_path = percent_encode(&path);
+            let encoded_name = percent_encode(&name);
+
+            // The single best profile: native (lowest overhead inside WSS) + 1rtt
+            // (stateless) + hybrid ML-KEM-768/X25519 PFS. `none` when the secret
+            // carries no key (legacy / encryption off).
+            let encryption = match enc_pubkey {
+                Some(pk) => format!(
+                    "mlkem768x25519plus.native.1rtt.{}",
+                    general_purpose::URL_SAFE_NO_PAD.encode(pk)
+                ),
+                None => "none".to_string(),
+            };
+
+            let url = format!(
+                "vless://{uuid}@{address}:{port}?encryption={encryption}&security=tls&sni={sni}&fp=chrome&alpn=http%2F1.1&type=ws&host={sni}&path={encoded_path}&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query&insecure=0&allowInsecure=0#{encoded_name}"
+            );
+
+            println!("{}", url);
+        }
+        Commands::GenSecret => {
+            use x25519_dalek::{PublicKey, StaticSecret};
+            // One shared UUID-signing secret, plus one X25519 keypair for VLESS
+            // Encryption. The relay gets the private key, the sub gets the public.
+            let mut uuid_secret = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut uuid_secret);
+            let x = StaticSecret::random_from_rng(rand::thread_rng());
+            let priv_bytes = x.to_bytes();
+            let pub_bytes = PublicKey::from(&x).to_bytes();
+
+            let relay = encode_blob(0, &uuid_secret, &priv_bytes);
+            let sub = encode_blob(1, &uuid_secret, &pub_bytes);
+
+            println!("# ── veilweave relay ──  set  SECRET_KEY  to:");
+            println!("{relay}");
+            println!();
+            println!("# ── veilweave-sub ──  use in  VEILWEAVE_NODES  as  <domain>|<blob>:");
+            println!("{sub}");
+        }
+    }
+}
+
+// ─── Combined secret blob (must match veilweave/src/secret.rs) ───────────────────
+// Layout (base64url, no pad): "VW1" ‖ kind(1) ‖ uuid_secret(32) ‖ x25519(32)
+//   kind 0 = relay (x25519 private),  kind 1 = sub (x25519 public)
+
+fn encode_blob(kind: u8, uuid_secret: &[u8; 32], key: &[u8; 32]) -> String {
+    let mut b = Vec::with_capacity(68);
+    b.extend_from_slice(b"VW1");
+    b.push(kind);
+    b.extend_from_slice(uuid_secret);
+    b.extend_from_slice(key);
+    general_purpose::URL_SAFE_NO_PAD.encode(&b)
+}
+
+fn decode_blob(s: &str) -> Option<(u8, [u8; 32], [u8; 32])> {
+    let b = general_purpose::URL_SAFE_NO_PAD.decode(s.trim()).ok()?;
+    if b.len() != 68 || &b[0..3] != b"VW1" {
+        return None;
+    }
+    let mut uuid = [0u8; 32];
+    uuid.copy_from_slice(&b[4..36]);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&b[36..68]);
+    Some((b[3], uuid, key))
+}
+
+/// Parse a secret for link generation: returns the UUID codec key bytes and, when
+/// the secret is a blob, the encryption **public** key (derived from the private
+/// key if a relay blob was supplied, so the private key never leaks into a link).
+fn parse_secret_for_link(s: &str) -> (Vec<u8>, Option<[u8; 32]>) {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    match decode_blob(s) {
+        Some((kind, uuid, key)) => {
+            let public = if kind == 0 {
+                PublicKey::from(&StaticSecret::from(key)).to_bytes()
+            } else {
+                key
+            };
+            (uuid.to_vec(), Some(public))
+        }
+        None => (s.as_bytes().to_vec(), None),
+    }
+}
+
+fn generate_realistic_path() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    let templates: &[&str] = &[
+        // API 版本化流式接口
+        "/api/v{ver}/{resource}/{action}",
+        "/api/v{ver}/{resource}/{id}/{action}",
+        "/api/v{ver}/stream/{resource}",
+        "/api/v{ver}/realtime/{resource}",
+        "/api/v{ver}/live/{resource}",
+        // WebSocket 原生路径
+        "/ws/{resource}",
+        "/ws/{resource}/{id}",
+        "/websocket/{resource}",
+        "/socket/{resource}",
+        "/socket.io/{resource}",
+        // 功能/资源路径
+        "/{resource}/stream",
+        "/{resource}/live",
+        "/{resource}/realtime",
+        "/{resource}/feed",
+        "/{resource}/events",
+        "/{resource}/sync",
+        "/{resource}/push",
+        "/{resource}/subscribe",
+        // 流式数据
+        "/stream/{resource}",
+        "/stream/{resource}/{id}",
+        "/live/{resource}",
+        "/live/{resource}/{id}",
+        "/realtime/{resource}",
+        "/realtime/{resource}/{id}",
+        // 内部/网关
+        "/internal/{resource}/stream",
+        "/services/{resource}/websocket",
+        "/gateway/{resource}/connection",
+        "/hub/{resource}/broadcast",
+        // 特定协议
+        "/graphql",
+        "/subscriptions",
+        "/stomp/websocket",
+        "/mqtt",
+        "/signalr/negotiate",
+        "/signalr/connect",
+        "/pusher/app/{id}",
+        "/pubsub/{resource}",
+        // 协作/通信
+        "/collab/{resource}",
+        "/collab/{resource}/sync",
+        "/call/{resource}",
+        "/conference/{resource}",
+        "/room/{id}",
+        "/channel/{id}",
+    ];
+
+    let resources: &[&str] = &[
+        // 通信
+        "chat", "messages", "notifications", "alerts", "mentions",
+        "inbox", "conversations", "threads", "replies",
+        // 金融
+        "market", "trades", "tickers", "orders", "transactions",
+        "positions", "balances", "funding", "liquidation", "candles",
+        // 媒体
+        "video", "audio", "screen", "camera", "microphone",
+        "stream", "broadcast", "recording", "playback", "media",
+        // 游戏
+        "game", "match", "lobby", "room", "session",
+        "party", "squad", "team", "leaderboard", "ranking",
+        // IoT
+        "device", "sensor", "telemetry", "iot", "gateway",
+        "controller", "actuator", "beacon", "tracker", "monitor",
+        // 协作
+        "document", "editor", "whiteboard", "presentation", "spreadsheet",
+        "cursor", "selection", "annotation", "comment", "revision",
+        // 用户/社交
+        "user", "presence", "status", "activity", "profile",
+        "friend", "follower", "contact", "group", "community",
+        // 数据/监控
+        "data", "metrics", "logs", "analytics", "monitoring",
+        "health", "performance", "trace", "span", "event",
+        // 位置
+        "location", "tracking", "geo", "map", "navigation",
+        "route", "delivery", "shipment", "fleet", "vehicle",
+        // 系统
+        "system", "config", "state", "cache", "queue",
+        "job", "task", "workflow", "pipeline", "build",
+    ];
+
+    let actions: &[&str] = &[
+        "stream", "live", "realtime", "feed", "websocket",
+        "events", "sync", "push", "pull", "subscribe",
+        "broadcast", "publish", "connect", "channel", "negotiate",
+        "handshake", "heartbeat", "ping", "update", "delta",
+    ];
+
+    let template = templates.choose(&mut rng).unwrap();
+    let resource = resources.choose(&mut rng).unwrap();
+    let action = actions.choose(&mut rng).unwrap();
+    let ver = rng.gen_range(1..=4);
+    let id = if rng.gen_bool(0.5) {
+        generate_ws_uuid()
+    } else {
+        generate_short_id()
+    };
+
+    let path = template
+        .replace("{ver}", &ver.to_string())
+        .replace("{resource}", resource)
+        .replace("{action}", action)
+        .replace("{id}", &id);
+
+    let mut params: Vec<String> = Vec::new();
+
+    // 协议特定的参数
+    if path.contains("socket.io") {
+        params.push(format!("EIO={}", rng.gen_range(3..=4)));
+        params.push("transport=websocket".to_string());
+        if rng.gen_bool(0.7) {
+            params.push(format!("sid={}", generate_hex_id(16)));
+        }
+    } else if path.contains("graphql") {
+        params.push(format!("query={}", generate_graphql_query()));
+        if rng.gen_bool(0.5) {
+            params.push(format!("operationName={}", [
+                "SubscribePrices", "SubscribeTrades", "SubscribeOrders", "OnMessageReceived",
+                "OnPresenceUpdate", "OnNotification",
+            ].choose(&mut rng).unwrap()));
+        }
+    } else if path.contains("signalr") {
+        params.push(format!("id={}", generate_ws_uuid()));
+        params.push(format!("access_token={}", generate_jwt_token()));
+    } else if path.contains("pusher") {
+        params.push(format!("protocol={}", rng.gen_range(5..=7)));
+        params.push("client=js".to_string());
+        params.push(format!("version={}", ["7.0.0", "7.6.0", "8.0.0"].choose(&mut rng).unwrap()));
+    } else {
+        let pool = vec![
+            format!("token={}", generate_jwt_token()),
+            format!("session={}", generate_ws_uuid()),
+            format!("client_id={}", generate_hex_id(16)),
+            format!("connection_id={}", generate_ws_uuid()),
+            format!("format={}", ["json", "protobuf", "binary", "msgpack"].choose(&mut rng).unwrap()),
+            format!("encoding={}", ["utf8", "base64"].choose(&mut rng).unwrap()),
+            format!("compress={}", ["zstd", "deflate", "gzip", "none"].choose(&mut rng).unwrap()),
+            format!("heartbeat={}", [30, 60, 120].choose(&mut rng).unwrap()),
+            format!("ping_interval={}", [30, 60, 120].choose(&mut rng).unwrap()),
+            format!("protocol={}", ["wss", "ws"].choose(&mut rng).unwrap()),
+            format!("transport={}", ["websocket", "polling"].choose(&mut rng).unwrap()),
+            format!("version={}", ["2.1.0", "3.0.1", "1.4.2", "2.5.0"].choose(&mut rng).unwrap()),
+            format!("client={}", ["web-3.2.1", "ios-4.1.0", "android-2.8.3", "desktop-1.5.0"].choose(&mut rng).unwrap()),
+            format!("api_key={}", generate_hex_id(32)),
+            format!("room={}", generate_room_id()),
+            format!("channel={}", generate_channel_name()),
+            format!("user_id={}", rng.gen::<u64>()),
+            format!("timestamp={}", generate_timestamp()),
+            format!("nonce={}", generate_hex_id(8)),
+        ];
+        let n = rng.gen_range(2..=5);
+        for p in pool.choose_multiple(&mut rng, n) {
+            params.push(p.clone());
+        }
+    }
+
+    // No `ed=2048`: it is an xray early-data marker, not a WebSocket requirement,
+    // and the relay reads the VLESS header from the first frame without it. Omitting
+    // it makes the path indistinguishable from genuine app WebSocket traffic.
+    if params.is_empty() {
+        return path;
+    }
+    params.shuffle(&mut rng);
+    format!("{}?{}", path, params.join("&"))
+}
+
+fn generate_ws_uuid() -> String {
+    let mut rng = rand::thread_rng();
+    let mut bytes = [0u8; 16];
+    rng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn generate_short_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let len = rng.gen_range(8..=16);
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+fn generate_hex_id(len: usize) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    const HEX: &[u8] = b"0123456789abcdef";
+    (0..len)
+        .map(|_| HEX[rng.gen_range(0..HEX.len())] as char)
+        .collect()
+}
+
+fn generate_jwt_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+    let payload_len = rng.gen_range(48..=96);
+    let mut payload_bytes = vec![0u8; payload_len];
+    rng.fill_bytes(&mut payload_bytes);
+    let payload = general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+    let sig_len = rng.gen_range(32..=48);
+    let mut sig_bytes = vec![0u8; sig_len];
+    rng.fill_bytes(&mut sig_bytes);
+    let signature = general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
+    format!("{}.{}.{}", header, payload, signature)
+}
+
+fn generate_graphql_query() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let queries = [
+        "subscription%20OnPriceUpdate%20%7B%20price%20%7B%20symbol%20price%20timestamp%20%7D%20%7D",
+        "subscription%20OnTrade%20%7B%20trade%20%7B%20id%20amount%20price%20side%20%7D%20%7D",
+        "subscription%20OnMessage%20%7B%20message%20%7B%20id%20content%20sender%20timestamp%20%7D%20%7D",
+        "subscription%20OnNotification%20%7B%20notification%20%7B%20type%20data%20read%20%7D%20%7D",
+        "subscription%20OnPresence%20%7B%20presence%20%7B%20userId%20status%20lastSeen%20%7D%20%7D",
+        "subscription%20OnOrder%20%7B%20order%20%7B%20id%20status%20amount%20symbol%20%7D%20%7D",
+    ];
+    queries[rng.gen_range(0..queries.len())].to_string()
+}
+
+fn generate_room_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let prefixes = ["room", "lobby", "channel", "space", "hub"];
+    let prefix = prefixes[rng.gen_range(0..prefixes.len())];
+    let id: u64 = rng.gen();
+    format!("{}_{}", prefix, id)
+}
+
+fn generate_channel_name() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let names = [
+        "global", "general", "random", "dev", "ops", "alerts",
+        "trades", "prices", "orders", "system", "logs", "events",
+        "private", "direct", "group", "team", "project",
+    ];
+    let name = names[rng.gen_range(0..names.len())];
+    let suffix: u32 = rng.gen();
+    format!("{}-{}", name, suffix)
+}
+
+fn generate_timestamp() -> u64 {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let base: u64 = 1_700_000_000;
+    base + rng.gen_range(0..100_000_000)
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}

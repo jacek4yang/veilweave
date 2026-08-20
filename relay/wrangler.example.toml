@@ -1,0 +1,34 @@
+# This is the **reference** wrangler.toml. The committed `wrangler.toml` is
+# safe to copy as-is, but the SECRET_KEY there is a placeholder.
+# For local dev or staging you can `cp wrangler.example.toml wrangler.toml`
+# and fill the placeholder with your own relay blob from
+# `cargo run --manifest-path tools/Cargo.toml -- gen-secret`.
+#
+# For production, use the secret-store path:
+#     wrangler secret put SECRET_KEY
+# and remove the `[vars].SECRET_KEY` line.
+
+name = "veilweave"
+main = "build/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+cwd = "."
+
+[observability]
+enabled = true
+
+[vars]
+# Run `cargo run --manifest-path tools/Cargo.toml -- gen-secret` to obtain a
+# matched pair of blobs; paste the **relay blob** here.
+SECRET_KEY = "VlcxAKSNnREPLACE_WITH_YOUR_RELAY_BLOB_GENERATED_BY_gen-secret"
+
+[[durable_objects.bindings]]
+name = "VEILWEAVE_SESSION"
+class_name = "VeilweaveSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VeilweaveSession"]
