@@ -119,7 +119,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: worker-bundles
-          path: app/src-tauri/bundle
+          path: app/src-tauri
       - name: Verify embedded worker bundle
         run: |
           test -f app/src-tauri/bundle/relay/build/index.js
