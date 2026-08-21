@@ -25,9 +25,13 @@ tokio = { version = "1", features = ["full"] }
 dialoguer = "0.11"
 
 # GUI (glow backend only — no wgpu). `open` opens the system browser.
+# x11/wayland select winit's Linux backends (without them winit refuses to
+# compile on Linux); they are no-ops on Windows/macOS.
 eframe = { version = "0.36", default-features = false, features = [
     "glow",
     "default_fonts",
+    "x11",
+    "wayland",
 ] }
 open = "5"
 

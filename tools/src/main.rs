@@ -56,7 +56,7 @@ enum Commands {
     /// as the relay's `SECRET_KEY` and in the sub's `VEILWEAVE_NODES` as
     /// `domain|<same secret>` — plaintext VLESS (`encryption=none`).
     /// `--encryption` instead prints the EXPERIMENTAL combined blob pair
-    /// (UUID secret + X25519 key, `mlkem768x25519plus`).
+    /// (UUID secret plus X25519 key material for mlkem768x25519plus).
     GenSecret {
         /// Print the EXPERIMENTAL VLESS Encryption blob pair instead of a raw
         /// secret. Warning: the encryption datapath is CPU-heavy and can

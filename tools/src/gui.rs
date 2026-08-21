@@ -974,7 +974,7 @@ mod tests {
         Config {
             accounts: vec![Account {
                 name: "test".into(),
-                token: "tok-12345678-abcd".into(),
+                token: "tok-12345678-abcd".into(), // gitleaks:allow — dummy test value
                 account_id: "acc-0001".into(),
                 workers_dev_subdomain: Some("tester".into()),
             }],
