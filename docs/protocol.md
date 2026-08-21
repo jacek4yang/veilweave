@@ -1,7 +1,10 @@
 # Protocol
 
 The wire format of the **signed UUID** and the **encrypted record layer**
-— what bytes fly between xray-core client and veilweave relay.
+— what bytes fly between xray-core client and veilweave relay when the
+experimental VLESS Encryption mode is enabled (a `VW1` blob `SECRET_KEY`).
+With the default raw secret the datapath is plaintext (`encryption=none`)
+and only §1 (signed UUID) applies.
 
 This is the *byte-for-byte* spec that the Rust code in `relay/src/`
 implements. It is a subset of xray-core's `proxy/vless/encryption`,
@@ -72,9 +75,9 @@ mac         = HMAC-SHA256(k_mac, nonce ‖ ciphertext)[:5]
    x25519     (32B; private for kind=0, public for kind=1)
 ```
 
-A non-blob string is treated as a legacy raw secret: it seeds the
-codec directly (bytes-as-master) and disables VLESS Encryption (the
-relay needs a `kind=0` blob to have the X25519 private key).
+A non-blob string is treated as a raw secret (the default since v1.0.0): it
+seeds the codec directly (bytes-as-master) and disables VLESS Encryption
+(the relay needs a `kind=0` blob to have the X25519 private key).
 
 ## 2. VLESS Encryption handshake (server)
 

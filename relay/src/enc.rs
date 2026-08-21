@@ -258,12 +258,23 @@ pub async fn seal_record_wasm(
 
 // ─── Server handshake ─────────────────────────────────────────────────────────────
 
+/// Outcome of one handshake attempt over the bytes buffered so far.
+pub enum HandshakePoll {
+    /// Handshake complete: derived keys, nonce state, data-stream leftover.
+    Done(Handshake),
+    /// The buffer does not yet hold the whole clientHello; **nothing has been
+    /// sent**. The reader hands the whole buffer back so the caller can extend
+    /// it with the next frame and retry — no per-frame clone of the accumulation.
+    NeedMore(WsReader),
+}
+
 /// Perform the server side of the VLESS Encryption handshake over an in-memory
 /// `reader` (the buffered clientHello) and `ws` (server→client).
 ///
-/// `Ok(Some(_))` — handshake complete; returns derived keys + nonce state + any
-/// data-stream leftover. `Ok(None)` — the buffer does not yet hold the whole
-/// clientHello; **nothing has been sent**, so the caller retries with more bytes.
+/// `Done(_)` — handshake complete; returns derived keys + nonce state + any
+/// data-stream leftover. `NeedMore(reader)` — the buffer does not yet hold the
+/// whole clientHello; **nothing has been sent**, and the reader carries every
+/// buffered byte back to the caller for the retry with more frames.
 /// `Err` — protocol violation / ChaCha-only client (rejected).
 ///
 /// All clientHello reads happen before any `ws.send`, so a partial buffer is a
@@ -272,14 +283,14 @@ pub async fn server_handshake(
     cfg: &EncConfig,
     mut reader: WsReader,
     ws: &WebSocket,
-) -> Result<Option<Handshake>> {
+) -> Result<HandshakePoll> {
     let mut rng = WebRng;
 
     // (1) NFS key exchange. Single X25519 key → relays section is the client's
     //     ephemeral X25519 public key (32 bytes); native mode sends it as-is.
     let mut iv_relays = [0u8; 16 + X25519_LEN];
     if !reader.read_exact(&mut iv_relays).await? {
-        return Ok(None);
+        return Ok(HandshakePoll::NeedMore(reader));
     }
     let mut iv = [0u8; 16];
     iv.copy_from_slice(&iv_relays[..16]);
@@ -299,7 +310,7 @@ pub async fn server_handshake(
     //     ChaCha-only client (or garbage) — reject (no software ChaCha path).
     let mut len_buf = [0u8; 18];
     if !reader.read_exact(&mut len_buf).await? {
-        return Ok(None);
+        return Ok(HandshakePoll::NeedMore(reader));
     }
     nfs_aead.open(&mut len_buf, &[])?;
     let length = decode_length(&len_buf[..2]);
@@ -316,7 +327,7 @@ pub async fn server_handshake(
     // PFS public key from client: ML-KEM-768 encapsulation key ‖ X25519 public.
     let mut enc_pfs = vec![0u8; length];
     if !reader.read_exact(&mut enc_pfs).await? {
-        return Ok(None);
+        return Ok(HandshakePoll::NeedMore(reader));
     }
     let pl = nfs_aead.open(&mut enc_pfs, &[])?; // nfs nonce: 2nd use
     enc_pfs.truncate(pl);
@@ -329,7 +340,7 @@ pub async fn server_handshake(
     //     — before any send — so an incomplete clientHello is a clean retry.
     let mut cpad_len = [0u8; 18];
     if !reader.read_exact(&mut cpad_len).await? {
-        return Ok(None);
+        return Ok(HandshakePoll::NeedMore(reader));
     }
     nfs_aead.open(&mut cpad_len, &[])?; // nfs nonce: 3rd use
     let cplen = decode_length(&cpad_len[..2]);
@@ -339,7 +350,7 @@ pub async fn server_handshake(
     if cplen > 0 {
         let mut cpad = vec![0u8; cplen];
         if !reader.read_exact(&mut cpad).await? {
-            return Ok(None);
+            return Ok(HandshakePoll::NeedMore(reader));
         }
         nfs_aead.open(&mut cpad, &[])?; // nfs nonce: 4th use
     }
@@ -415,7 +426,7 @@ pub async fn server_handshake(
     // read unused → next 1).
     let key_w = derive_key(&pfs_public, &united_key);
     let key_r = derive_key(&client_pfs_public, &united_key);
-    Ok(Some(Handshake {
+    Ok(HandshakePoll::Done(Handshake {
         leftover: reader.leftover(),
         key_w,
         nonce_w: write_aead.nonce,

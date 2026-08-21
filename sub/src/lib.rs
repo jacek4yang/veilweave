@@ -75,8 +75,17 @@ async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
     // Initialize PRNG for this request
     init_prng();
 
-    // Get KV for caching
-    let kv = env.kv("VEILWEAVE_KV").or_else(|_| env.kv("KV")).ok();
+    // Get KV for caching (optional). Binding name resolution: an explicit
+    // `KV_BINDING` var wins (users are encouraged to pick their own binding
+    // name), then the conventional `VEILWEAVE_KV`, then plain `KV`.
+    let kv = env
+        .var("KV_BINDING")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|name| env.kv(&name).ok())
+        .or_else(|| env.kv("VEILWEAVE_KV").ok())
+        .or_else(|| env.kv("KV").ok());
 
     // Detect user geography (Cloudflare native)
     let user_country = extract_cf_header(req, "CF-IPCountry").unwrap_or_else(|| "XX".to_string());

@@ -48,4 +48,12 @@ impl WsReader {
     pub fn leftover(self) -> Vec<u8> {
         self.buf[self.pos..].to_vec()
     }
+
+    /// Hand the WHOLE buffer back, cursor ignored. A short read is a clean retry
+    /// (no side effects), so on an incomplete clientHello the caller re-buffers
+    /// every byte and retries once more of it has arrived — this lets the DO
+    /// move the accumulation out instead of cloning it per inbound frame.
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
 }

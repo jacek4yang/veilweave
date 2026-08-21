@@ -1,9 +1,10 @@
 // vless.rs
-// VLESS wire-format parsing for the decrypted inner stream. After the VLESS
-// Encryption handshake (`enc.rs`) the `VeilweaveSession` DO hands the decrypted
-// header bytes here; this module authenticates the signed UUID (which also carries
-// the egress) and decodes the request (command + target). It holds no I/O — the DO
-// owns the sockets and the record framing.
+// VLESS wire-format parsing for the inner stream. In encrypted mode the
+// `VeilweaveSession` DO hands the decrypted header bytes here after the VLESS
+// Encryption handshake (`enc.rs`); in plaintext mode (the default) the raw WS
+// bytes come here directly. Either way this module authenticates the signed
+// UUID (which also carries the egress) and decodes the request (command +
+// target). It holds no I/O — the DO owns the sockets and the record framing.
 
 use std::cell::{OnceCell, RefCell};
 
@@ -101,8 +102,8 @@ fn load_codec(env: &Env) -> Result<UuidCodec> {
         .map(|v| v.to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(fb)?;
-    // SECRET_KEY is a combined blob (UUID secret + encryption key); the UUID codec
-    // is seeded from the UUID-secret part.
+    // SECRET_KEY may be a combined blob (UUID secret + encryption key) or a raw
+    // secret string; either way the UUID codec is seeded from its UUID-secret bytes.
     Ok(UuidCodec::new(&crate::secret::parse(&secret).uuid_key))
 }
 

@@ -1,19 +1,20 @@
 # `relay/` — 数据面 Worker
 
-Cloudflare Worker 实现的 **VLESS + WS + VLESS Encryption** 终结点。
-每个连接在自己的 Durable Object 里跑握手和 bulk crypto，对外只暴露一
-条 WSS 端点。
+Cloudflare Worker 实现的 **VLESS + WS** 终结点。默认**明文直通**
+（`encryption=none`：无握手、无逐 record 加解密，每帧 CPU 接近零）；
+可选一个**实验性**的 VLESS Encryption（`mlkem768x25519plus`）加密层。
+每个连接在自己的 Durable Object 里跑，对外只暴露一条 WSS 端点。
 
 ## 它做什么 / 不做什么
 
 **做：**
 
 - 接收来自 xray / sing-box / v2rayN 等客户端的 WSS 升级请求；
-- 在自己的 Durable Object 里跑 ML-KEM-768 + X25519 + BLAKE3 混合 PFS 握手；
-- 用 WebCrypto AES-NI 加解密 record（AES-256-GCM）；
 - 验签 VLESS 头中的 16 字节 UUID（HMAC + HKDF 派生）；
 - 按 UUID 编码里的 type byte 直连 / 走 ProxyIP / SOCKS5 / HTTP-CONNECT；
-- 把上传字节流到目标、把下载字节封回 record 流给客户端；
+- 明文模式（默认）：把上传字节原样转发到目标、把下载字节原样封回 WS 帧；
+- 加密模式（实验性，需 `VW1` blob）：跑 ML-KEM-768 + X25519 + BLAKE3 混合
+  PFS 握手，用 WebCrypto AES-NI 加解密 record（AES-256-GCM）；
 - 对非 WS 请求返回 Apache 2.4.62 / Debian 伪装页。
 
 **不做：**
@@ -42,7 +43,7 @@ relay/
 │   ├── rng.rs            # crypto.getRandomValues → RngCore 适配器
 │   ├── hmac.rs           # 纯 Rust HMAC-SHA256 + HKDF
 │   ├── sha256.rs         # 纯 Rust SHA-256（仅给 HMAC 用）
-│   ├── secret.rs         # SECRET_KEY 解析（兼容 legacy raw + VW1 blob）
+│   ├── secret.rs         # SECRET_KEY 解析（raw secret + VW1 blob 自动识别）
 │   ├── apache_mock.rs    # 伪装页
 │   └── log.rs            # perf-log feature 开关
 │
@@ -61,10 +62,11 @@ relay/
 ## 快速部署
 
 ```bash
-# 1. 在项目根目录生成配套密钥
+# 1. 在项目根目录生成密钥（默认：一个明文模式用的 raw 随机密钥）
 cargo run --manifest-path tools/Cargo.toml -- gen-secret
+#    实验性加密：gen-secret --encryption（输出 relay blob + sub blob 一对）
 
-# 2. 把 "relay blob" 填到 wrangler.toml 的 [vars].SECRET_KEY
+# 2. 把密钥填到 wrangler.toml 的 [vars].SECRET_KEY
 #    或更推荐：用 secret 而非 vars
 #    wrangler secret put SECRET_KEY
 #    （然后把 wrangler.toml 里的 [vars].SECRET_KEY 整行删掉）
@@ -86,7 +88,7 @@ wrangler deploy
 | `name`                              | Worker 名（也是默认域名前缀）|
 | `compatibility_date`                | 固定 workerd 行为；尽量别改 |
 | `compatibility_flags = ["nodejs_compat"]` | 启用 Node.js 兼容 API |
-| `[build].command`                   | 部署时跑 `worker-build --release`（默认带 `perf-log`，生产关掉） |
+| `[build].command`                   | 部署时跑 `worker-build --release`（不带日志；抓现场加 `--features perf-log`） |
 | `[observability].enabled`           | 启用 Workers Logs（免费版采样） |
 | `[vars].SECRET_KEY`                 | **生产必删**，改用 `wrangler secret put SECRET_KEY` |
 | `[[durable_objects.bindings]]`      | 把 `VeilweaveSession` 类绑到 `VEILWEAVE_SESSION` 名 |
@@ -94,21 +96,27 @@ wrangler deploy
 
 ### `SECRET_KEY` 怎么填
 
-只接受两种格式（自动识别）：
+两种格式（自动识别）：
 
-1. **新格式（推荐）**：`veilweave-tools gen-secret` 输出的 **relay blob**（以 `VW1` 开头的 base64url）。
-   内部 = `VW1‖0‖uuid_secret(32)‖x25519_private(32)`。
-   这会同时启用 UUID 签名 + VLESS Encryption（X25519 私钥用于握手）。
+1. **raw 密钥（默认，推荐）**：任意随机字符串——`veilweave-tools gen-secret`
+   默认输出的就是这种。它只用于 UUID 签名，数据面是**明文直通**
+   （链接为 `encryption=none`），每帧 CPU 接近零，轻松落在免费套餐的
+   CPU 预算内。
 
-2. **旧格式**：任意字符串。UUID 签名正常工作，**不启用** VLESS Encryption。
-   适用于老部署，链接会变成 `encryption=none`。
+2. **`VW1` blob（实验性 VLESS Encryption）**：`gen-secret --encryption`
+   输出的 **relay blob**（以 `VW1` 开头的 base64url），内部 =
+   `VW1‖0‖uuid_secret(32)‖x25519_private(32)`。它会同时启用 UUID 签名 +
+   VLESS Encryption（X25519 私钥用于握手）。注意：每条连接的握手 + 逐
+   record AEAD 很吃 CPU，**可能超出 Workers 免费套餐的单次调用 CPU
+   上限**，所以是实验性、不推荐在免费套餐上使用的功能。
 
 详见 [`../tools/README.md`](../tools/README.md)。
 
 ## 性能剖析
 
-`Cargo.toml` 默认开 `perf-log` feature（profile-aware：默认 ON，发布版 ON，
-长期生产可以关）。开启后所有 `vlog!` 才会输出。
+`perf-log` feature **默认关闭**（`Cargo.toml` 的 `default = []`，
+`wrangler.toml` 的 build 命令也不带它），正常构建/部署的产物里完全没有
+日志代码。要抓现场时，单独构建一个带日志的 worker：
 
 ```bash
 # 一次性发布「带日志的镜像」，用来抓现场
@@ -130,8 +138,8 @@ record 数 / 字节数、下载 stall 次数、错误关闭原因。
 
 | 想优化 | 看哪里 |
 |--------|--------|
-| ML-KEM-768 握手 CPU  | `enc.rs::server_handshake`、`.cargo/config.toml` 的 simd128 |
-| AEAD seal/open 速率  | `webcrypto.rs::Ctx`（per-isolate handle 缓存）|
+| ML-KEM-768 握手 CPU（加密模式） | `enc.rs::server_handshake`、`.cargo/config.toml` 的 simd128 |
+| AEAD seal/open 速率（加密模式） | `webcrypto.rs::Ctx`（per-isolate handle 缓存）|
 | 下载吞吐             | `datapath.rs::relay_download` 的 `WS_SEND_HWM` / `DL_RECORD` |
 | UUID 验签            | `vless.rs` 的两层 cache（codec OnceCell + LRU 16）|
 | 唤醒 / 上下文切换    | `session.rs::pump` 的 `pumping` 锁 |

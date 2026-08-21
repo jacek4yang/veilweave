@@ -3,7 +3,15 @@
 Step-by-step production deployment for the **three-piece** veilweave stack.
 Designed for the Cloudflare Workers free plan.
 
+> **Easiest path:** you don't need this guide at all. Download a release
+> archive, run `veilweave-tools` (GUI) or `veilweave-tools deploy` (CLI
+> wizard), and the deployer publishes both workers through the Cloudflare
+> API — accounts, KV, secrets, and the subscription URL included. This guide
+> covers the manual wrangler flow and the operational details underneath.
+
 ## 0. Prerequisites
+
+For the manual flow in this guide:
 
 | Tool         | Version      | Verify            |
 |--------------|--------------|-------------------|
@@ -13,7 +21,37 @@ Designed for the Cloudflare Workers free plan.
 | wrangler     | ≥ 3.x        | `wrangler --version` |
 | Cloudflare   | free or paid | `wrangler whoami`  |
 
-## 1. Generate a matched keypair
+For the deployer path (`veilweave-tools deploy` / GUI) you only need a
+Cloudflare **API token** with:
+
+- Account → Workers Scripts → **Edit**
+- Account → Workers KV Storage → **Edit**
+- Account → Account Settings → **Read** (resolves the workers.dev subdomain)
+
+Create it at <https://dash.cloudflare.com/profile/api-tokens>
+("Create Custom Token"). The deployer supports **multiple accounts** — a
+common hardening topology is sub on account A and each relay on its own
+account (B, C, D…), with an independent secret per relay.
+
+## 0.1 Plaintext vs. experimental encryption
+
+Since v1.0.0 the **default and recommended datapath is plaintext VLESS
+passthrough** (`encryption=none`): the client ↔ Cloudflare hop is normal TLS,
+and the relay forwards bytes without any handshake or per-record crypto, so
+per-frame CPU is near zero and the free plan's 10 ms per-invocation budget is
+never a concern. The tradeoff, stated plainly: Cloudflare terminates that TLS
+and can see the plaintext destination and payload — the same trust model as
+any site hosted on Cloudflare.
+
+VLESS Encryption (`mlkem768x25519plus`: ML-KEM-768 + X25519 PFS handshake,
+AES-256-GCM records) hides the stream from Cloudflare too, but its
+per-connection handshake and per-record AEAD are CPU-heavy and can exceed the
+free plan's CPU limit. It is **experimental** and opt-in: generate the blob
+pair with `gen-secret --encryption` (or `bundle --encryption`) and deploy the
+relay blob as `SECRET_KEY`. Existing blob deployments from ≤ 0.x keep working
+unchanged.
+
+## 1. Generate secrets
 
 ```bash
 git clone https://github.com/<owner>/veilweave.git
@@ -22,19 +60,24 @@ rustup target add wasm32-unknown-unknown
 cargo run --manifest-path tools/Cargo.toml -- gen-secret
 ```
 
-You'll see two blobs. **Copy them somewhere safe (1Password / Bitwarden)**
-before pasting them in the next step.
+The default output is **one raw random secret**, used verbatim as the relay's
+`SECRET_KEY` and in the sub's `VEILWEAVE_NODES` as `<domain>|<secret>`
+(plaintext mode). For the experimental encryption mode, run
+`gen-secret --encryption` instead — you'll get two blobs (relay + sub).
+
+**Copy the secret(s) somewhere safe (1Password / Bitwarden)** before pasting
+them in the next step. Run `gen-secret` once **per relay node**.
 
 ## 2. Deploy the relay (`relay/`)
 
 ### 2.1 Set the secret
 
-In production, **never** put the relay blob in `wrangler.toml`. Use:
+In production, **never** put the secret in `wrangler.toml`. Use:
 
 ```bash
 cd relay
 wrangler secret put SECRET_KEY
-# paste the **relay blob** when prompted
+# paste the raw secret (or, for experimental encryption, the **relay blob**)
 ```
 
 Then open `wrangler.toml` and **delete the entire `[vars]` block**
@@ -87,6 +130,22 @@ wrangler kv:namespace create VEILWEAVE_KV --preview
 #    [[kv_namespaces]]  preview_id = "..."
 ```
 
+**The binding name is customizable.** The worker resolves its namespace via
+the `KV_BINDING` var first, then `VEILWEAVE_KV`, then `KV`. To use your own
+name (recommended — see naming hygiene below), set both to the same value:
+
+```toml
+[[kv_namespaces]]
+binding = "my_cache"      # any valid JS identifier
+id = "..."
+
+[vars]
+KV_BINDING = "my_cache"
+```
+
+(`veilweave-tools bundle` and the deployer randomize the binding name, e.g.
+`kv_x7f2a9`, and wire up `KV_BINDING` for you.)
+
 ### 3.2 Set the secret token
 
 ```bash
@@ -101,21 +160,25 @@ wrangler secret put SUBSCRIPTION_TOKEN
 Edit `wrangler.toml` and replace the placeholder:
 
 ```toml
-VEILWEAVE_NODES = "relay.your-domain.com|<paste SUB blob from step 1>"
+VEILWEAVE_NODES = "relay.your-domain.com|<the same raw secret from step 1>"
 ```
 
-For multiple relay nodes, comma-separate, each with its own SUB blob:
+For multiple relay nodes, comma-separate, each with its own secret:
 
 ```toml
 VEILWEAVE_NODES = """
-node-a.example.com|<sub blob a>,
-node-b.example.com|<sub blob b>
+node-a.example.com|<secret a>,
+node-b.example.com|<secret b>
 """
 ```
 
-> Different nodes with different blobs sign their UUIDs independently —
+> Different nodes with different secrets sign their UUIDs independently —
 > a UUID issued for node a won't validate on node b (this is **a feature**:
 > per-node key isolation).
+>
+> For the experimental encryption mode, each node's secret is the **sub blob**
+> from `gen-secret --encryption` instead, and links automatically carry
+> `encryption=mlkem768x25519plus.native.1rtt.<pubkey>`.
 
 ### 3.4 Bind a custom domain
 
@@ -149,7 +212,7 @@ cargo run --manifest-path tools/Cargo.toml -- gen-link \
   --type proxyip \
   --proxy-ip 1.2.3.4 \
   --proxy-port 443 \
-  --secret-key "<the same relay blob from step 1>"
+  --secret-key "<the same secret from step 1>"
 ```
 
 Then:
@@ -164,16 +227,17 @@ Then:
    cd relay && wrangler tail
    ```
 
-   You should see `[veilweave] handshake: complete` and download lines.
+   (Logs need a `perf-log` build — see §6. Without it the worker compiles
+   with zero logging.)
 
 ## 5. Key rotation
 
 There is no in-place rotation. To rotate keys:
 
-1. `cargo run -p veilweave-tools -- gen-secret` — generate a fresh pair.
-2. Deploy the **new** relay blob (`wrangler secret put SECRET_KEY`).
+1. `cargo run -p veilweave-tools -- gen-secret` — generate a fresh secret.
+2. Deploy the **new** secret (`wrangler secret put SECRET_KEY`).
 3. Re-deploy `wrangler deploy`.
-4. Update `VEILWEAVE_NODES` in the sub worker with the new sub blob.
+4. Update `VEILWEAVE_NODES` in the sub worker with the new secret.
 5. Re-deploy the sub worker.
 6. Notify users to re-fetch the subscription.
 
@@ -190,9 +254,9 @@ via `wrangler tail`.
 
 ### Profiling the relay
 
-Default build has `perf-log` enabled in the build command. To get
-**even more** lines (per-record / per-frame counter dumps), build
-explicitly with the feature:
+The default build compiles **no logging at all** (the `perf-log` feature is
+off; zero hot-path overhead). To get per-record / per-frame counter dumps,
+build explicitly with the feature:
 
 ```bash
 cd relay
@@ -210,6 +274,11 @@ You'll see lines like:
 [veilweave] upload drive: 12 records, 16384 ciphertext bytes → target
 [veilweave] download: target EOF — 248 records / 67 reads, 4056880 plaintext bytes, 0 stalls over ~1234ms
 ```
+
+(Handshake / record lines only appear in the experimental encryption mode;
+the plaintext datapath logs connection lifecycle and byte counts.)
+
+Turn the feature back off for long-term production deploys.
 
 ### Custom metrics
 
@@ -233,6 +302,18 @@ that accepts non-WS is the Apache page. WS upgrades that fail the
 handshake will close fast. A simple rate-limit rule by `cf.client.ip` is
 usually enough.
 
+## 7.1 Naming hygiene
+
+Every veilweave deployment should look like *your* deployment, not like a
+stock one:
+
+- Pick your own **worker names** (not `veilweave` / `veilweave-sub`).
+- Pick your own **KV namespace title and binding name** (set `KV_BINDING`).
+- `veilweave-tools bundle` and the deployer already randomize worker names,
+  the KV binding, and inject a per-run nonce into each script so artifacts
+  never share a content hash — if you deploy manually, at least rename the
+  workers.
+
 ## 8. Cost & limits (free plan)
 
 | Limit                         | Free plan | Note |
@@ -249,6 +330,8 @@ usually enough.
 A single relay with 50 concurrent VLESS connections uses roughly:
 
 - 50 DO instances × few ms CPU = well under the 100k request budget.
+  (Plaintext mode: essentially zero CPU per frame. The experimental
+  encryption mode is the one that can approach the 10 ms cap.)
 - 0 KV / subreq.
 
 A sub worker serving 1000 unique users/day with 90% cache hit rate:
@@ -261,11 +344,12 @@ A sub worker serving 1000 unique users/day with 90% cache hit rate:
 
 | Failure | Recovery |
 |---------|----------|
-| `SECRET_KEY` leaked | Run `gen-secret` → deploy new blobs → notify users |
+| `SECRET_KEY` leaked | Run `gen-secret` → deploy the new secret → notify users |
 | `SUBSCRIPTION_TOKEN` leaked | `wrangler secret put SUBSCRIPTION_TOKEN` (new value) |
-| Sub KV corrupted | `wrangler kv:delete --binding VEILWEAVE_KV 'proxyip_cache_v1'` |
+| Sub KV corrupted | `wrangler kv:delete --binding <KV_BINDING> 'proxyip_cache_v1'` |
 | Relay misbehaving | `wrangler rollback` (Cloudflare keeps last 5 deploys) |
 | Cloudflare region down | Free plan = single region; consider paid plan for HA |
+| Whole account suspended | Redeploy from the deployer to another account (`deploy` → pick account) |
 
 ## 10. Common gotchas
 
@@ -274,9 +358,13 @@ A sub worker serving 1000 unique users/day with 90% cache hit rate:
   vs. the deployed `SECRET_KEY`.
 - **Sub returns 404**: token mismatch or `SUBSCRIPTION_TOKEN` env not
   set. Tail the worker to confirm.
-- **`handshake: complete` then immediate close**: client and relay
-  disagree on the encryption profile. Make sure the client is
-  configured with `encryption=mlkem768x25519plus` (not `none`).
+- **Client and relay disagree on encryption**: the link's `encryption=...`
+  parameter comes from the secret type. Raw secret → `encryption=none`;
+  `VW1` blob → `encryption=mlkem768x25519plus...`. If you switch modes,
+  regenerate the links/subscription — old links keep the old mode.
+- **CPU limit exceeded in encryption mode**: expected on busy connections —
+  that's why encryption is experimental. Switch to the plaintext default if
+  this bites.
 - **Slow downloads**: the egress `ProxyIp` may be down. The direct
   fallback in `egress::connect_target` should still serve most traffic;
   check `wrangler tail` for "connect" failures.

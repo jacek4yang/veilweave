@@ -3,9 +3,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::{seq::SliceRandom, RngCore};
 use std::net::Ipv4Addr;
 
+mod cfapi;
 mod codec;
+mod config;
+mod deploy;
+mod gui;
 mod hmac;
 mod sha256;
+mod wizard;
 
 use codec::UuidCodec;
 
@@ -47,12 +52,18 @@ enum Commands {
         #[arg(long)]
         secret_key: String,
     },
-    /// Generate a matched pair of combined secrets. Each bundles the UUID-signing
-    /// secret and the VLESS Encryption (mlkem768x25519plus) X25519 key into one
-    /// string: the relay blob (private key) goes in veilweave's `SECRET_KEY`, the
-    /// sub blob (public key) goes in veilweave-sub's `VEILWEAVE_NODES` as
-    /// `domain|<blob>`. Same single-value fill as before — just paste each blob.
-    GenSecret,
+    /// Generate secrets for relay + sub. Default: ONE raw random secret used
+    /// as the relay's `SECRET_KEY` and in the sub's `VEILWEAVE_NODES` as
+    /// `domain|<same secret>` — plaintext VLESS (`encryption=none`).
+    /// `--encryption` instead prints the EXPERIMENTAL combined blob pair
+    /// (UUID secret + X25519 key, `mlkem768x25519plus`).
+    GenSecret {
+        /// Print the EXPERIMENTAL VLESS Encryption blob pair instead of a raw
+        /// secret. Warning: the encryption datapath is CPU-heavy and can
+        /// exceed the Workers free plan's per-invocation CPU limit.
+        #[arg(long)]
+        encryption: bool,
+    },
     /// Pack the prebuilt workers (shipped next to this binary in `bundle/`) into
     /// ready-to-deploy folders: fresh secrets, randomized worker names, and a
     /// per-run nonce injected into each script so every user's artifact is unique.
@@ -70,7 +81,22 @@ enum Commands {
         /// next to the executable (as shipped in the release archive).
         #[arg(long)]
         bundle_dir: Option<String>,
+        /// Use the EXPERIMENTAL VLESS Encryption blob pair instead of the
+        /// default plaintext (encryption=none) raw secret.
+        #[arg(long)]
+        encryption: bool,
     },
+    /// Interactive deploy wizard: deploy the relay and sub workers directly to
+    /// Cloudflare via the API — no wrangler, no Node.js required.
+    Deploy {
+        /// Directory containing the prebuilt workers. Defaults to `bundle/`
+        /// next to the executable (as shipped in the release archive).
+        #[arg(long)]
+        bundle_dir: Option<String>,
+    },
+    /// Manage existing deployments: list them, re-show a subscription URL, or
+    /// delete a worker (and its KV namespace) from Cloudflare.
+    Manage,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -83,13 +109,17 @@ enum ProxyType {
 
 fn main() {
     let cli = Cli::parse();
-    // Double-click (no subcommand) defaults to `bundle` — that is the path
-    // release-archive users take.
-    let command = cli.command.unwrap_or(Commands::Bundle {
-        out: "dist".to_string(),
-        relay_domain: None,
-        bundle_dir: None,
-    });
+    let Some(command) = cli.command else {
+        // Double-click (no subcommand) launches the GUI deployer.
+        if let Err(e) = gui::launch() {
+            eprintln!("无法创建图形界面窗口 / could not open the GUI window: {e:#}");
+            eprintln!("（无显示环境？）请改用命令行部署向导 / headless? use the CLI wizard:");
+            eprintln!("    veilweave-tools deploy");
+            pause_before_exit();
+            std::process::exit(1);
+        }
+        return;
+    };
     let pause = matches!(command, Commands::Bundle { .. });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(command)));
     if pause {
@@ -169,32 +199,78 @@ fn run(command: Commands) {
 
             println!("{}", url);
         }
-        Commands::GenSecret => {
-            use x25519_dalek::{PublicKey, StaticSecret};
-            // One shared UUID-signing secret, plus one X25519 keypair for VLESS
-            // Encryption. The relay gets the private key, the sub gets the public.
-            let mut uuid_secret = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut uuid_secret);
-            let x = StaticSecret::random_from_rng(rand::thread_rng());
-            let priv_bytes = x.to_bytes();
-            let pub_bytes = PublicKey::from(&x).to_bytes();
-
-            let relay = encode_blob(0, &uuid_secret, &priv_bytes);
-            let sub = encode_blob(1, &uuid_secret, &pub_bytes);
-
-            println!("# ── veilweave relay ──  set  SECRET_KEY  to:");
-            println!("{relay}");
-            println!();
-            println!("# ── veilweave-sub ──  use in  VEILWEAVE_NODES  as  <domain>|<blob>:");
-            println!("{sub}");
+        Commands::GenSecret { encryption } => {
+            if encryption {
+                print_encryption_secret_pair();
+            } else {
+                // Plaintext mode (encryption=none): ONE raw random secret shared
+                // between the relay (SECRET_KEY) and the sub (VEILWEAVE_NODES).
+                let secret = gen_raw_secret();
+                println!("# Plaintext VLESS (encryption=none) — one shared raw secret.");
+                println!();
+                println!("# ── veilweave relay ──  set  SECRET_KEY  to:");
+                println!("{secret}");
+                println!();
+                println!(
+                    "# ── veilweave-sub ──  use in  VEILWEAVE_NODES  as  <domain>|<secret>, e.g.:"
+                );
+                println!("my-relay.example.workers.dev|{secret}");
+                println!();
+                println!(
+                    "# Every relay should get its OWN secret — run gen-secret once per relay."
+                );
+            }
         }
         Commands::Bundle {
             out,
             relay_domain,
             bundle_dir,
+            encryption,
         } => {
-            run_bundle(&out, relay_domain.as_deref(), bundle_dir.as_deref());
+            run_bundle(
+                &out,
+                relay_domain.as_deref(),
+                bundle_dir.as_deref(),
+                encryption,
+            );
         }
+        Commands::Deploy { bundle_dir } => run_async(wizard::run_deploy(bundle_dir)),
+        Commands::Manage => run_async(wizard::run_manage()),
+    }
+}
+
+/// Print the EXPERIMENTAL VLESS Encryption combined blob pair (the pre-1.0
+/// `gen-secret` behavior). Kept byte-compatible with relay/src/secret.rs.
+fn print_encryption_secret_pair() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    // One shared UUID-signing secret, plus one X25519 keypair for VLESS
+    // Encryption. The relay gets the private key, the sub gets the public.
+    let mut uuid_secret = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut uuid_secret);
+    let x = StaticSecret::random_from_rng(rand::thread_rng());
+    let priv_bytes = x.to_bytes();
+    let pub_bytes = PublicKey::from(&x).to_bytes();
+
+    let relay = encode_blob(0, &uuid_secret, &priv_bytes);
+    let sub = encode_blob(1, &uuid_secret, &pub_bytes);
+
+    println!("⚠️  EXPERIMENTAL: VLESS Encryption (mlkem768x25519plus) is CPU-heavy and");
+    println!("    can exceed the Workers free plan's per-invocation CPU limit. The default");
+    println!("    plaintext mode (gen-secret without --encryption) is recommended.");
+    println!();
+    println!("# ── veilweave relay ──  set  SECRET_KEY  to:");
+    println!("{relay}");
+    println!();
+    println!("# ── veilweave-sub ──  use in  VEILWEAVE_NODES  as  <domain>|<blob>:");
+    println!("{sub}");
+}
+
+/// Run an async deploy/manage entry point on a fresh tokio runtime.
+fn run_async(future: impl std::future::Future<Output = anyhow::Result<()>>) {
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    if let Err(e) = rt.block_on(future) {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
     }
 }
 
@@ -204,16 +280,10 @@ fn run(command: Commands) {
 /// next to the binary, generates fresh secrets, randomizes worker names, and
 /// injects a per-run nonce comment into each `index.js` so every user's artifact
 /// has a unique content hash.
-fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>) {
-    use std::path::{Path, PathBuf};
+fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>, encryption: bool) {
+    use std::path::Path;
 
-    let bundle_root: PathBuf = match bundle_dir {
-        Some(d) => PathBuf::from(d),
-        None => std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("bundle")))
-            .unwrap_or_else(|| PathBuf::from("bundle")),
-    };
+    let bundle_root = crate::deploy::locate_bundle_dir(bundle_dir);
     for unit in ["relay", "sub"] {
         let src = bundle_root.join(unit);
         if !src.join("build/index.js").is_file() {
@@ -226,11 +296,18 @@ fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>) {
         }
     }
 
-    // Fresh matched secrets: relay blob (X25519 private) + sub blob (public).
-    let (relay_blob, sub_blob) = gen_secret_pair();
+    // One shared secret for relay and sub. Plaintext (default): a raw random
+    // string. --encryption: the EXPERIMENTAL blob pair (UUID secret + X25519).
+    let (relay_secret, sub_secret) = if encryption {
+        gen_secret_pair()
+    } else {
+        let raw = gen_raw_secret();
+        (raw.clone(), raw)
+    };
     let token = generate_hex_id(32);
     let relay_name = random_worker_name();
     let sub_name = random_worker_name();
+    let kv_binding = random_kv_binding();
     let relay_domain = relay_domain
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{relay_name}.<your-subdomain>.workers.dev"));
@@ -244,12 +321,19 @@ fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>) {
 
     std::fs::write(
         relay_out.join("wrangler.toml"),
-        relay_wrangler_toml(&relay_name, &relay_blob),
+        relay_wrangler_toml(&relay_name, &relay_secret, encryption),
     )
     .expect("write relay wrangler.toml");
     std::fs::write(
         sub_out.join("wrangler.toml"),
-        sub_wrangler_toml(&sub_name, &relay_domain, &sub_blob, &token),
+        sub_wrangler_toml(
+            &sub_name,
+            &relay_domain,
+            &sub_secret,
+            &token,
+            &kv_binding,
+            encryption,
+        ),
     )
     .expect("write sub wrangler.toml");
 
@@ -274,7 +358,7 @@ fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>) {
         "  2. Edit {}/wrangler.toml: set VEILWEAVE_NODES domain to that domain,",
         sub_out.display()
     );
-    println!("     then run:  wrangler kv:namespace create VEILWEAVE_KV");
+    println!("     then run:  wrangler kv:namespace create {kv_binding}");
     println!("     and paste the printed id into [[kv_namespaces]].id");
     println!("  3. cd {} && wrangler deploy", sub_out.display());
     println!("  4. Subscription URL:  https://<sub-domain>/sub?token={token}");
@@ -289,8 +373,13 @@ fn pack_worker(src: &std::path::Path, dst: &std::path::Path) {
     copy_dir(&src.join("build"), &dst.join("build"));
     let index = dst.join("build/index.js");
     let js = std::fs::read_to_string(&index).expect("read build/index.js");
-    let nonce = generate_hex_id(64);
-    std::fs::write(&index, format!("/* vw:{nonce} */\n{js}")).expect("write build/index.js");
+    std::fs::write(&index, inject_nonce(&js)).expect("write build/index.js");
+}
+
+/// Prepend a per-run nonce comment so every user's artifact has a unique
+/// content hash. Shared by `bundle` and the direct-deploy path.
+fn inject_nonce(js: &str) -> String {
+    format!("/* vw:{} */\n{js}", generate_hex_id(64))
 }
 
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
@@ -336,7 +425,31 @@ fn random_worker_name() -> String {
     )
 }
 
-fn relay_wrangler_toml(name: &str, relay_blob: &str) -> String {
+/// Random raw shared secret for plaintext mode: 32 bytes, base64url (no pad).
+/// Used as the relay's SECRET_KEY and in the sub's VEILWEAVE_NODES verbatim.
+fn gen_raw_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Random KV binding name, e.g. `kv_x7f2a9` — always a valid JS identifier.
+/// The sub worker resolves its KV namespace via the `KV_BINDING` var, so the
+/// binding name itself can (and should) vary per deployment.
+fn random_kv_binding() -> String {
+    format!("kv_{}", generate_hex_id(6))
+}
+
+fn relay_wrangler_toml(name: &str, secret: &str, encryption: bool) -> String {
+    let secret_comment = if encryption {
+        "# EXPERIMENTAL: SECRET_KEY is the relay blob — it carries the UUID-signing\n\
+         # secret AND the X25519 private key for VLESS Encryption (mlkem768x25519plus).\n\
+         # Keep it private; regenerate with a fresh bundle if leaked."
+    } else {
+        "# SECRET_KEY is the raw shared secret for plaintext VLESS (encryption=none).\n\
+         # The same string goes in the sub's VEILWEAVE_NODES as `<domain>|<secret>`.\n\
+         # Keep it private; regenerate with a fresh bundle if leaked."
+    };
     format!(
         r#"name = "{name}"
 main = "build/index.js"
@@ -347,11 +460,10 @@ workers_dev = true
 [observability]
 enabled = true
 
-# Generated by `veilweave-tools bundle`. SECRET_KEY is the relay blob — it carries
-# the UUID-signing secret AND the X25519 private key for VLESS Encryption
-# (mlkem768x25519plus). Keep it private; regenerate with a fresh bundle if leaked.
+# Generated by `veilweave-tools bundle`.
+{secret_comment}
 [vars]
-SECRET_KEY = "{relay_blob}"
+SECRET_KEY = "{secret}"
 
 [[durable_objects.bindings]]
 name = "VEILWEAVE_SESSION"
@@ -364,7 +476,21 @@ new_sqlite_classes = ["VeilweaveSession"]
     )
 }
 
-fn sub_wrangler_toml(name: &str, relay_domain: &str, sub_blob: &str, token: &str) -> String {
+fn sub_wrangler_toml(
+    name: &str,
+    relay_domain: &str,
+    secret: &str,
+    token: &str,
+    kv_binding: &str,
+    encryption: bool,
+) -> String {
+    let secret_comment = if encryption {
+        "# <relay domain>|<sub blob> — replace the domain with your deployed relay's.\n\
+         # EXPERIMENTAL: the blob carries the UUID secret + X25519 public key."
+    } else {
+        "# <relay domain>|<raw secret> — replace the domain with your deployed relay's.\n\
+         # Plaintext VLESS (encryption=none); the secret must match the relay's SECRET_KEY."
+    };
     format!(
         r#"name = "{name}"
 main = "build/index.js"
@@ -372,14 +498,18 @@ compatibility_date = "2026-05-26"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-# Run:  wrangler kv:namespace create VEILWEAVE_KV   and paste the id below.
+# Run:  wrangler kv:namespace create {kv_binding}   and paste the id below.
+# The binding name is randomized per bundle; feel free to pick your own —
+# the worker finds its namespace via the KV_BINDING var below, so just keep
+# `binding` and `KV_BINDING` identical (must be a valid JS identifier).
 [[kv_namespaces]]
-binding = "VEILWEAVE_KV"
+binding = "{kv_binding}"
 id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 
 [vars]
-# <relay domain>|<sub blob> — replace the domain with your deployed relay's.
-VEILWEAVE_NODES = "{relay_domain}|{sub_blob}"
+KV_BINDING = "{kv_binding}"
+{secret_comment}
+VEILWEAVE_NODES = "{relay_domain}|{secret}"
 SUBSCRIPTION_TOKEN = "{token}"
 MAX_NODES = "100"
 FP = "chrome"

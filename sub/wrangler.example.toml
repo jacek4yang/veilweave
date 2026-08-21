@@ -4,7 +4,8 @@
 #
 # Steps to get a real one:
 #   1. cargo run --manifest-path tools/Cargo.toml -- gen-secret
-#   2. wrangler kv:namespace create VEILWEAVE_KV   # paste id below
+#   2. wrangler kv:namespace create <YOUR_NAMESPACE_NAME>   # paste id below;
+#      rename the binding too and set KV_BINDING to its name (recommended)
 #   3. Paste the SUB blob into VEILWEAVE_NODES
 #   4. wrangler secret put SUBSCRIPTION_TOKEN       # production
 #      (or paste a random token into the [vars] line for local dev)

@@ -1,11 +1,11 @@
 name: Release
 
 # Tag push (v*) builds and publishes a GitHub Release containing, per platform:
-#   veilweave-tools[.exe]      — native CLI (gen-secret / gen-link / bundle)
+#   veilweave-tools[.exe]      — all-in-one deployer (GUI + deploy/manage CLI)
 #   bundle/relay, bundle/sub   — PREBUILT workers (worker-build output)
-# End users never touch a Rust toolchain: download the archive, double-click the
-# executable (or run `veilweave-tools bundle`), then `wrangler deploy` the
-# generated folders.
+# End users never touch a Rust toolchain, Node, or wrangler: download the
+# archive, double-click the executable (GUI) or run `veilweave-tools deploy`,
+# paste a Cloudflare API token, pick a topology, done.
 
 on:
   push:
@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v0.1.0)"
+        description: "Release tag to create (e.g. v1.0.0)"
         required: true
-        default: "v0.1.0"
+        default: "v1.0.0"
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,6 +35,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux GUI build deps (egui/winit)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
         with:
@@ -113,19 +120,33 @@ jobs:
           veilweave — quick deploy / 快捷部署
           ====================================
 
-          EN: Double-click veilweave-tools (.exe) — or run `./veilweave-tools bundle`
-          in a terminal. It writes ready-to-deploy workers into `dist/` with fresh
-          secrets and randomized names. Then, for each generated folder:
+          EN: Double-click veilweave-tools (.exe) to open the GUI deployer
+          (or run `./veilweave-tools deploy` in a terminal for the wizard):
 
-              wrangler deploy
+            1. Add a Cloudflare account — the app opens the API token page;
+               the token needs: Workers Scripts Edit, Workers KV Storage Edit,
+               Account Settings Read.
+            2. Pick a topology: one account for the sub worker, one or more
+               accounts for relay nodes (multi-account is supported).
+            3. Click deploy — workers are uploaded directly via the Cloudflare
+               API. No Rust, Node, or wrangler needed.
+            4. Copy the subscription URL into your client.
 
-          The sub worker also needs a KV namespace — follow the steps printed by
-          the tool. Details: https://github.com/jacek4yang/veilweave#readme
+          Advanced: `veilweave-tools bundle` still generates wrangler-ready
+          folders for manual `wrangler deploy`.
+          Details: https://github.com/jacek4yang/veilweave#readme
 
-          中文：双击 veilweave-tools(.exe)，或在终端运行 `./veilweave-tools bundle`。
-          它会在 `dist/` 下生成可直接部署的 worker 目录（全新密钥 + 随机名称，
-          每次运行产物哈希均不相同）。然后进入生成的目录执行 `wrangler deploy`，
-          并按工具输出的提示为 sub 创建 KV。详见仓库 README。
+          中文：双击 veilweave-tools(.exe) 打开图形化部署器（或在终端运行
+          `./veilweave-tools deploy` 使用交互向导）：
+
+            1. 添加 Cloudflare 账号——程序会打开 API Token 页面；Token 需要：
+               Workers Scripts 编辑、Workers KV Storage 编辑、Account Settings 读取。
+            2. 选择拓扑：sub 放一个账号，若干 relay 节点可分散到多个账号。
+            3. 点击部署——直接通过 Cloudflare API 上传，无需 Rust/Node/wrangler。
+            4. 复制订阅链接到客户端。
+
+          高级用法：`veilweave-tools bundle` 仍会生成可用 wrangler 手动部署的目录。
+          详见仓库 README。
           EOF
       - name: Assemble per-platform archives
         run: |

@@ -20,29 +20,36 @@ cwd = "."
 enabled = true
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-# `SECRET_KEY` is the SINGLE configuration value. Generate it once with
-# `veilweave-tools gen-secret` (see tools/README.md) and paste the
-# **relay blob** below. The blob carries both the UUID-signing secret AND the
-# X25519 private key the VLESS Encryption handshake needs, so PQ-PFS
-# (`mlkem768x25519plus`) is enabled automatically — no extra variables.
+# `SECRET_KEY` is the SINGLE configuration value. The DEFAULT — and the mode
+# recommended for the Workers free CPU limits — is PLAINTEXT VLESS: set any
+# plain random secret string below. It seeds the UUID-signing codec only; the
+# data path is then a pure passthrough with zero crypto and zero handshake.
+#
+# VLESS Encryption (post-quantum, forward-secret — `mlkem768x25519plus`) is an
+# EXPERIMENTAL opt-in, and CPU-heavy on the free plan: generate a matched blob
+# pair with `veilweave-tools gen-secret --encryption` (see tools/README.md) and
+# paste the **relay blob** below. The blob carries both the UUID-signing secret
+# AND the X25519 private key the encryption handshake needs, so PQ-PFS is
+# enabled automatically — no extra variables.
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │  ⚠️  NEVER commit a real blob to this file.                               │
+# │  ⚠️  NEVER commit a real secret to this file.                             │
 # │  For production, run:                                                    │
 # │      wrangler secret put SECRET_KEY                                      │
 # │  and remove the `[vars].SECRET_KEY` line below entirely.                 │
 # └─────────────────────────────────────────────────────────────────────────┘
 [vars]
-# Replace with your relay blob from `cargo run -p veilweave-tools -- gen-secret`.
+# Default: a plain random secret string (plaintext VLESS — recommended).
+# Experimental: the relay blob from
+#   cargo run -p veilweave-tools -- gen-secret --encryption
 # Format: base64url, starts with "Vlcx..." (kind=0 relay blob).
-# A legacy raw secret (any non-blob string) still works but disables encryption.
-SECRET_KEY = "REPLACE_ME_WITH_RELAY_BLOB_FROM_gen-secret"
+SECRET_KEY = "REPLACE_ME_WITH_A_PLAIN_RANDOM_SECRET"
 
-# ─── Durable Object: per-connection VLESS Encryption session ────────────────
-# Every encrypted WS connection is handled by its own `VeilweaveSession` instance
-# under the WebSocket Hibernation API, so each inbound frame gets its own CPU
-# budget — the key to staying under the free plan's per-invocation 10 ms CPU cap
-# on bulk upload.
+# ─── Durable Object: per-connection VLESS session ───────────────────────────
+# Every WS connection (plaintext or encrypted) is handled by its own
+# `VeilweaveSession` instance under the WebSocket Hibernation API, so each
+# inbound frame gets its own CPU budget — the key to staying under the free
+# plan's per-invocation 10 ms CPU cap on bulk upload.
 [[durable_objects.bindings]]
 name = "VEILWEAVE_SESSION"
 class_name = "VeilweaveSession"

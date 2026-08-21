@@ -1,18 +1,29 @@
 // session.rs
-// `VeilweaveSession` — a per-connection Durable Object that runs the VLESS Encryption
-// data path under the **WebSocket Hibernation API**. The decisive benefit on the
-// free plan: each inbound WS frame is delivered as a *separate* `websocket_message`
-// invocation with its **own CPU budget**, so the ML-KEM handshake and all upload
-// crypto no longer pile into one 10 ms-capped invocation (which is what blew the
-// budget on bulk traffic in the single-`fetch` design).
+// `VeilweaveSession` — a per-connection Durable Object that runs the VLESS data
+// path under the **WebSocket Hibernation API**, in one of two modes selected by
+// `SECRET_KEY`:
+//
+//   Plaintext (default — any raw secret string): the VLESS header arrives as
+//     raw WS bytes; once it parses, both directions are a pure passthrough —
+//     zero crypto, zero record framing. This is the recommended mode under the
+//     Workers free CPU limits.
+//   Encrypted (experimental opt-in — a "VW1" blob secret): the VLESS Encryption
+//     handshake runs first and all traffic flows in AEAD records. The decisive
+//     benefit of hibernation here: each inbound WS frame is delivered as a
+//     *separate* `websocket_message` invocation with its **own CPU budget**, so
+//     the ML-KEM handshake and all upload crypto no longer pile into one
+//     10 ms-capped invocation (which is what blew the budget on bulk traffic in
+//     the single-`fetch` design).
 //
 //   fetch              → WS upgrade + `accept_web_socket` (hibernatable), return 101.
 //   websocket_message  → feed bytes to a resumable state machine:
-//                          Handshake → Header(VLESS) → Data | Udp.
-//                        Each message decrypts its records (own CPU budget) and
-//                        forwards to the target socket.
-//   download           → one background loop (target → encrypt → ws.send); the only
-//                        continuous task, kept minimal and payload-in-JS.
+//                          encrypted: Handshake → Header(VLESS) → Data | Udp
+//                          plaintext: PlainHeader(VLESS) → PlainData | PlainUdp.
+//                        Encrypted messages decrypt their records (own CPU budget)
+//                        and forward to the target socket; plaintext messages are
+//                        written through as-is.
+//   download           → one background loop (target → ws.send, encrypted or raw);
+//                        the only continuous task, kept minimal and payload-in-JS.
 //
 // In-memory per-connection state lives in `RefCell<Inner>`; it survives between
 // messages because the open target socket keeps the DO from hibernating while the
@@ -27,11 +38,13 @@ use web_sys::{ReadableStreamDefaultReader, WritableStreamDefaultWriter};
 use worker::*;
 
 use crate::conn::Conn;
-use crate::datapath::{relay_download, target_write_js};
+use crate::datapath::{plain_download, relay_download, target_write_js};
 use crate::egress::{connect_target, Egress};
-use crate::enc::{get_header, next_nonce, seal_record_wasm, server_handshake, EncConfig};
+use crate::enc::{
+    get_header, next_nonce, seal_record_wasm, server_handshake, EncConfig, HandshakePoll,
+};
 use crate::log::vlog;
-use crate::vless::{parse_vless_header, Command, VLESS_RESPONSE};
+use crate::vless::{parse_vless_header, Command, VlessRequest, VLESS_RESPONSE};
 use crate::wsio::WsReader;
 
 #[inline(always)]
@@ -47,10 +60,15 @@ type Record = ([u8; 5], Uint8Array, [u8; 12]);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Phase {
+    // Encrypted mode (blob secret): handshake, then record-framed phases.
     Handshake,
     Header,
     Data,
     Udp,
+    // Plaintext mode (raw secret): raw VLESS header, then pure passthrough.
+    PlainHeader,
+    PlainData,
+    PlainUdp,
     Closed,
 }
 
@@ -82,9 +100,16 @@ struct Inner {
 }
 
 impl Inner {
-    fn new() -> Self {
+    /// `plaintext` selects the starting phase: a raw (non-blob) `SECRET_KEY`
+    /// means the raw VLESS header arrives directly; a blob means the VLESS
+    /// Encryption clientHello comes first.
+    fn new(plaintext: bool) -> Self {
         Inner {
-            phase: Phase::Handshake,
+            phase: if plaintext {
+                Phase::PlainHeader
+            } else {
+                Phase::Handshake
+            },
             buf: Vec::new(),
             pos: 0,
             pumping: false,
@@ -134,23 +159,29 @@ impl Inner {
         self.pos = 0;
     }
 
-    /// Whether a *complete* record is buffered at the cursor — i.e. bytes that
-    /// arrived during the pump's awaits still need draining. Only meaningful once
-    /// records are being framed (post-handshake). A malformed header counts as
-    /// pending so the pump re-enters `drive`, which surfaces the error and closes.
+    /// Whether buffered bytes still need draining — i.e. bytes that arrived
+    /// during the pump's awaits. In the encrypted phases that means a *complete*
+    /// record at the cursor (a malformed header counts as pending so the pump
+    /// re-enters `drive`, which surfaces the error and closes). In the plaintext
+    /// data phases any buffered byte is forwardable as-is; the plaintext header
+    /// phase makes no progress without NEW bytes (its parse attempt never
+    /// awaits), so nothing can be pending there.
     fn has_pending(&self) -> bool {
-        if !matches!(self.phase, Phase::Header | Phase::Data | Phase::Udp) {
-            return false;
-        }
-        let avail = self.buf.len() - self.pos;
-        if avail < 5 {
-            return false;
-        }
-        let mut hdr = [0u8; 5];
-        hdr.copy_from_slice(&self.buf[self.pos..self.pos + 5]);
-        match get_header(&hdr) {
-            Ok(l) => avail >= 5 + l,
-            Err(_) => true,
+        match self.phase {
+            Phase::PlainHeader | Phase::Handshake | Phase::Closed => false,
+            Phase::PlainData | Phase::PlainUdp => self.buf.len() > self.pos,
+            Phase::Header | Phase::Data | Phase::Udp => {
+                let avail = self.buf.len() - self.pos;
+                if avail < 5 {
+                    return false;
+                }
+                let mut hdr = [0u8; 5];
+                hdr.copy_from_slice(&self.buf[self.pos..self.pos + 5]);
+                match get_header(&hdr) {
+                    Ok(l) => avail >= 5 + l,
+                    Err(_) => true,
+                }
+            }
         }
     }
 }
@@ -166,22 +197,34 @@ pub struct VeilweaveSession {
 impl DurableObject for VeilweaveSession {
     fn new(state: State, env: Env) -> Self {
         // The encryption config is derived once from the relay's combined secret.
+        // A "VW1" blob yields `Some` → VLESS Encryption (experimental opt-in);
+        // a raw (non-blob) secret yields `None` → plaintext VLESS, the default
+        // and recommended mode under the Workers free CPU limits.
         let cfg = env
             .var("SECRET_KEY")
             .ok()
             .map(|v| v.to_string())
             .and_then(|s| crate::secret::parse(&s).relay_private())
             .map(EncConfig::new);
+        let plaintext = cfg.is_none();
         Self {
             state,
             env,
             cfg,
-            inner: RefCell::new(Inner::new()),
+            inner: RefCell::new(Inner::new(plaintext)),
         }
     }
 
     async fn fetch(&self, _req: Request) -> Result<Response> {
-        if self.cfg.is_none() {
+        // A missing/empty SECRET_KEY is a misconfiguration in either mode (the
+        // UUID codec could not be seeded), so refuse the upgrade early.
+        let configured = self
+            .env
+            .var("SECRET_KEY")
+            .ok()
+            .map(|v| v.to_string())
+            .is_some_and(|s| !s.is_empty());
+        if !configured {
             return Response::error("not configured", 500);
         }
         let pair = WebSocketPair::new()?;
@@ -193,11 +236,19 @@ impl DurableObject for VeilweaveSession {
             .set_binary_type(web_sys::BinaryType::Arraybuffer);
 
         // The veilweave-generated config carries no `?ed=` early-data and no
-        // WebSocket subprotocol — the VLESS-Encryption clientHello arrives in the
-        // first WS frame — so there is nothing to seed or echo here.
-        *self.inner.borrow_mut() = Inner::new();
+        // WebSocket subprotocol — in encrypted mode the VLESS-Encryption
+        // clientHello arrives in the first WS frame, in plaintext mode the raw
+        // VLESS header does — so there is nothing to seed or echo here.
+        *self.inner.borrow_mut() = Inner::new(self.cfg.is_none());
 
-        vlog!("session: ws accepted (hibernatable), awaiting clientHello");
+        vlog!(
+            "session: ws accepted (hibernatable), mode={}",
+            if self.cfg.is_some() {
+                "vless-encryption"
+            } else {
+                "plaintext"
+            }
+        );
         Response::from_websocket(pair.client)
     }
 
@@ -310,15 +361,36 @@ impl VeilweaveSession {
     /// Advance the connection state machine as far as the buffered bytes allow.
     /// Borrows of `inner` are confined to short sync sections (never across await).
     async fn drive(&self, ws: &web_sys::WebSocket) -> Result<()> {
+        // Plaintext mode runs its own phases — no handshake, no record framing.
+        if matches!(
+            self.phase(),
+            Phase::PlainHeader | Phase::PlainData | Phase::PlainUdp
+        ) {
+            return self.drive_plain(ws).await;
+        }
+
         // ── Handshake ──
         if self.phase() == Phase::Handshake {
-            let buf = self.inner.borrow().buf.clone();
             #[cfg(feature = "perf-log")]
             let hs_t0 = crate::log::now_ms();
             let cfg = self.cfg.as_ref().ok_or_else(fb)?;
+            // Move the buffer out instead of cloning it: the handshake retries on
+            // every inbound frame until the clientHello is complete, so copying
+            // the whole accumulation per invocation is pure churn. `NeedMore`
+            // hands the bytes straight back.
+            let buf = std::mem::take(&mut self.inner.borrow_mut().buf);
             match server_handshake(cfg, WsReader::from_buffer(buf), ws).await? {
-                None => return Ok(()), // need more clientHello bytes
-                Some(hs) => {
+                HandshakePoll::NeedMore(reader) => {
+                    // Incomplete clientHello: restore the bytes and wait for the
+                    // next frame. Anything concurrent invocations appended during
+                    // the await sorts behind what we already had.
+                    let mut inner = self.inner.borrow_mut();
+                    let mut buf = reader.into_inner();
+                    buf.extend_from_slice(&inner.buf);
+                    inner.buf = buf;
+                    return Ok(()); // need more clientHello bytes
+                }
+                HandshakePoll::Done(hs) => {
                     vlog!(
                         "handshake: complete (~{:.0}ms wall), {} leftover data bytes",
                         crate::log::now_ms() - hs_t0,
@@ -335,7 +407,10 @@ impl VeilweaveSession {
                     inner.key_r = Some(key_r);
                     inner.nonce_w = hs.nonce_w;
                     inner.nonce_r = hs.nonce_r;
-                    inner.buf = hs.leftover;
+                    // Any bytes appended mid-await sort behind the handshake leftover.
+                    let mut buf = hs.leftover;
+                    buf.extend_from_slice(&inner.buf);
+                    inner.buf = buf;
                     inner.pos = 0;
                     inner.phase = Phase::Header;
                 }
@@ -419,6 +494,151 @@ impl VeilweaveSession {
         }
 
         Ok(())
+    }
+
+    /// Plaintext-mode state machine (raw `SECRET_KEY`, no VLESS Encryption): the
+    /// VLESS header arrives as raw WS bytes and the data phases are a pure
+    /// passthrough — zero crypto, zero record framing. Uploads reuse the same
+    /// serialized pump (`pumping`/`buf`), so concurrent invocations cannot
+    /// interleave target writes; the download side is `plain_download`.
+    async fn drive_plain(&self, ws: &web_sys::WebSocket) -> Result<()> {
+        // ── VLESS header (raw bytes, accumulate until it parses) ──
+        if self.phase() == Phase::PlainHeader {
+            enum Hdr {
+                More,
+                Parsed(VlessRequest, Egress, Vec<u8>),
+            }
+            let step = {
+                let inner = self.inner.borrow();
+                match parse_vless_header(&inner.buf[inner.pos..], &self.env) {
+                    Ok((req, header_len, egress)) => {
+                        // Bytes past the header are the first payload chunk.
+                        let initial = inner.buf[inner.pos + header_len..].to_vec();
+                        Hdr::Parsed(req, egress, initial)
+                    }
+                    // Same rule as the encrypted header phase: an incomplete
+                    // header waits for more bytes; past 1 KiB it is a failure.
+                    Err(_) if inner.buf.len() - inner.pos < 1024 => Hdr::More,
+                    Err(e) => return Err(e),
+                }
+            };
+            match step {
+                Hdr::More => return Ok(()), // need more header bytes
+                Hdr::Parsed(req, egress, initial) => {
+                    {
+                        let mut inner = self.inner.borrow_mut();
+                        inner.buf.clear();
+                        inner.pos = 0;
+                    }
+                    self.establish_plain(ws, req.command, req.host, req.port, egress, initial)
+                        .await?;
+                }
+            }
+        }
+
+        // ── Data (TCP): frame bytes → target socket, verbatim ──
+        if self.phase() == Phase::PlainData {
+            let writer = self.inner.borrow().target_writer.clone().ok_or_else(fb)?;
+            loop {
+                let chunk = {
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.pos == inner.buf.len() {
+                        return Ok(());
+                    }
+                    // One copy into the JS heap, then the cursor consumes all of
+                    // it; bytes landing during the await are taken next round.
+                    let chunk = Uint8Array::from(&inner.buf[inner.pos..]);
+                    inner.pos = inner.buf.len();
+                    chunk
+                };
+                target_write_js(&writer, chunk.as_ref()).await?;
+            }
+        }
+
+        // ── Data (UDP / DNS): length-prefixed packets, unsealed responses ──
+        if self.phase() == Phase::PlainUdp {
+            loop {
+                let pt = {
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.pos == inner.buf.len() {
+                        return Ok(());
+                    }
+                    let pt = inner.buf[inner.pos..].to_vec();
+                    inner.pos = inner.buf.len();
+                    pt
+                };
+                self.handle_udp_frames(ws, &pt).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Plaintext-mode connect: the same target/egress logic as `establish`, but
+    /// the VLESS response and every following chunk flow unsealed.
+    async fn establish_plain(
+        &self,
+        ws: &web_sys::WebSocket,
+        command: Command,
+        host: String,
+        port: u16,
+        egress: Egress,
+        initial: Vec<u8>,
+    ) -> Result<()> {
+        match command {
+            Command::Tcp => {
+                #[cfg(feature = "perf-log")]
+                let ct0 = crate::log::now_ms();
+                let (conn, leftover, _path) = connect_target(&host, port, &egress).await?;
+                vlog!(
+                    "plain connect: {host}:{port} via {_path} (~{:.0}ms), {} initial / {} leftover bytes",
+                    crate::log::now_ms() - ct0,
+                    initial.len(),
+                    leftover.len()
+                );
+                let reader_t: ReadableStreamDefaultReader =
+                    conn.readable().get_reader().dyn_into().map_err(|_| fb())?;
+                let writer_t: WritableStreamDefaultWriter =
+                    conn.writable().get_writer().map_err(|_| fb())?;
+
+                // Header-remainder payload goes upstream first (order preserved).
+                if !initial.is_empty() {
+                    let chunk: JsValue = Uint8Array::from(&initial[..]).into();
+                    target_write_js(&writer_t, &chunk).await?;
+                }
+                // VLESS response (+ proxy-handshake leftover) go down raw.
+                ws.send_with_u8_array(&VLESS_RESPONSE).map_err(|_| fb())?;
+                if !leftover.is_empty() {
+                    ws.send_with_u8_array(&leftover).map_err(|_| fb())?;
+                }
+
+                // Background download loop: raw socket reads straight to ws.send.
+                let ws_c: web_sys::WebSocket = ws.clone();
+                spawn_local(async move {
+                    let _ = plain_download(&reader_t, &ws_c).await;
+                    let _ = ws_c.close();
+                });
+
+                let mut inner = self.inner.borrow_mut();
+                inner.target_writer = Some(writer_t);
+                inner.conn = Some(conn);
+                inner.phase = Phase::PlainData;
+                Ok(())
+            }
+            Command::Udp => {
+                ws.send_with_u8_array(&VLESS_RESPONSE).map_err(|_| fb())?;
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    inner.udp_target = Some((host, port));
+                    inner.phase = Phase::PlainUdp;
+                }
+                if !initial.is_empty() {
+                    self.handle_udp_frames(ws, &initial).await?;
+                }
+                Ok(())
+            }
+            Command::Mux => Err(fb()),
+        }
     }
 
     /// Connect the target and start the appropriate direction(s).
@@ -514,13 +734,15 @@ impl VeilweaveSession {
     }
 
     /// One inbound plaintext buffer of length-prefixed UDP packets → DNS round-trips
-    /// (stateless: a fresh socket per packet), responses sealed back to the client.
+    /// (stateless: a fresh socket per packet), responses sent back to the client —
+    /// sealed records in encrypted mode, raw frames in plaintext mode (`key_w`
+    /// is `None` there).
     async fn handle_udp_frames(&self, ws: &web_sys::WebSocket, pt: &[u8]) -> Result<()> {
         let (host, port) = match self.inner.borrow().udp_target.clone() {
             Some(t) => t,
             None => return Err(fb()),
         };
-        let key_w = self.inner.borrow().key_w.clone().ok_or_else(fb)?;
+        let key_w = self.inner.borrow().key_w.clone();
 
         let mut p = pt;
         while p.len() >= 2 {
@@ -536,10 +758,17 @@ impl VeilweaveSession {
                     let mut framed = Vec::with_capacity(2 + resp.len());
                     framed.extend_from_slice(&(resp.len() as u16).to_be_bytes());
                     framed.extend_from_slice(&resp);
-                    let mut nonce_w = self.inner.borrow().nonce_w;
-                    let rec = seal_record_wasm(&key_w, &mut nonce_w, &framed).await?;
-                    self.inner.borrow_mut().nonce_w = nonce_w;
-                    ws.send_with_u8_array(&rec).map_err(|_| fb())?;
+                    match &key_w {
+                        Some(key_w) => {
+                            let mut nonce_w = self.inner.borrow().nonce_w;
+                            let rec = seal_record_wasm(key_w, &mut nonce_w, &framed).await?;
+                            self.inner.borrow_mut().nonce_w = nonce_w;
+                            ws.send_with_u8_array(&rec).map_err(|_| fb())?;
+                        }
+                        None => {
+                            ws.send_with_u8_array(&framed).map_err(|_| fb())?;
+                        }
+                    }
                 }
             }
         }

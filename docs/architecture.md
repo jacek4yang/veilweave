@@ -4,6 +4,13 @@ This document covers the **data path** of veilweave at a level deeper than
 the top-level README — what happens to a byte from the moment a WS upgrade
 arrives at the edge until it lands on the target socket, and back.
 
+> **Scope note (v1.0.0+):** the default datapath is **plaintext passthrough**
+> (`encryption=none`) — steps ① (handshake) and the record seal/open below
+> simply do not happen; bytes pass through after the VLESS header check.
+> Everything crypto-related in this document describes the **experimental,
+> opt-in VLESS Encryption mode** (a `VW1` blob `SECRET_KEY`), which is where
+> the CPU optimizations matter.
+
 ## High-level pipeline
 
 ```

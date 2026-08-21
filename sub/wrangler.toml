@@ -8,23 +8,26 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 cwd = "."
 
 # Subscriptions are read-heavy and cache-heavy; KV is the right backing store.
-# Run `wrangler kv:namespace create VEILWEAVE_KV` to obtain an id; paste below.
+# Pick your OWN namespace title (avoid the predictable default) and rename the
+# binding to match: run `wrangler kv:namespace create <YOUR_NAMESPACE_NAME>`,
+# paste the id below, and if you rename the binding, set the `KV_BINDING` var
+# to its name (resolution order: KV_BINDING → VEILWEAVE_KV → KV; KV optional).
 [[kv_namespaces]]
 binding = "VEILWEAVE_KV"
 id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 
 [vars]
 # Relay nodes for load balancing. Each node is `domain|secret`, comma-separated.
-# `secret` is the SUB blob from `veilweave-tools gen-secret` (must pair with
-# the relay's SECRET_KEY blob). The subscription signs each node's UUID with
-# the blob's UUID secret AND advertises VLESS Encryption from the blob's
-# X25519 public key, so every link is
+# DEFAULT (plaintext, `encryption=none`): `secret` is the raw shared secret from
+# `veilweave-tools gen-secret` (must equal the relay's SECRET_KEY).
+# EXPERIMENTAL encryption: use the SUB blob from `gen-secret --encryption` —
+# the subscription then signs each node's UUID with the blob's UUID secret AND
+# advertises VLESS Encryption from the blob's X25519 public key, so links become
 # `encryption=mlkem768x25519plus.native.1rtt.<pubkey>` automatically.
-# A legacy raw secret still works and emits `encryption=none`.
 #
 # Multiple nodes, comma-separated:
-#   VEILWEAVE_NODES = "node-a.example.com|<sub blob a>,node-b.example.com|<sub blob b>"
-VEILWEAVE_NODES = "REPLACE_ME.example.com|REPLACE_ME_WITH_SUB_BLOB"
+#   VEILWEAVE_NODES = "node-a.example.com|<secret a>,node-b.example.com|<secret b>"
+VEILWEAVE_NODES = "REPLACE_ME.example.com|REPLACE_ME_WITH_SECRET"
 
 # Subscription access token (independent of any relay secret).
 # For production, prefer:  wrangler secret put SUBSCRIPTION_TOKEN
@@ -39,6 +42,10 @@ FP = "chrome"
 # ProxyIP source. Fetched once and cached in KV for 24 h.
 # Disable by setting to "true" if you only want to use PROXYIP_LIST below.
 DISABLE_BUILTIN_PROXYIP = "false"
+
+# KV binding name override. Set this if you renamed the [[kv_namespaces]]
+# binding above to your own (recommended, non-default) name.
+# KV_BINDING = "MY_KV"
 
 # Extra inline proxyips (host:port#CC[, ...]). Optional, complements the API.
 # PROXYIP_LIST = "1.2.3.4:443#CN, 5.6.7.8:8443#US"

@@ -1,11 +1,12 @@
 // datapath.rs
-// JS-handle data-path helpers shared by the VeilweaveSession Durable Object. The
-// download direction (target → client) runs as one background loop that reads the
-// target socket as JS `Uint8Array` frames, seals each ≤16384-byte record with
-// WebCrypto AES-256-GCM (BoringSSL/AES-NI), and sends one `[header‖ciphertext]` WS
-// frame per record — the same single-frame-per-record shape xray reads (never split
-// a record across frames). Payload never enters wasm. The upload direction is
-// handled per `websocket_message` in `session.rs`.
+// JS-handle data-path helpers shared by the VeilweaveSession Durable Object. In
+// encrypted mode the download direction (target → client) runs as one background
+// loop that reads the target socket as JS `Uint8Array` frames, seals each
+// ≤16384-byte record with WebCrypto AES-256-GCM (BoringSSL/AES-NI), and sends one
+// `[header‖ciphertext]` WS frame per record — the same single-frame-per-record
+// shape xray reads (never split a record across frames). Payload never enters
+// wasm. The upload direction is handled per `websocket_message` in `session.rs`.
+// Plaintext mode uses `plain_download` below: raw chunks straight to `ws.send`.
 //
 // The download loop is tuned for throughput close to the link limit while keeping
 // the per-byte CPU low (it all runs in one background task, so it never adds WS
@@ -39,7 +40,7 @@ fn fb() -> Error {
     Error::RustError(String::new())
 }
 
-/// Throttle the encrypted download once the WS send buffer exceeds this.
+/// Throttle the download loops once the WS send buffer exceeds this.
 const WS_SEND_HWM: u32 = 1 << 20; // 1 MiB
 
 /// Max plaintext per download record, still **one record = one WS frame** (never
@@ -221,6 +222,57 @@ pub async fn relay_download(
         }
 
         // Throttle if the WS send buffer is backing up (rare — usually read-bound).
+        while ws.ready_state() == web_sys::WebSocket::OPEN && ws.buffered_amount() > WS_SEND_HWM {
+            #[cfg(feature = "perf-log")]
+            {
+                nstall += 1;
+            }
+            sleep(1).await;
+        }
+    }
+}
+
+/// Plaintext download loop (raw `SECRET_KEY` mode): target readable → `ws.send`
+/// of each chunk as-is — no record framing, no crypto, so the per-byte cost is
+/// the floor. Reads stay pipelined (the next `read()` is started before the
+/// send, overlapping socket latency), and the same 1 MiB WS backpressure
+/// throttle paces reads. Coalescing is deliberately skipped: every chunk goes
+/// out the moment it arrives, keeping interactive latency at zero.
+pub async fn plain_download(
+    target_reader: &ReadableStreamDefaultReader,
+    ws: &web_sys::WebSocket,
+) -> Result<()> {
+    #[cfg(feature = "perf-log")]
+    let (mut nread, mut nbytes, mut nstall) = (0u64, 0u64, 0u64);
+    #[cfg(feature = "perf-log")]
+    let dl_t0 = crate::log::now_ms();
+
+    // Keep exactly one read in flight at all times: start the next before
+    // sending the current chunk.
+    let mut inflight = JsFuture::from(target_reader.read());
+
+    loop {
+        let val = (&mut inflight).await.map_err(|_| fb())?;
+        if read_done(&val) {
+            vlog!(
+                "plain download: target EOF — {nread} reads, {nbytes} bytes, \
+                 {nstall} stalls over ~{:.0}ms",
+                crate::log::now_ms() - dl_t0
+            );
+            return Ok(());
+        }
+        let chunk = read_value(&val)?;
+        #[cfg(feature = "perf-log")]
+        {
+            nread += 1;
+            nbytes += chunk.length() as u64;
+        }
+        // Pipeline: kick off the next read immediately so it overlaps the send.
+        inflight = JsFuture::from(target_reader.read());
+
+        ws.send_with_array_buffer_view(&chunk).map_err(|_| fb())?;
+
+        // Throttle if the WS send buffer is backing up (same rule as encrypted).
         while ws.ready_state() == web_sys::WebSocket::OPEN && ws.buffered_amount() > WS_SEND_HWM {
             #[cfg(feature = "perf-log")]
             {
