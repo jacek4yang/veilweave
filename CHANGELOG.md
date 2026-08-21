@@ -9,6 +9,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 > wire-compatible with the previous patch release; minor releases
 > may change the build profile but stay wire-compatible.
 
+## [1.0.1] — 2026-08-21
+
+### Fixed
+- **GUI now opens on DisplayLink / RDP / software-GL machines**: the window
+  tries the `wgpu` renderer first (DX12 on Windows, Metal on macOS, Vulkan on
+  Linux — fully static, zero runtime dependencies), falls back to `glow`
+  (OpenGL), and only then to the CLI wizard message.
+- **GUI language auto-detect**: the UI follows the OS locale (Chinese for
+  `zh*`, English otherwise) with a persistent manual 中文/English override in
+  the sidebar.
+- **GUI contrast**: dark theme is now the default (light is a sidebar toggle);
+  all status/log colors are theme-aware, eliminating the unreadable
+  pale-yellow-on-white warning text.
+- CI: winit `x11`/`wayland` backends enabled so the Linux build compiles;
+  gitleaks false positives annotated.
+
 ## [1.0.0] — 2026-08-21
 
 ### Added

@@ -13,6 +13,12 @@ pub struct Config {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub deployments: Vec<Deployment>,
+    /// GUI language override: "zh" or "en". None = auto-detect from OS locale.
+    #[serde(default)]
+    pub ui_language: Option<String>,
+    /// GUI theme override: "dark" or "light". None = dark.
+    #[serde(default)]
+    pub ui_theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +164,8 @@ mod tests {
 
     fn sample_config() -> Config {
         Config {
+            ui_language: None,
+            ui_theme: None,
             accounts: vec![Account {
                 name: "personal".into(),
                 token: "tok-abc".into(),
@@ -211,6 +219,15 @@ mod tests {
         );
         assert!(back.deployments[0].subscription_url().is_none());
         assert_eq!(back.account("personal").unwrap().token, "tok-abc");
+    }
+
+    /// Configs written before ui_language/ui_theme existed must still load.
+    #[test]
+    fn config_backward_compat_without_ui_fields() {
+        let text = "[[accounts]]\nname = \"a\"\ntoken = \"t\"\naccount_id = \"id\"\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.ui_language.is_none());
+        assert!(cfg.ui_theme.is_none());
     }
 
     #[test]
