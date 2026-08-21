@@ -336,11 +336,13 @@ impl CfClient {
     }
 
     /// Today's per-script usage via the GraphQL Analytics API
-    /// (POST /client/v4/graphql, `workersInvocationsAdaptiveGroups`).
+    /// (POST /client/v4/graphql, dataset `workersInvocationsAdaptive`).
     ///
-    /// REQUIRES the `Account → Analytics → Read` token permission; without it
-    /// this returns Err — callers must treat that as non-fatal (the UI shows
-    /// "需要 Analytics Read 权限 / needs Analytics Read").
+    /// REQUIRES the `Account → Account Analytics → Read` token permission;
+    /// without it Cloudflare hides the dataset and the query fails with
+    /// `unknown field "workersInvocationsAdaptive"` — callers must treat any
+    /// error here as non-fatal (the UI shows "需要 Analytics Read 权限 /
+    /// needs Analytics Read").
     pub async fn account_usage(&self, account_id: &str) -> Result<Vec<UsageRow>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -348,7 +350,7 @@ impl CfClient {
             .unwrap_or(0);
         let day_start = now - now % 86_400;
         let body = serde_json::json!({
-            "query": "query($account: String!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $account}) { workersInvocationsAdaptiveGroups(limit: 100, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { scriptName } sum { requests errors } quantiles { cpuTimeP50 } } } } }",
+            "query": "query($account: String!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $account}) { workersInvocationsAdaptive(limit: 100, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { scriptName } sum { requests errors } quantiles { cpuTimeP50 } } } } }",
             "variables": {
                 "account": account_id,
                 "from": crate::config::format_unix_utc(day_start),
@@ -373,7 +375,7 @@ impl CfClient {
                 .join("; ");
             bail!("account usage: {msgs}");
         }
-        let groups = v["data"]["viewer"]["accounts"][0]["workersInvocationsAdaptiveGroups"]
+        let groups = v["data"]["viewer"]["accounts"][0]["workersInvocationsAdaptive"]
             .as_array()
             .cloned()
             .unwrap_or_default();

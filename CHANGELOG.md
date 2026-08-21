@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 > wire-compatible with the previous patch release; minor releases
 > may change the build profile but stay wire-compatible.
 
+## [1.1.1] — 2026-08-22
+
+### Fixed
+- **Usage dashboard** (`cfapi::account_usage`): the GraphQL dataset is
+  `workersInvocationsAdaptive`, not `workersInvocationsAdaptiveGroups` —
+  Cloudflare answered `unknown field` and the app misreported it as a
+  missing `Account Analytics: Read` permission. Verified end-to-end against
+  a real account: per-script requests / errors / CPU P50 now load.
+
 ## [1.1.0] — 2026-08-21
 
 ### Added
@@ -135,7 +144,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Apache 2.4.62 / Debian camouflage page (`static/apache_default.html`).
 - Signed-UUID scheme with per-isolate HKDF derivation and bounded LRU.
 
-[Unreleased]: https://github.com/<owner>/veilweave/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/<owner>/veilweave/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/<owner>/veilweave/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/<owner>/veilweave/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/<owner>/veilweave/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/<owner>/veilweave/compare/v0.1.0...v1.0.0

@@ -1,6 +1,6 @@
 [package]
 name = "veilweave-core"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 
 # Shared deploy core: Cloudflare API client, persistent config, deploy
