@@ -2,12 +2,12 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::{seq::SliceRandom, RngCore};
 use std::net::Ipv4Addr;
+use veilweave_core::util::{
+    decode_blob, encode_blob, gen_raw_secret, gen_secret_pair, generate_hex_id, inject_nonce,
+    random_kv_binding, random_worker_name,
+};
 
-mod cfapi;
 mod codec;
-mod config;
-mod deploy;
-mod gui;
 mod hmac;
 mod sha256;
 mod wizard;
@@ -110,14 +110,13 @@ enum ProxyType {
 fn main() {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        // Double-click (no subcommand) launches the GUI deployer.
-        if let Err(e) = gui::launch() {
-            eprintln!("无法创建图形界面窗口 / could not open the GUI window: {e:#}");
-            eprintln!("（无显示环境？）请改用命令行部署向导 / headless? use the CLI wizard:");
-            eprintln!("    veilweave-tools deploy");
-            pause_before_exit();
-            std::process::exit(1);
-        }
+        // Double-click (no subcommand): point at the deploy wizard. The
+        // graphical deployer is the separate Tauri app.
+        println!("veilweave-tools — 部署请运行 / to deploy, run:");
+        println!("    veilweave-tools deploy");
+        println!();
+        println!("更多命令 / more commands: veilweave-tools --help");
+        pause_before_exit();
         return;
     };
     let pause = matches!(command, Commands::Bundle { .. });
@@ -283,7 +282,7 @@ fn run_async(future: impl std::future::Future<Output = anyhow::Result<()>>) {
 fn run_bundle(out: &str, relay_domain: Option<&str>, bundle_dir: Option<&str>, encryption: bool) {
     use std::path::Path;
 
-    let bundle_root = crate::deploy::locate_bundle_dir(bundle_dir);
+    let bundle_root = veilweave_core::deploy::locate_bundle_dir(bundle_dir);
     for unit in ["relay", "sub"] {
         let src = bundle_root.join(unit);
         if !src.join("build/index.js").is_file() {
@@ -376,12 +375,6 @@ fn pack_worker(src: &std::path::Path, dst: &std::path::Path) {
     std::fs::write(&index, inject_nonce(&js)).expect("write build/index.js");
 }
 
-/// Prepend a per-run nonce comment so every user's artifact has a unique
-/// content hash. Shared by `bundle` and the direct-deploy path.
-fn inject_nonce(js: &str) -> String {
-    format!("/* vw:{} */\n{js}", generate_hex_id(64))
-}
-
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     std::fs::create_dir_all(dst).expect("create output dir");
     for entry in std::fs::read_dir(src).expect("read bundle dir") {
@@ -394,50 +387,6 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
             std::fs::copy(&from, &to).expect("copy bundle file");
         }
     }
-}
-
-fn gen_secret_pair() -> (String, String) {
-    use x25519_dalek::{PublicKey, StaticSecret};
-    let mut uuid_secret = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut uuid_secret);
-    let x = StaticSecret::random_from_rng(rand::thread_rng());
-    let relay = encode_blob(0, &uuid_secret, &x.to_bytes());
-    let sub = encode_blob(1, &uuid_secret, &PublicKey::from(&x).to_bytes());
-    (relay, sub)
-}
-
-/// Random, innocuous worker name — a new one every run.
-fn random_worker_name() -> String {
-    use rand::Rng;
-    const WORDS: &[&str] = &[
-        "edge", "api", "cdn", "cache", "media", "data", "sync", "hub", "core", "node", "link",
-        "stream", "relay", "proxy", "gate", "mesh", "orbit",
-    ];
-    const KINDS: &[&str] = &[
-        "service", "worker", "backend", "endpoint", "gateway", "bridge", "feed",
-    ];
-    let mut rng = rand::thread_rng();
-    format!(
-        "{}-{}-{}",
-        WORDS[rng.gen_range(0..WORDS.len())],
-        KINDS[rng.gen_range(0..KINDS.len())],
-        generate_hex_id(4)
-    )
-}
-
-/// Random raw shared secret for plaintext mode: 32 bytes, base64url (no pad).
-/// Used as the relay's SECRET_KEY and in the sub's VEILWEAVE_NODES verbatim.
-fn gen_raw_secret() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Random KV binding name, e.g. `kv_x7f2a9` — always a valid JS identifier.
-/// The sub worker resolves its KV namespace via the `KV_BINDING` var, so the
-/// binding name itself can (and should) vary per deployment.
-fn random_kv_binding() -> String {
-    format!("kv_{}", generate_hex_id(6))
 }
 
 fn relay_wrangler_toml(name: &str, secret: &str, encryption: bool) -> String {
@@ -530,30 +479,8 @@ fn pause_before_exit() {
     }
 }
 
-// ─── Combined secret blob (must match veilweave/src/secret.rs) ───────────────────
-// Layout (base64url, no pad): "VW1" ‖ kind(1) ‖ uuid_secret(32) ‖ x25519(32)
-//   kind 0 = relay (x25519 private),  kind 1 = sub (x25519 public)
-
-fn encode_blob(kind: u8, uuid_secret: &[u8; 32], key: &[u8; 32]) -> String {
-    let mut b = Vec::with_capacity(68);
-    b.extend_from_slice(b"VW1");
-    b.push(kind);
-    b.extend_from_slice(uuid_secret);
-    b.extend_from_slice(key);
-    general_purpose::URL_SAFE_NO_PAD.encode(&b)
-}
-
-fn decode_blob(s: &str) -> Option<(u8, [u8; 32], [u8; 32])> {
-    let b = general_purpose::URL_SAFE_NO_PAD.decode(s.trim()).ok()?;
-    if b.len() != 68 || &b[0..3] != b"VW1" {
-        return None;
-    }
-    let mut uuid = [0u8; 32];
-    uuid.copy_from_slice(&b[4..36]);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&b[36..68]);
-    Some((b[3], uuid, key))
-}
+// The VW1 blob codec lives in veilweave_core::util (encode_blob/decode_blob,
+// byte-compatible with veilweave/src/secret.rs).
 
 /// Parse a secret for link generation: returns the UUID codec key bytes and, when
 /// the secret is a blob, the encryption **public** key (derived from the private
@@ -900,15 +827,6 @@ fn generate_short_id() -> String {
     let len = rng.gen_range(8..=16);
     (0..len)
         .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect()
-}
-
-fn generate_hex_id(len: usize) -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    const HEX: &[u8] = b"0123456789abcdef";
-    (0..len)
-        .map(|_| HEX[rng.gen_range(0..HEX.len())] as char)
         .collect()
 }
 

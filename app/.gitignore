@@ -1,0 +1,7 @@
+# App slice (Tauri desktop)
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+# Prebuilt worker bundles are refreshed by CI (see src-tauri/bundle/README.md)
+src-tauri/bundle/relay/
+src-tauri/bundle/sub/

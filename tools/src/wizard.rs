@@ -2,16 +2,17 @@
 //! and `veilweave-tools manage`). All prompts live here; `deploy.rs` stays
 //! UI-agnostic so the GUI can drive it directly.
 
-use crate::config::{Config, Role};
-use crate::deploy::{self, DeployPlan, LogKind, RelaySpec, SubSpec};
 use anyhow::{bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use veilweave_core::config::{Config, Role};
+use veilweave_core::deploy::{self, BundleSource, DeployPlan, LogKind, RelaySpec, SubSpec};
 
 pub const TOKEN_URL: &str = "https://dash.cloudflare.com/profile/api-tokens";
 pub const TOKEN_PERMISSIONS: &str = "\
   · Account → Workers Scripts → Edit
   · Account → Workers KV Storage → Edit
-  · Account → Account Settings → Read   (for the workers.dev subdomain)";
+  · Account → Account Settings → Read   (for the workers.dev subdomain)
+  · Account → Analytics → Read          (可选 / optional — for usage stats)";
 
 pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
     let theme = ColorfulTheme::default();
@@ -82,7 +83,7 @@ pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
         .with_prompt(
             "KV binding name (valid JS identifier; the worker reads it from the KV_BINDING var)",
         )
-        .default(crate::random_kv_binding())
+        .default(veilweave_core::util::random_kv_binding())
         .interact_text()?;
 
     // ── Encryption ──────────────────────────────────────────────────────────
@@ -130,16 +131,16 @@ pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
         sub: SubSpec {
             account: sub_account,
             worker_name: sub_name,
-            kv_title: format!("{}-kv", crate::random_worker_name()),
+            kv_title: format!("{}-kv", veilweave_core::util::random_worker_name()),
             kv_binding,
         },
         relays,
         encryption,
     };
 
-    let bundle_dir = deploy::locate_bundle_dir(bundle_dir.as_deref());
+    let source = BundleSource::Dir(deploy::locate_bundle_dir(bundle_dir.as_deref()));
     println!();
-    let outcome = deploy::execute(&plan, &bundle_dir, &mut cfg, &mut |line| match line.kind {
+    let outcome = deploy::execute(&plan, &source, &mut cfg, &mut |line| match line.kind {
         LogKind::Step => println!("▸ {}", line.message),
         LogKind::Info => println!("  ✔ {}", line.message),
         LogKind::Warn => eprintln!("  ⚠ {}", line.message),
@@ -238,7 +239,7 @@ async fn delete_deployment(theme: &ColorfulTheme, cfg: &mut Config, idx: usize) 
         .account(&d.account)
         .with_context(|| format!("account {:?} no longer in config", d.account))?
         .clone();
-    let client = crate::cfapi::CfClient::new(&account.token)?;
+    let client = veilweave_core::cfapi::CfClient::new(&account.token)?;
     client.delete_worker(&account.account_id, &d.name).await?;
     println!("  ✔ deleted worker {}", d.name);
     if let Some(sub) = &d.sub {
@@ -265,7 +266,7 @@ async fn add_account(theme: &ColorfulTheme, cfg: &mut Config) -> Result<()> {
     let token = Password::with_theme(theme)
         .with_prompt("Paste the API token")
         .interact()?;
-    let client = crate::cfapi::CfClient::new(&token)?;
+    let client = veilweave_core::cfapi::CfClient::new(&token)?;
     println!("Verifying token…");
     client.verify_token().await?;
 
@@ -301,7 +302,7 @@ async fn add_account(theme: &ColorfulTheme, cfg: &mut Config) -> Result<()> {
         })
         .interact_text()?;
 
-    cfg.accounts.push(crate::config::Account {
+    cfg.accounts.push(veilweave_core::config::Account {
         name: label.clone(),
         token,
         account_id: account.id.clone(),
@@ -322,7 +323,7 @@ fn worker_name_prompt(theme: &ColorfulTheme, prompt: &str) -> Result<String> {
         .with_prompt(format!(
             "{prompt} (random default; a custom innocuous name is STRONGLY recommended)"
         ))
-        .default(crate::random_worker_name())
+        .default(veilweave_core::util::random_worker_name())
         .validate_with(|name: &String| validate_worker_name(name))
         .interact_text()?;
     Ok(name)

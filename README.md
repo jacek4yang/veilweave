@@ -15,7 +15,7 @@
 
 A VLESS + WebSocket proxy stack built for the Cloudflare Workers free plan: a
 relay worker whose per-connection Durable Object forwards traffic with near-zero
-per-frame CPU, a subscription worker, and a native deployer (GUI + CLI) that
+per-frame CPU, a subscription worker, and a native desktop app (+ CLI) that
 publishes everything through the Cloudflare API. The default datapath is
 **plaintext passthrough**; an experimental, opt-in VLESS Encryption layer
 (xray-core `mlkem768x25519plus`: ML-KEM-768 + X25519 + AES-256-GCM) can hide the
@@ -23,7 +23,7 @@ stream from on-path observers at a much higher CPU cost.
 
 为 Cloudflare Workers 免费套餐打造的 VLESS + WebSocket 代理三件套：relay
 worker 用独立的 Durable Object 逐连接转发，每帧 CPU 开销接近零；订阅 worker
-分发链接；原生部署器（GUI + CLI）直接通过 Cloudflare API 完成部署。默认数据
+分发链接；原生桌面应用（+ 命令行）直接通过 Cloudflare API 完成部署。默认数据
 面是**明文直通**；另有一个实验性、需手动开启的 VLESS Encryption 加密层
 （xray-core `mlkem768x25519plus`：ML-KEM-768 + X25519 + AES-256-GCM），可以
 对链路上的观察者隐藏流量，但 CPU 开销大得多。
@@ -43,41 +43,44 @@ worker 用独立的 Durable Object 逐连接转发，每帧 CPU 开销接近零�
 **Prerequisites / 前置条件：** one or more free Cloudflare accounts.
 一个或多个免费 Cloudflare 账号。
 
-### 1. Download / 下载
+### 1. Download the desktop app / 下载桌面应用
 
-Grab the archive for your platform from
-[**Releases**](https://github.com/jacek4yang/veilweave/releases) and unzip it:
+Grab the installer for your platform from
+[**Releases**](https://github.com/jacek4yang/veilweave/releases):
 从 [Releases](https://github.com/jacek4yang/veilweave/releases) 下载对应平台的
-压缩包并解压：
+安装包：
 
-| Platform / 平台 | Archive / 压缩包 |
+| Platform / 平台 | Installer / 安装包 |
 |---|---|
-| Windows (x64) | `veilweave-<ver>-windows-x64.zip` |
-| Linux (x64) | `veilweave-<ver>-linux-x64.tar.gz` |
-| macOS (Apple Silicon) | `veilweave-<ver>-macos-arm64.tar.gz` |
+| Windows (x64) | `veilweave_<ver>_x64-setup.exe` (NSIS) 或 `.msi` |
+| macOS (Apple Silicon) | `veilweave_<ver>_aarch64.dmg` — unsigned: right-click → **Open** on first launch / 未签名：首次**右键 → 打开** |
+| Linux (x64) | `.AppImage` 或 `.deb` |
 
-Each archive contains / 压缩包内含：
+The app is fully self-contained (the prebuilt workers are embedded) and has
+**in-app auto-update** — later versions install themselves from Settings.
+应用完全自包含（内嵌预编译 worker），并支持**应用内自动更新**——之后的版本
+可在「设置」里一键升级。
 
-```
-veilweave-tools(.exe)   ← deployer GUI + CLI / 部署器（图形界面 + 命令行）
-bundle/relay/build/     ← PREBUILT relay worker (no compilation needed / 预编译)
-bundle/sub/build/       ← PREBUILT sub worker   (no compilation needed / 预编译)
-QUICKSTART.txt
-```
+> Prefer a terminal? The same release also ships CLI archives
+> (`veilweave-<ver>-{windows-x64.zip,linux-x64.tar.gz,macos-arm64.tar.gz}`)
+> containing `veilweave-tools` + prebuilt workers — `veilweave-tools deploy`
+> runs the same wizard in your shell. See
+> [`tools/README.md`](tools/README.md).
+>
+> 更喜欢终端？同一 release 也提供命令行压缩包
+> （`veilweave-<ver>-{windows-x64.zip,linux-x64.tar.gz,macos-arm64.tar.gz}`，
+> 内含 `veilweave-tools` + 预编译 worker）——`veilweave-tools deploy`
+> 在终端里走同一套向导。详见 [`tools/README.md`](tools/README.md)。
 
-### 2. Run the deployer / 运行部署器
+### 2. Deploy from the app / 在应用里部署
 
-**Windows: double-click `veilweave-tools.exe`.** The GUI ("veilweave 部署器")
-opens with three pages: **Accounts / Deploy / Manage**.
-Everyone else: run `./veilweave-tools` with no arguments for the same GUI, or
-`./veilweave-tools deploy` for the interactive CLI wizard — identical flow.
+Open **veilweave** (Windows: a clean GUI window, no console). The sidebar has
+five pages: **概览 / 账号 / 部署 / 管理 / 设置**.
 
-**Windows 直接双击 `veilweave-tools.exe`**，打开图形界面「veilweave 部署器」
-（账号 / 部署 / 管理三个页面）；其他系统不带参数运行 `./veilweave-tools`
-打开同样的界面，或用 `./veilweave-tools deploy` 走交互式命令行向导——流程
-完全一样。
+打开 **veilweave**（Windows 下是纯图形窗口，没有控制台黑框）。侧边栏五个
+页面：**概览 / 账号 / 部署 / 管理 / 设置**。
 
-1. **Accounts / 账号** — add one or more Cloudflare accounts with an API token.
+1. **账号** — add one or more Cloudflare accounts with an API token.
    The app opens <https://dash.cloudflare.com/profile/api-tokens>
    ("Create Custom Token"); the token needs:
    用一个 API token 添加一个或多个 Cloudflare 账号。程序会打开
@@ -85,17 +88,32 @@ Everyone else: run `./veilweave-tools` with no arguments for the same GUI, or
    token 需要以下权限：
    - Account → Workers Scripts → **Edit**
    - Account → Workers KV Storage → **Edit**
-   - Account → Account Settings → **Read**（用于解析 workers.dev 子域）
-2. **Deploy / 部署** — pick the topology: which account hosts the **sub**
-   worker, and how many **relays** on which accounts (each relay gets its own
-   secret). Confirm — the deployer creates the KV namespace, uploads both
-   workers via the Cloudflare API, and prints your **subscription URL**.
+   - Account → Account Settings → **Read**（解析 workers.dev 子域用）
+   - Account → Account Analytics → **Read**（**可选** — 启用「概览」用量面板 /
+     optional — powers the usage dashboard）
+2. **部署** — pick the topology: which account hosts the **sub** worker, and
+   how many **relays** on which accounts (each relay gets its own secret).
+   All names are customizable, with one-click 随机 buttons. Confirm — the app
+   creates the KV namespace, uploads both workers via the Cloudflare API, and
+   shows your **subscription URL**.
    规划拓扑：sub 放哪个账号、部署几个 relay、分别放哪些账号（每个 relay
-   独立密钥）。确认后部署器会自动创建 KV、通过 Cloudflare API 上传两个
-   worker，并打印**订阅地址**。
-3. **Manage / 管理** — list deployments, re-show a subscription URL, or delete
+   独立密钥）。所有名称都可以自定义，也有一键「随机」。确认后应用会自动
+   创建 KV、通过 Cloudflare API 上传两个 worker，并展示**订阅地址**。
+3. **概览** — per-account usage dashboard: today's requests against the
+   100k/day free tier, error counts, per-worker rows.
+   按账号查看用量：今日请求数（对照免费版 100k/天上限）、错误数、分
+   worker 明细。
+4. **管理** — copy subscription URLs, **update** a deployment in place
+   (re-uploads the latest embedded worker code, secrets untouched), or delete
    a worker (and its KV namespace).
-   列出现有部署、重新查看订阅地址、删除 worker（及其 KV）。
+   复制订阅地址、**更新**部署（重新上传应用内嵌的最新 worker 代码，密钥
+   不变）、删除 worker（及其 KV）。
+
+> **Reinstalling? / 重装系统了？** Re-add your API token on the 账号 page and
+> hit **扫描已有部署** — the app reads your workers' settings through the
+> Cloudflare API and rebuilds the local deployment list.
+> 在「账号」页重新添加 API token，点「**扫描已有部署**」——应用会通过
+> Cloudflare API 读取 worker 配置，重建本地部署清单。
 
 > **Pick your own names / 建议自定义命名：** worker names, KV titles, and
 > binding names are randomized by default, and you are encouraged to choose
@@ -110,12 +128,12 @@ Everyone else: run `./veilweave-tools` with no arguments for the same GUI, or
 https://<sub-domain>/sub?token=<SUBSCRIPTION_TOKEN>
 ```
 
-The deployer prints this URL at the end (recoverable anytime via Manage /
-`veilweave-tools manage`). Paste the base64 response into
+The app shows this URL after deploy (recoverable anytime on the 管理 page, or
+via `veilweave-tools manage`). Paste the base64 response into
 v2rayN / NekoBox / mihomo / sing-box.
-部署完成后会打印该地址（之后可随时在「管理」页 / `veilweave-tools manage`
-重新查看）。把返回的 base64 文本粘到 v2rayN / NekoBox / mihomo / sing-box
-的订阅栏即可。
+部署完成后应用会展示该地址（之后可随时在「管理」页或用
+`veilweave-tools manage` 重新查看）。把返回的 base64 文本粘到
+v2rayN / NekoBox / mihomo / sing-box 的订阅栏即可。
 
 ### Advanced: `bundle` + wrangler (manual) / 手动方式：bundle + wrangler
 
@@ -161,13 +179,15 @@ wrangler deploy
 
 ## What is this / 项目是什么
 
-`veilweave` is **one repo, three components / 单仓库三件套**:
+`veilweave` is **one repo, five components / 单仓库五件套**:
 
 | Component / 子项目 | Form / 形态 | Role / 作用 |
 |---|---|---|
 | **`relay/`** | Cloudflare Worker (Rust → WASM) | **Data plane / 数据面**: terminates VLESS+WS (plaintext passthrough by default; optional VLESS Encryption), forwards to targets / 终止 VLESS+WS 连接（默认明文直通，可选加密），转发到目标站点 |
 | **`sub/`** | Cloudflare Worker (Rust → WASM) | **Subscription plane / 订阅面**: serves `vless://…` link lists, multi egress/entry IP / 生成 `vless://…` 链接列表，支持多出口/入口 IP |
-| **`tools/`** | Native GUI + CLI (Rust) | **Ops plane / 运维面**: deploys to Cloudflare accounts via API (multi-account topologies), keypairs, single links, wrangler bundles / 通过 Cloudflare API 部署（支持多账号拓扑）、生成配套密钥、签发单条链接、生成 wrangler 部署产物 |
+| **`app/`** | Desktop app (Tauri 2) | **Ops plane, GUI / 运维面·图形界面**: account management, usage dashboard, deploy/update/recover, auto-update / 账号管理、用量面板、部署/更新/找回、自动更新 |
+| **`tools/`** | Native CLI (Rust) | **Ops plane, CLI / 运维面·命令行**: `deploy` / `manage` wizards, keypairs, single links, wrangler bundles / `deploy`/`manage` 向导、生成配套密钥、签发单条链接、生成 wrangler 部署产物 |
+| **`core/`** | Rust library | Shared deploy core used by `app` + `tools`: Cloudflare API client, config, deploy/recover orchestration / `app` 与 `tools` 共用的部署核心：Cloudflare API 客户端、配置持久化、部署/找回编排 |
 
 All three share the same "signed UUID" codec (HKDF + HMAC-SHA256 + 5-byte MAC).
 **A UUID only decodes under the key that signed it**, so every relay node accepts
@@ -237,8 +257,9 @@ WebCrypto 调用次数和 `ws.send` 次数都减半。
 
 ```
                                 ┌───────────────────────────────┐
-                                │  veilweave-tools (GUI + CLI)  │
-                                │  deploy / manage              │
+                                │  veilweave desktop app (GUI)  │
+                                │  veilweave-tools (CLI)        │
+                                │  deploy / manage / recover    │
                                 │  gen-secret / gen-link        │
                                 │  bundle                       │
                                 └───────────┬───────────────────┘
@@ -285,9 +306,17 @@ veilweave/
 │   ├── wrangler.toml
 │   └── README.md
 │
-├── tools/                    # deployer GUI + CLI / 部署器（veilweave-tools crate, native binary）
+├── tools/                    # deployer CLI / 部署命令行（veilweave-tools crate, native binary）
 │   ├── src/                  # deploy / manage / gen-secret / gen-link / bundle
 │   └── README.md
+│
+├── app/                      # desktop app / 桌面应用（veilweave-app, Tauri 2）
+│   ├── ui/                   # static frontend (sidebar pages) / 静态前端
+│   ├── src-tauri/            # commands + veilweave-core, embeds prebuilt workers
+│   └── README.md
+│
+├── core/                     # shared deploy library / 共享部署库（veilweave-core crate）
+│   └── src/                  # cfapi / config / deploy / recover / util
 │
 ├── docs/                     # design / deployment / protocol docs / 设计·部署·协议文档
 │   ├── architecture.md
@@ -301,13 +330,13 @@ veilweave/
 └── SECURITY.md
 ```
 
-> The three components are independent (own `Cargo.toml` / `wrangler.toml`) — no
+> The components are independent (own `Cargo.toml` / `wrangler.toml`) — no
 > top-level Cargo workspace, because `relay`/`sub` are cdylib targeting
-> `wasm32-unknown-unknown` while `tools` is a native binary.
+> `wasm32-unknown-unknown` while `tools`/`app` are native binaries.
 >
-> 三个子项目**互相独立**，各自有自己的 `Cargo.toml` / `wrangler.toml`，没有
-> 顶层 Cargo workspace——`relay`/`sub` 是走 wasm 目标的 cdylib，`tools` 是原生
-> 二进制，混在一起反而麻烦。
+> 各子项目**互相独立**，各自有自己的 `Cargo.toml` / `wrangler.toml`，没有
+> 顶层 Cargo workspace——`relay`/`sub` 是走 wasm 目标的 cdylib，`tools`/`app`
+> 是原生二进制，混在一起反而麻烦。
 
 ## Build from source / 从源码构建
 
@@ -366,7 +395,7 @@ during the handshake.
 | X25519 public key / 公钥（加密模式） | `tools gen-secret --encryption` (sub blob) | `sub` writes it into `encryption=...`; clients negotiate from it / 写进链接，客户端据此协商 |
 | Single `vless://` / 单条链接 | `tools gen-link` | straight into a client (no sub) / 直接喂给客户端 |
 | Full subscription / 整组订阅 | `sub` worker (`GET /sub?token=…`) | straight into a client (recommended) / 直接喂给客户端（推荐） |
-| One-shot deployment / 一键部署 | `tools deploy` (GUI or CLI) | Cloudflare API — no wrangler / 直接走 Cloudflare API |
+| One-shot deployment / 一键部署 | desktop app or `tools deploy` | Cloudflare API — no wrangler / 直接走 Cloudflare API |
 | Deploy bundle / 部署产物 | `tools bundle` | `wrangler deploy` — no source build / 直接部署，无需编译 |
 
 ### Hard constraints / 关键约束
@@ -434,10 +463,10 @@ rows below matter only for the experimental encryption mode.
 | Optimization / 优化 | Payoff / 收益 | How / 怎么做的 |
 |---|---|---|
 | WebSocket Hibernation | 10 ms CPU budget per frame / 每帧 10 ms CPU 预算 | `accept_web_socket` + `websocket_message` |
+| Zero-copy hot path (v1.0.1+) | no wasm-memory traffic on upload/download / 上下行不经过 wasm 内存 | owned WS frames, JS-side views, cached property strings |
 | WebCrypto AES-NI (encryption mode) | 10×+ throughput / 吞吐 10×+ | `crypto.subtle.encrypt` in BoringSSL |
 | `+simd128` handshake (encryption mode) | handshake CPU halved / 握手 CPU 减半 | `.cargo/config.toml` + `blake3/wasm32_simd` |
 | Pipeline + coalesce download (encryption mode) | WebCrypto calls ÷4 / 调用数 ÷4 | background loop, merge ≤ 16 KiB |
-| Zero-copy upload (encryption mode) | no wasm memory growth / wasm 内存不增 | `Uint8Array` straight into WebCrypto |
 | Per-isolate codec | constant-time UUID verify / 验签常数时间 | `OnceCell` + 16-entry LRU |
 | Direct-first ProxyIP | most requests skip the detour / 多数请求不绕道 | fall back to ProxyIP only on dial failure |
 
@@ -471,13 +500,16 @@ cargo fmt --manifest-path tools/Cargo.toml -- --check
 
 ## Releases / 发布
 
-Pushing a `v*` tag (or running the **Release** workflow manually) builds the
-deployer for Windows/Linux/macOS and both workers, then publishes per-platform
-archives containing everything the no-build flow needs. See
+Pushing a `v*` tag (or running the **Release** workflow manually) builds both
+workers, the CLI for Windows/Linux/macOS, and the desktop app installers —
+NSIS `*-setup.exe` + MSI (Windows), `.dmg` (macOS arm64), `.AppImage` + `.deb`
+(Linux) — plus a signed `latest.json` manifest for in-app auto-update. See
 [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-推送 `v*` tag（或手动触发 **Release** workflow）会构建三平台部署器和两个
-worker，并发布包含免编译部署全部所需文件的分平台压缩包。
+推送 `v*` tag（或手动触发 **Release** workflow）会构建两个 worker、三平台
+CLI 和桌面应用安装包——Windows（NSIS `*-setup.exe` + MSI）、macOS arm64
+（`.dmg`）、Linux（`.AppImage` + `.deb`）——并发布签名的 `latest.json`
+供应用内自动更新使用。
 
 ## Docs / 文档
 
@@ -486,7 +518,8 @@ worker，并发布包含免编译部署全部所需文件的分平台压缩包�
 - [`docs/protocol.md`](docs/protocol.md) — wire format of signed UUIDs and encrypted records · 签名 UUID 与加密 record 线格式
 - [`relay/README.md`](relay/README.md) — data-plane Worker details · 数据面 Worker 细节
 - [`sub/README.md`](sub/README.md) — subscription Worker details · 订阅 Worker 细节
-- [`tools/README.md`](tools/README.md) — deployer GUI + CLI reference · 部署器（GUI + CLI）参考
+- [`tools/README.md`](tools/README.md) — CLI reference · 命令行参考
+- [`app/README.md`](app/README.md) — desktop app (dev setup, updater) · 桌面应用（开发构建、自动更新）
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed in each version · 版本变更
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute · 贡献指南
 - [`SECURITY.md`](SECURITY.md) — security disclosure policy · 安全披露策略

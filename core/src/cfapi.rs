@@ -252,6 +252,185 @@ impl CfClient {
         self.send_ok(req, "delete KV namespace").await?;
         Ok(())
     }
+
+    /// GET /accounts/{id}/workers/scripts — every script on the account.
+    pub async fn list_workers(&self, account_id: &str) -> Result<Vec<WorkerScript>> {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: String,
+            created_on: Option<String>,
+        }
+        let r: Vec<Raw> = self
+            .send(
+                self.get(&format!("/accounts/{account_id}/workers/scripts")),
+                "list workers",
+            )
+            .await?;
+        Ok(r.into_iter()
+            .map(|w| WorkerScript {
+                id: w.id,
+                created_on: w.created_on,
+            })
+            .collect())
+    }
+
+    /// GET /accounts/{id}/workers/scripts/{name}/settings — the
+    /// ScriptAndVersionSettings endpoint (wrangler's own SDK uses it; unlike
+    /// the newer `script-settings` variant it returns `bindings`). plain_text
+    /// values ARE readable here — this is the config-recovery mechanism.
+    pub async fn get_script_settings(
+        &self,
+        account_id: &str,
+        name: &str,
+    ) -> Result<Vec<BindingInfo>> {
+        let v: serde_json::Value = self
+            .send(
+                self.get(&format!(
+                    "/accounts/{account_id}/workers/scripts/{name}/settings"
+                )),
+                &format!("get settings for {name:?}"),
+            )
+            .await?;
+        let bindings = v["bindings"].as_array().cloned().unwrap_or_default();
+        Ok(bindings
+            .iter()
+            .map(|b| BindingInfo {
+                name: b["name"].as_str().unwrap_or_default().to_string(),
+                kind: b["type"].as_str().unwrap_or_default().to_string(),
+                text: b["text"].as_str().map(str::to_string),
+                namespace_id: b["namespace_id"].as_str().map(str::to_string),
+                class_name: b["class_name"].as_str().map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// GET /accounts/{id}/storage/kv/namespaces — all namespaces, following
+    /// `page` until a short page comes back (per_page=100).
+    pub async fn list_kv_namespaces(&self, account_id: &str) -> Result<Vec<KvNamespace>> {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: String,
+            title: String,
+        }
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let batch: Vec<Raw> = self
+                .send(
+                    self.get(&format!(
+                        "/accounts/{account_id}/storage/kv/namespaces?per_page=100&page={page}"
+                    )),
+                    "list KV namespaces",
+                )
+                .await?;
+            let short = batch.len() < 100;
+            out.extend(batch.into_iter().map(|n| KvNamespace {
+                id: n.id,
+                title: n.title,
+            }));
+            if short {
+                return Ok(out);
+            }
+            page += 1;
+        }
+    }
+
+    /// Today's per-script usage via the GraphQL Analytics API
+    /// (POST /client/v4/graphql, `workersInvocationsAdaptiveGroups`).
+    ///
+    /// REQUIRES the `Account → Analytics → Read` token permission; without it
+    /// this returns Err — callers must treat that as non-fatal (the UI shows
+    /// "需要 Analytics Read 权限 / needs Analytics Read").
+    pub async fn account_usage(&self, account_id: &str) -> Result<Vec<UsageRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let day_start = now - now % 86_400;
+        let body = serde_json::json!({
+            "query": "query($account: String!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $account}) { workersInvocationsAdaptiveGroups(limit: 100, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { scriptName } sum { requests errors } quantiles { cpuTimeP50 } } } } }",
+            "variables": {
+                "account": account_id,
+                "from": crate::config::format_unix_utc(day_start),
+                "to": crate::config::format_unix_utc(now),
+            },
+        });
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/graphql"))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .context("account usage: request failed")?;
+        // GraphQL returns HTTP 200 even for errors — check the errors array.
+        let v: serde_json::Value = resp.json().await.context("account usage: bad response")?;
+        if let Some(errors) = v["errors"].as_array().filter(|e| !e.is_empty()) {
+            let msgs = errors
+                .iter()
+                .filter_map(|e| e["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("account usage: {msgs}");
+        }
+        let groups = v["data"]["viewer"]["accounts"][0]["workersInvocationsAdaptiveGroups"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(groups
+            .iter()
+            .map(|g| UsageRow {
+                script: g["dimensions"]["scriptName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                requests: g["sum"]["requests"].as_u64().unwrap_or(0),
+                errors: g["sum"]["errors"].as_u64().unwrap_or(0),
+                cpu_p50_us: g["quantiles"]["cpuTimeP50"].as_f64().unwrap_or(0.0),
+            })
+            .collect())
+    }
+}
+
+/// A worker script as returned by the scripts list endpoint.
+#[derive(Debug, Clone)]
+pub struct WorkerScript {
+    pub id: String,
+    pub created_on: Option<String>,
+}
+
+/// One binding as reported by the script settings endpoint. `text` is only
+/// present for `plain_text` (secrets of type `secret_text` are never
+/// readable via the API).
+#[derive(Debug, Clone, Default)]
+pub struct BindingInfo {
+    pub name: String,
+    /// Binding type string: "plain_text", "kv_namespace",
+    /// "durable_object_namespace", "secret_text", …
+    pub kind: String,
+    pub text: Option<String>,
+    pub namespace_id: Option<String>,
+    pub class_name: Option<String>,
+}
+
+/// A KV namespace (id + title).
+#[derive(Debug, Clone)]
+pub struct KvNamespace {
+    pub id: String,
+    pub title: String,
+}
+
+/// Free-plan daily request cap — for UI usage ratios.
+pub const FREE_TIER_DAILY_REQUESTS: u64 = 100_000;
+
+/// Per-script usage for the current UTC day. `cpu_p50_us` is the P50 CPU
+/// time per invocation in microseconds (GraphQL `cpuTimeP50`).
+#[derive(Debug, Clone)]
+pub struct UsageRow {
+    pub script: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub cpu_p50_us: f64,
 }
 
 fn format_api_errors(errors: &[ApiError], status: reqwest::StatusCode) -> String {
@@ -274,6 +453,16 @@ pub fn collect_build_files(build_dir: &Path) -> Result<Vec<UploadFile>> {
     Ok(files)
 }
 
+/// MIME content type for a worker upload part, by file extension.
+pub fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next() {
+        Some("js") | Some("mjs") => "application/javascript+module",
+        Some("wasm") => "application/wasm",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
 fn collect_into(root: &Path, dir: &Path, out: &mut Vec<UploadFile>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let path: PathBuf = entry?.path();
@@ -286,16 +475,10 @@ fn collect_into(root: &Path, dir: &Path, out: &mut Vec<UploadFile>) -> Result<()
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let content_type = match path.extension().and_then(|e| e.to_str()) {
-            Some("js") | Some("mjs") => "application/javascript+module",
-            Some("wasm") => "application/wasm",
-            Some("json") => "application/json",
-            _ => "application/octet-stream",
-        };
         out.push(UploadFile {
+            content_type: content_type_for(&rel),
             name: rel,
             contents: std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-            content_type,
         });
     }
     Ok(())

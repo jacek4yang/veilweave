@@ -2,11 +2,76 @@
 //! a `DeployPlan`, then call `execute` with a log callback. Nothing in here
 //! prints or prompts.
 
-use crate::cfapi::{self, CfClient};
+use crate::cfapi::{self, CfClient, UploadFile};
 use crate::config::{Account, Config, Deployment, Role, SubDetails};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+/// Where the prebuilt workers come from. The CLI ships `bundle/` next to the
+/// executable ([`BundleSource::Dir`]); the Tauri app embeds them at compile
+/// time via `include_bytes!` ([`BundleSource::Embedded`]).
+#[derive(Debug, Clone)]
+pub enum BundleSource {
+    /// Root containing `relay/build/` and `sub/build/` on disk.
+    Dir(PathBuf),
+    Embedded(EmbeddedBundle),
+}
+
+/// In-memory prebuilt workers: `(relative path, bytes)` per file, paths with
+/// forward slashes relative to the build dir (e.g. `index.js`,
+/// `worker/shim.mjs`).
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddedBundle {
+    pub relay: Vec<(String, Vec<u8>)>,
+    pub sub: Vec<(String, Vec<u8>)>,
+}
+
+impl BundleSource {
+    /// Upload-ready files for one unit ("relay" or "sub"), with the per-run
+    /// nonce comment injected into `index.js`.
+    fn files(&self, unit: &str) -> Result<Vec<UploadFile>> {
+        let mut files = match self {
+            BundleSource::Dir(root) => {
+                let build = root.join(unit).join("build");
+                if !build.join("index.js").is_file() {
+                    bail!(
+                        "prebuilt {unit} worker not found at {} — download the full \
+                         release archive (it contains bundle/{unit}/)",
+                        build.display()
+                    );
+                }
+                cfapi::collect_build_files(&build)?
+            }
+            BundleSource::Embedded(bundle) => {
+                let entries = if unit == "relay" {
+                    &bundle.relay
+                } else {
+                    &bundle.sub
+                };
+                if !entries.iter().any(|(name, _)| name == "index.js") {
+                    bail!("embedded bundle has no {unit}/index.js");
+                }
+                entries
+                    .iter()
+                    .map(|(name, bytes)| UploadFile {
+                        name: name.clone(),
+                        contents: bytes.clone(),
+                        content_type: cfapi::content_type_for(name),
+                    })
+                    .collect()
+            }
+        };
+        for f in &mut files {
+            if f.name == "index.js" {
+                let js = String::from_utf8(std::mem::take(&mut f.contents))
+                    .context("index.js is not valid UTF-8")?;
+                f.contents = crate::util::inject_nonce(&js).into_bytes();
+            }
+        }
+        Ok(files)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DeployPlan {
@@ -117,24 +182,16 @@ pub fn build_nodes_value(nodes: &[(String, String)]) -> String {
 /// failure, so a half-finished deploy is still visible to `manage`.
 pub async fn execute(
     plan: &DeployPlan,
-    bundle_dir: &Path,
+    source: &BundleSource,
     cfg: &mut Config,
     log: &mut dyn FnMut(LogLine),
 ) -> Result<DeployOutcome> {
     if plan.relays.is_empty() {
         bail!("deploy plan has no relays — a sub without nodes is useless");
     }
-    let relay_build = bundle_dir.join("relay").join("build");
-    let sub_build = bundle_dir.join("sub").join("build");
-    for (unit, dir) in [("relay", &relay_build), ("sub", &sub_build)] {
-        if !dir.join("index.js").is_file() {
-            bail!(
-                "prebuilt {unit} worker not found at {} — download the full \
-                 release archive (it contains bundle/{unit}/)",
-                dir.display()
-            );
-        }
-    }
+    // Fail fast before touching the API if either worker payload is missing.
+    source.files("relay")?;
+    source.files("sub")?;
 
     // One client + workers.dev subdomain per distinct account in the plan.
     let mut clients: HashMap<String, CfClient> = HashMap::new();
@@ -168,7 +225,7 @@ pub async fn execute(
             &clients,
             &subdomains,
             cfg,
-            &relay_build,
+            source,
             log,
         )
         .await;
@@ -198,7 +255,7 @@ pub async fn execute(
         &clients,
         &subdomains,
         cfg,
-        &sub_build,
+        source,
         log,
     )
     .await
@@ -231,7 +288,7 @@ async fn deploy_relay(
     clients: &HashMap<String, CfClient>,
     subdomains: &HashMap<String, String>,
     cfg: &mut Config,
-    build_dir: &Path,
+    source: &BundleSource,
     log: &mut dyn FnMut(LogLine),
 ) -> Result<RelayOutcome> {
     let name = &spec.worker_name;
@@ -241,9 +298,9 @@ async fn deploy_relay(
     ));
     // Each relay gets its OWN independently generated secret.
     let (relay_secret, node_secret) = if encryption {
-        crate::gen_secret_pair()
+        crate::util::gen_secret_pair()
     } else {
-        let raw = crate::gen_raw_secret();
+        let raw = crate::util::gen_raw_secret();
         (raw.clone(), raw)
     };
 
@@ -251,7 +308,7 @@ async fn deploy_relay(
         LogKind::Step,
         format!("relay {name}: uploading worker"),
     ));
-    let files = build_files_with_nonce(build_dir)?;
+    let files = source.files("relay")?;
     clients[&spec.account]
         .upload_worker(
             &account_id(cfg, &spec.account)?,
@@ -298,7 +355,7 @@ async fn deploy_sub(
     clients: &HashMap<String, CfClient>,
     subdomains: &HashMap<String, String>,
     cfg: &mut Config,
-    build_dir: &Path,
+    source: &BundleSource,
     log: &mut dyn FnMut(LogLine),
 ) -> Result<SubOutcome> {
     let name = &spec.worker_name;
@@ -319,13 +376,13 @@ async fn deploy_sub(
             .map(|r| (r.domain.clone(), r.node_secret.clone()))
             .collect::<Vec<_>>(),
     );
-    let token = crate::generate_hex_id(32);
+    let token = crate::util::generate_hex_id(32);
 
     log(LogLine::new(
         LogKind::Step,
         format!("sub {name}: uploading worker"),
     ));
-    let files = build_files_with_nonce(build_dir)?;
+    let files = source.files("sub")?;
     client
         .upload_worker(
             &account_id,
@@ -371,20 +428,6 @@ async fn deploy_sub(
         subscription_token: token,
         subscription_url,
     })
-}
-
-/// Read the prebuilt worker and inject the per-run nonce comment into
-/// `index.js` (shared with the `bundle` command via `crate::inject_nonce`).
-fn build_files_with_nonce(build_dir: &Path) -> Result<Vec<cfapi::UploadFile>> {
-    let mut files = cfapi::collect_build_files(build_dir)?;
-    for f in &mut files {
-        if f.name == "index.js" {
-            let js = String::from_utf8(std::mem::take(&mut f.contents))
-                .context("build/index.js is not valid UTF-8")?;
-            f.contents = crate::inject_nonce(&js).into_bytes();
-        }
-    }
-    Ok(files)
 }
 
 fn resolve_account(cfg: &Config, name: &str) -> Result<Account> {
@@ -446,5 +489,44 @@ mod tests {
         assert_eq!(build_nodes_value(&[]), "");
         let single = vec![("d".to_string(), "s".to_string())];
         assert_eq!(build_nodes_value(&single), "d|s");
+    }
+
+    #[test]
+    fn embedded_bundle_files_with_nonce() {
+        let source = BundleSource::Embedded(EmbeddedBundle {
+            relay: vec![
+                ("index.js".into(), b"export default {}".to_vec()),
+                ("index_bg.wasm".into(), b"\0asm".to_vec()),
+                ("worker/shim.mjs".into(), b"import 0".to_vec()),
+            ],
+            sub: vec![("index.js".into(), b"export default {}".to_vec())],
+        });
+
+        let relay = source.files("relay").unwrap();
+        assert_eq!(relay.len(), 3);
+        let index = relay.iter().find(|f| f.name == "index.js").unwrap();
+        assert_eq!(index.content_type, "application/javascript+module");
+        let js = String::from_utf8(index.contents.clone()).unwrap();
+        assert!(js.starts_with("/* vw:"), "nonce comment injected");
+        assert!(js.ends_with("export default {}"));
+        let wasm = relay.iter().find(|f| f.name == "index_bg.wasm").unwrap();
+        assert_eq!(wasm.content_type, "application/wasm");
+        // Nonce differs per call (per-upload unique content hash).
+        let again = source.files("relay").unwrap();
+        assert_ne!(
+            index.contents,
+            again
+                .iter()
+                .find(|f| f.name == "index.js")
+                .unwrap()
+                .contents
+        );
+
+        let sub = source.files("sub").unwrap();
+        assert_eq!(sub.len(), 1);
+
+        // Missing unit fails loudly.
+        let empty = BundleSource::Embedded(EmbeddedBundle::default());
+        assert!(empty.files("relay").is_err());
     }
 }

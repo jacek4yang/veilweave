@@ -1,44 +1,16 @@
 [package]
 name = "veilweave-tools"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 
 [dependencies]
+# Shared deploy core (Cloudflare API client, config, orchestration).
+veilweave-core = { path = "../core" }
+
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-
-# Deploy core (cfapi / config / deploy / wizard). anyhow is used by the new
-# modules only; the pre-existing code keeps its expect() style.
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-dirs = "6"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "json",
-    "multipart",
-] }
 tokio = { version = "1", features = ["full"] }
 dialoguer = "0.11"
-
-# GUI. `wgpu` is the primary renderer (DX12/Metal/Vulkan — fully static, no
-# runtime deps, works even on DisplayLink/RDP/WARP machines); `glow` (OpenGL)
-# is kept as a fallback renderer. `open` opens the system browser.
-# x11/wayland select winit's Linux backends (no-ops on Windows/macOS).
-eframe = { version = "0.36", default-features = false, features = [
-    "wgpu",
-    "glow",
-    "default_fonts",
-    "x11",
-    "wayland",
-] }
-open = "5"
-# OS locale detection for GUI language auto-select.
-sys-locale = "0.3"
-
-[dev-dependencies]
-# Headless GUI smoke tests (logic only — no wgpu renderer).
-egui_kittest = { version = "0.36", default-features = false, features = ["eframe"] }

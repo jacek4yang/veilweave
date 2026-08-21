@@ -53,9 +53,10 @@ fn fb() -> Error {
 }
 
 /// One framed upload record popped from the inbound buffer:
-/// `(5-byte record header, AEAD body as a JS buffer, the read nonce)`. The body is
-/// copied straight into a `Uint8Array` once — WebCrypto decrypts it in place in the
-/// V8 heap, so the payload never makes a second trip through wasm linear memory.
+/// `(5-byte record header, AEAD body as a JS view, the read nonce)`. The body is
+/// a **zero-copy view over `buf`** (see `take_record`) — WebCrypto copies its
+/// input synchronously during the `decrypt` call, so the payload never crosses
+/// into the V8 heap and back before that.
 type Record = ([u8; 5], Uint8Array, [u8; 12]);
 
 #[derive(PartialEq, Clone, Copy)]
@@ -124,9 +125,17 @@ impl Inner {
         }
     }
 
-    /// Pop the next complete `[5-byte header ‖ body]` record at the cursor, copying
-    /// the body once into a `Uint8Array` and advancing the cursor + read nonce.
-    /// Returns `(header, body, nonce)` or `None` if the record is not yet complete.
+    /// Pop the next complete `[5-byte header ‖ body]` record at the cursor,
+    /// advancing the cursor + read nonce. The body is handed out as a zero-copy
+    /// `Uint8Array::view` over `buf` — this removes the old per-record wasm→JS
+    /// copy of the whole ciphertext. Soundness: WebCrypto performs "get a copy
+    /// of the bytes held by the buffer source" **synchronously** inside the
+    /// `decrypt` call (WebIDL BufferSource conversion), before the promise it
+    /// returns exists; the view is never touched after that `apply`. Between
+    /// view creation and `apply` there is no `await` and no wasm allocation, so
+    /// linear memory cannot grow and move under the view; workers are
+    /// single-threaded, so no concurrent invocation can mutate `buf` in that
+    /// window either. Returns `None` if the record is not yet complete.
     fn take_record(&mut self) -> Result<Option<Record>> {
         let avail = self.buf.len() - self.pos;
         if avail < 5 {
@@ -140,7 +149,7 @@ impl Inner {
         }
         next_nonce(&mut self.nonce_r);
         let nonce = self.nonce_r;
-        let body = Uint8Array::from(&self.buf[self.pos + 5..self.pos + 5 + l]);
+        let body = unsafe { Uint8Array::view(&self.buf[self.pos + 5..self.pos + 5 + l]) };
         self.pos += 5 + l;
         Ok(Some((hdr, body, nonce)))
     }
@@ -431,17 +440,33 @@ impl VeilweaveSession {
                 let pt = Uint8Array::new(&pt).to_vec();
                 self.inner.borrow_mut().acc_header.extend_from_slice(&pt);
 
-                let acc = self.inner.borrow().acc_header.clone();
-                match parse_vless_header(&acc, &self.env) {
-                    Ok((req, header_len, egress)) => {
-                        let initial = acc[header_len..].to_vec();
+                // `parse_vless_header` is fully synchronous, so borrow
+                // `acc_header` in place and copy out ONLY the post-header payload
+                // on success — the old code cloned the whole accumulation for
+                // every parse attempt (i.e. per header record).
+                enum Hdr {
+                    More,
+                    Parsed(VlessRequest, Egress, Vec<u8>),
+                }
+                let step = {
+                    let inner = self.inner.borrow();
+                    match parse_vless_header(&inner.acc_header, &self.env) {
+                        Ok((req, header_len, egress)) => {
+                            let initial = inner.acc_header[header_len..].to_vec();
+                            Hdr::Parsed(req, egress, initial)
+                        }
+                        Err(_) if inner.acc_header.len() < 1024 => Hdr::More,
+                        Err(e) => return Err(e),
+                    }
+                };
+                match step {
+                    Hdr::More => continue,
+                    Hdr::Parsed(req, egress, initial) => {
                         self.inner.borrow_mut().acc_header = Vec::new();
                         self.establish(ws, req.command, req.host, req.port, egress, initial)
                             .await?;
                         break;
                     }
-                    Err(_) if acc.len() < 1024 => continue,
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -537,6 +562,18 @@ impl VeilweaveSession {
         }
 
         // ── Data (TCP): frame bytes → target socket, verbatim ──
+        //
+        // Two copies per frame remain here and both are FFI-mandated:
+        //   1. JS→wasm, done by worker-rs when it delivers `websocket_message`
+        //      as a `Vec<u8>` — irreducible without abandoning worker-rs's
+        //      Durable Object event plumbing (not worth it).
+        //   2. wasm→JS, the `Uint8Array::from` below — required because the
+        //      socket's WritableStream may read the chunk ASYNCHRONOUSLY after
+        //      we return (unlike WebCrypto/`ws.send`, the Streams spec does not
+        //      copy the chunk synchronously), so handing it a zero-copy view
+        //      over `buf` would alias memory we later reuse. Everything else —
+        //      the move into `buf` in `websocket_message`, the cursor drain
+        //      here — is copy-free in the common case.
         if self.phase() == Phase::PlainData {
             let writer = self.inner.borrow().target_writer.clone().ok_or_else(fb)?;
             loop {

@@ -1,0 +1,22 @@
+[package]
+name = "veilweave-core"
+version = "1.1.0"
+edition = "2021"
+
+# Shared deploy core: Cloudflare API client, persistent config, deploy
+# orchestration, secret/blob helpers, and account recovery. UI-agnostic —
+# consumed by the veilweave-tools CLI and the Tauri app.
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "multipart",
+] }
+rand = "0.8"
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

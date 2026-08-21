@@ -3,11 +3,13 @@
 Step-by-step production deployment for the **three-piece** veilweave stack.
 Designed for the Cloudflare Workers free plan.
 
-> **Easiest path:** you don't need this guide at all. Download a release
-> archive, run `veilweave-tools` (GUI) or `veilweave-tools deploy` (CLI
-> wizard), and the deployer publishes both workers through the Cloudflare
-> API — accounts, KV, secrets, and the subscription URL included. This guide
-> covers the manual wrangler flow and the operational details underneath.
+> **Easiest path:** you don't need this guide at all. Download the **desktop
+> app** from the release page (Windows NSIS/MSI, macOS `.dmg`, Linux
+> AppImage/`.deb`), or run `veilweave-tools deploy` from the CLI archive — both
+> publish the workers through the Cloudflare API: accounts, KV, secrets, and
+> the subscription URL included. The app adds a usage dashboard, one-click
+> updates, and "扫描已有部署" recovery after a reinstall. This guide covers
+> the manual wrangler flow and the operational details underneath.
 
 ## 0. Prerequisites
 
@@ -21,12 +23,14 @@ For the manual flow in this guide:
 | wrangler     | ≥ 3.x        | `wrangler --version` |
 | Cloudflare   | free or paid | `wrangler whoami`  |
 
-For the deployer path (`veilweave-tools deploy` / GUI) you only need a
+For the deployer path (desktop app / `veilweave-tools deploy`) you only need a
 Cloudflare **API token** with:
 
 - Account → Workers Scripts → **Edit**
 - Account → Workers KV Storage → **Edit**
 - Account → Account Settings → **Read** (resolves the workers.dev subdomain)
+- Account → Account Analytics → **Read** (*optional* — only the desktop app's
+  usage dashboard needs it)
 
 Create it at <https://dash.cloudflare.com/profile/api-tokens>
 ("Create Custom Token"). The deployer supports **multiple accounts** — a

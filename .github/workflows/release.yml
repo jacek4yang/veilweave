@@ -1,11 +1,11 @@
 name: Release
 
-# Tag push (v*) builds and publishes a GitHub Release containing, per platform:
-#   veilweave-tools[.exe]      — all-in-one deployer (GUI + deploy/manage CLI)
-#   bundle/relay, bundle/sub   — PREBUILT workers (worker-build output)
-# End users never touch a Rust toolchain, Node, or wrangler: download the
-# archive, double-click the executable (GUI) or run `veilweave-tools deploy`,
-# paste a Cloudflare API token, pick a topology, done.
+# Tag push (v*) builds and publishes a GitHub Release containing:
+#   veilweave-tools[.exe] zips  — CLI deployer + PREBUILT workers (per platform)
+#   desktop app installers      — NSIS+MSI (Windows), DMG (macOS arm64),
+#                                 AppImage+deb (Linux), plus updater sigs and
+#                                 latest.json for in-app auto-update
+# End users never touch a Rust toolchain, Node, or wrangler.
 
 on:
   push:
@@ -99,10 +99,69 @@ jobs:
           path: stage/
           if-no-files-found: error
 
+  app:
+    name: app · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: workers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows }
+          - { os: macos-latest,   name: macos }
+          - { os: ubuntu-latest,  name: linux }
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download prebuilt worker bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-bundles
+          path: app/src-tauri/bundle
+      - name: Verify embedded worker bundle
+        run: |
+          test -f app/src-tauri/bundle/relay/build/index.js
+          test -f app/src-tauri/bundle/sub/build/index.js
+      - name: Install Linux app deps (webkit2gtk etc.)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+      - name: npm ci (tauri-cli)
+        working-directory: app
+        run: npm ci
+      - name: tauri build
+        working-directory: app
+        run: npm run tauri -- build
+      - name: Upload app bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.name }}
+          path: |
+            app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/bundle/nsis/*.sig
+            app/src-tauri/target/release/bundle/msi/*.msi
+            app/src-tauri/target/release/bundle/dmg/*.dmg
+            app/src-tauri/target/release/bundle/macos/*.tar.gz
+            app/src-tauri/target/release/bundle/macos/*.sig
+            app/src-tauri/target/release/bundle/appimage/*.AppImage
+            app/src-tauri/target/release/bundle/appimage/*.sig
+            app/src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
   release:
     name: publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [tools, workers]
+    needs: [tools, workers, app]
     permissions:
       contents: write
     env:
@@ -117,36 +176,24 @@ jobs:
       - name: Write QUICKSTART
         run: |
           cat > QUICKSTART.txt <<'EOF'
-          veilweave — quick deploy / 快捷部署
-          ====================================
+          veilweave CLI — quick deploy / 快捷部署
+          ======================================
 
-          EN: Double-click veilweave-tools (.exe) to open the GUI deployer
-          (or run `./veilweave-tools deploy` in a terminal for the wizard):
+          This archive is the CLI + prebuilt workers. For the full desktop app
+          (installer / DMG / auto-update), download it from the release page
+          instead: https://github.com/jacek4yang/veilweave/releases/latest
 
-            1. Add a Cloudflare account — the app opens the API token page;
-               the token needs: Workers Scripts Edit, Workers KV Storage Edit,
-               Account Settings Read.
-            2. Pick a topology: one account for the sub worker, one or more
-               accounts for relay nodes (multi-account is supported).
-            3. Click deploy — workers are uploaded directly via the Cloudflare
-               API. No Rust, Node, or wrangler needed.
-            4. Copy the subscription URL into your client.
+          EN: run `./veilweave-tools deploy` in a terminal — the wizard adds a
+          Cloudflare account (API token), plans the topology, and deploys
+          directly via the Cloudflare API. No Rust, Node, or wrangler needed.
+          `veilweave-tools manage` lists/deletes deployments.
+          Advanced: `veilweave-tools bundle` generates wrangler-ready folders.
 
-          Advanced: `veilweave-tools bundle` still generates wrangler-ready
-          folders for manual `wrangler deploy`.
-          Details: https://github.com/jacek4yang/veilweave#readme
-
-          中文：双击 veilweave-tools(.exe) 打开图形化部署器（或在终端运行
-          `./veilweave-tools deploy` 使用交互向导）：
-
-            1. 添加 Cloudflare 账号——程序会打开 API Token 页面；Token 需要：
-               Workers Scripts 编辑、Workers KV Storage 编辑、Account Settings 读取。
-            2. 选择拓扑：sub 放一个账号，若干 relay 节点可分散到多个账号。
-            3. 点击部署——直接通过 Cloudflare API 上传，无需 Rust/Node/wrangler。
-            4. 复制订阅链接到客户端。
-
-          高级用法：`veilweave-tools bundle` 仍会生成可用 wrangler 手动部署的目录。
-          详见仓库 README。
+          中文：本包为命令行版 + 预编译 worker。完整桌面应用（安装包/DMG/自动
+          更新）请在 release 页面下载。终端运行 `./veilweave-tools deploy`
+          按向导添加账号（API Token）、规划拓扑并直接通过 Cloudflare API 部署，
+          无需 Rust/Node/wrangler。`veilweave-tools manage` 管理已有部署。
+          高级用法：`veilweave-tools bundle` 生成 wrangler 手动部署目录。
           EOF
       - name: Assemble per-platform archives
         run: |
@@ -166,6 +213,48 @@ jobs:
             fi
             rm -rf "$pkg"
           done
+          ls -la out/
+      - name: Stage desktop app installers + build latest.json (updater manifest)
+        run: |
+          set -euo pipefail
+          cp artifacts/app-windows/nsis/*.exe out/ 2>/dev/null || true
+          cp artifacts/app-windows/msi/*.msi out/ 2>/dev/null || true
+          cp artifacts/app-macos/dmg/*.dmg out/ 2>/dev/null || true
+          cp artifacts/app-linux/appimage/*.AppImage out/ 2>/dev/null || true
+          cp artifacts/app-linux/deb/*.deb out/ 2>/dev/null || true
+
+          python3 - "$TAG" <<'PYEOF'
+          import glob, json, os, sys
+          tag = sys.argv[1]
+          version = tag.lstrip("v")
+          base = f"https://github.com/jacek4yang/veilweave/releases/download/{tag}"
+          def sig(pattern):
+              hits = glob.glob(pattern)
+              return open(hits[0], encoding="utf-8").read().strip() if hits else None
+          def asset(pattern):
+              hits = glob.glob(pattern)
+              return os.path.basename(hits[0]) if hits else None
+          platforms = {}
+          entries = [
+              ("windows-x86_64", "artifacts/app-windows/nsis/*.exe", "artifacts/app-windows/nsis/*.sig"),
+              ("darwin-aarch64", "artifacts/app-macos/macos/*.tar.gz", "artifacts/app-macos/macos/*.sig"),
+              ("linux-x86_64", "artifacts/app-linux/appimage/*.AppImage", "artifacts/app-linux/appimage/*.sig"),
+          ]
+          for name, asset_pat, sig_pat in entries:
+              a, s = asset(asset_pat), sig(sig_pat)
+              if a and s:
+                  platforms[name] = {"signature": s, "url": f"{base}/{a}"}
+          manifest = {
+              "version": version,
+              "notes": f"veilweave {tag}",
+              "pub_date": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+              "platforms": platforms,
+          }
+          with open("out/latest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+          print(json.dumps(manifest, indent=2))
+          assert platforms, "no updater platforms collected"
+          PYEOF
           ls -la out/
       - name: Create release
         run: |

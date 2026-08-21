@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "veilweave",
+  "version": "1.1.0",
+  "identifier": "dev.veilweave.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "veilweave",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 940,
+        "minHeight": 620,
+        "resizable": true,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "nsis",
+      "msi",
+      "dmg",
+      "appimage",
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    },
+    "category": "DeveloperTool",
+    "shortDescription": "veilweave desktop deployer",
+    "longDescription": "One-click deployment of veilweave relay and subscription workers to Cloudflare."
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFCNTQ5MEE5NUZCMzkyNkEKUldScWtyTmZxWkJVcTBLWEFpRTNPRXh0bWVUNENtUGVROE0xdEdtTXZaWkdScFo0bzZNQUdIV1kK",
+      "endpoints": [
+        "https://github.com/jacek4yang/veilweave/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

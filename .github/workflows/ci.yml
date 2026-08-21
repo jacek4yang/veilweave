@@ -95,3 +95,36 @@ jobs:
           grep -q "relay blob" /tmp/secret.txt || true
           # we accept any non-empty output
           test "$(wc -c < /tmp/secret.txt)" -gt 50
+
+  app-check:
+    name: app · cargo check (desktop)
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+      - name: Provide placeholder worker bundle for build.rs
+        run: |
+          # build.rs requires the embedded bundle layout; the real bytes are only
+          # needed for actual release builds (release.yml's workers job). A minimal
+          # placeholder is enough for cargo check.
+          for unit in relay sub; do
+            mkdir -p "app/src-tauri/bundle/$unit/build/worker"
+            echo "// ci placeholder" > "app/src-tauri/bundle/$unit/build/index.js"
+            : > "app/src-tauri/bundle/$unit/build/index_bg.wasm"
+            echo '{}' > "app/src-tauri/bundle/$unit/build/package.json"
+            echo "// ci placeholder" > "app/src-tauri/bundle/$unit/build/worker/shim.mjs"
+          done
+      - name: cargo check
+        working-directory: app/src-tauri
+        run: cargo check --locked 2>&1 | tail -5

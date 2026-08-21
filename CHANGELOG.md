@@ -9,6 +9,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 > wire-compatible with the previous patch release; minor releases
 > may change the build profile but stay wire-compatible.
 
+## [1.1.0] — 2026-08-21
+
+### Added
+- **Desktop app** (`app/`, `veilweave-app`): a Tauri 2 graphical deployer —
+  the new primary install path. Sidebar pages 概览 / 账号 / 部署 / 管理 /
+  设置; dark, polished design.
+  - Multi-token Cloudflare account management (API token, same permission
+    model as the CLI wizard).
+  - Per-account **usage dashboard**: today's requests against the 100k free
+    tier, error counts, per-worker rows — via the GraphQL Analytics API
+    (requires the optional `Account → Analytics → Read` token permission).
+  - **Recover** ("扫描已有部署"): reads worker script settings through the
+    Cloudflare API and rebuilds the local config — restores your deployment
+    inventory after a reinstall.
+  - Deploy wizard with the CLI's topology model (sub on one account, N
+    relays across any accounts, per-relay secrets), all names customizable
+    with one-click 随机 buttons.
+  - Manage: copy subscription URLs, **update a deployment** in place
+    (re-uploads the latest embedded worker code, keeping all secrets), or
+    delete a worker including its KV namespace.
+  - Settings: language (中文/English) and check-for-updates.
+  - Ships as installers per platform: NSIS `*-setup.exe` + MSI (Windows),
+    `.dmg` (macOS arm64), `.AppImage` + `.deb` (Linux). The Windows build
+    has no console window (`windows_subsystem`). The app embeds the prebuilt
+    workers — deploy/update runs fully offline from the installed app.
+  - **In-app auto-update**: releases now publish a signed `latest.json`
+    updater manifest next to the installers.
+- **`core/` crate** (`veilweave-core`): the shared deploy library — Cloudflare
+  API client, config persistence, deploy/recover orchestration, secret/name
+  utilities — now used by both `tools` (CLI) and `app` (desktop).
+
+### Changed
+- **The egui GUI was removed from `veilweave-tools`**; the tools crate is a
+  pure CLI again (`gen-secret` / `gen-link` / `bundle` / `deploy` / `manage`).
+  Running it with no arguments prints a hint pointing at `deploy` and the
+  desktop app. Graphical users should install the desktop app instead.
+- **Relay hot-path zero-copy pass** (`relay` 1.0.1; wire-compatible, `sub`
+  unchanged): plaintext upload takes ownership of arriving WS frames instead
+  of append-copying them; the download loop moves no bytes through wasm
+  linear memory and caches JS property strings. Encrypted mode gets
+  zero-copy views into WebCrypto, a per-connection staging buffer for
+  records, zero per-record JS allocations for GCM parameters, and the
+  header-phase clone is eliminated. No protocol or configuration changes.
+
 ## [1.0.1] — 2026-08-21
 
 ### Fixed
@@ -91,6 +135,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Apache 2.4.62 / Debian camouflage page (`static/apache_default.html`).
 - Signed-UUID scheme with per-isolate HKDF derivation and bounded LRU.
 
-[Unreleased]: https://github.com/<owner>/veilweave/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/<owner>/veilweave/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/<owner>/veilweave/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/<owner>/veilweave/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/<owner>/veilweave/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/<owner>/veilweave/releases/tag/v0.1.0

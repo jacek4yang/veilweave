@@ -1,27 +1,23 @@
-# `tools/` — 部署器（GUI + CLI）
+# `tools/` — 部署 CLI
 
-`veilweave-tools` 是**原生 Rust 二进制**（不跑在 Worker 里），是整个项目的
-运维入口：图形界面部署器、交互式 CLI 部署向导、密钥生成、单条链接签发、
-wrangler 部署产物打包。
+`veilweave-tools` 是**原生 Rust 命令行二进制**（不跑在 Worker 里）：
+交互式部署向导、密钥生成、单条链接签发、wrangler 部署产物打包。
 
-## 图形界面（无参数运行）
-
-不带任何参数运行 `veilweave-tools`（Windows 下双击 exe 也一样）会打开图形
-界面「**veilweave 部署器**」，三个页面：
-
-- **Accounts / 账号**：用 API token 添加一个或多个 Cloudflare 账号；
-- **Deploy / 部署**：规划拓扑（sub 放哪个账号、几个 relay、分别放哪些账号），
-  一键部署并打印订阅地址；
-- **Manage / 管理**：查看已部署的 worker、重新显示订阅地址、删除部署。
-
-这是给大多数用户的**主路径**——全程不需要 wrangler、Node.js 或 Rust
-工具链，部署直接走 Cloudflare API。
+> **要图形界面？** 那是独立的桌面应用 [`app/`](../app/)（Tauri 2，
+> 概览/账号/部署/管理/设置 五个页面，支持用量面板、扫描找回、自动更新）。
+> 从 [Releases](https://github.com/jacek4yang/veilweave/releases) 下载对应
+> 平台的安装包即可。CLI 不带参数运行时只会打印一条提示：
+>
+> ```
+> veilweave-tools — 部署请运行 / to deploy, run:
+>     veilweave-tools deploy
+> ```
 
 ## 子命令
 
 ### `deploy`
 
-交互式 CLI 向导，与 GUI 等价的命令行版本：
+交互式 CLI 向导（与桌面应用「部署」页同一套流程）：
 
 ```bash
 veilweave-tools deploy
@@ -142,18 +138,19 @@ veilweave-tools bundle
   不相同**，不会因批量指纹被标记。
 
 可选参数：`--out <dir>`（默认 `dist`）、`--relay-domain <域名>`、
-`--bundle-dir <dir>`。生成后按终端提示 `wrangler deploy` 即可（这是不装
-GUI、走 wrangler 的手动路径）。
+`--bundle-dir <dir>`。生成后按终端提示 `wrangler deploy` 即可（这是不用
+桌面应用 / API 部署、走 wrangler 的手动路径）。
 
 ## API token 权限
 
-部署器（GUI 和 `deploy`/`manage`）需要 **Account 级** Custom Token：
+部署器（`deploy`/`manage`，以及桌面应用）需要 **Account 级** Custom Token：
 
 | 资源 | 权限 |
 |------|------|
 | Account → Workers Scripts | **Edit** |
 | Account → Workers KV Storage | **Edit** |
 | Account → Account Settings | **Read**（解析 workers.dev 子域用） |
+| Account → Account Analytics | **Read**（**可选**——仅桌面应用「概览」用量面板需要） |
 
 在 <https://dash.cloudflare.com/profile/api-tokens> 选 "Create Custom Token"
 配置。token 只存在本机配置文件里，不会上传到任何地方（除了 Cloudflare API
@@ -186,9 +183,9 @@ Deploy:
   relay 3  → account D   (独立密钥)
 ```
 
-GUI / `deploy` 向导里按提示逐个选择即可：每个 relay 自动获得自己的密钥，
-sub 的 `VEILWEAVE_NODES` 自动汇总全部节点。订阅地址部署完成时打印，之后
-可在 Manage / `manage` 里随时重新查看。
+桌面应用 / `deploy` 向导里按提示逐个选择即可：每个 relay 自动获得自己的
+密钥，sub 的 `VEILWEAVE_NODES` 自动汇总全部节点。订阅地址部署完成时打印，
+之后可在桌面应用「管理」页 / `manage` 里随时重新查看。
 
 ## 编译产物
 
@@ -222,5 +219,6 @@ cargo build --release --manifest-path tools/Cargo.toml
 ## 关联文档
 
 - 顶层：[`../README.md`](../README.md)
+- 桌面应用：[`../app/README.md`](../app/README.md)
 - 协议细节：[`../docs/protocol.md`](../docs/protocol.md)
 - 部署：[`../docs/deployment.md`](../docs/deployment.md)

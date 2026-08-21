@@ -26,38 +26,63 @@ fn fb() -> Error {
     Error::RustError(String::new())
 }
 
+/// AAD length for every data-path call: the 5-byte VLESS Encryption record
+/// header. Typed into the signatures below so the reused `ad_buf` (see `Ctx`)
+/// is provably the right size — the protocol fixes this, no caller can vary it.
+const AAD_LEN: usize = 5;
+
 /// Per-isolate WebCrypto handles. `crypto.subtle` and its methods are stable for
 /// the isolate's life, so binding them once removes a handful of `Reflect.get`
 /// lookups and `JsString` allocations from every record on the hot path.
+///
+/// `params` / `iv_buf` / `ad_buf` / `args` are the per-call machinery, built once
+/// and **reused for every record** — this removes four per-record allocations
+/// (a params `Object`, two `Uint8Array` buffers and the args `Array`) that the
+/// old code paid for each call. Reuse is safe because of a WebCrypto guarantee:
+/// the algorithm dictionary and the data buffer are read ("get a copy of the
+/// bytes", WebIDL conversion) **synchronously during the call**, before the
+/// returned promise exists — so rewriting these buffers between calls can never
+/// disturb an in-flight operation, and there is no `await` between the rewrite
+/// and the `apply` (workers are single-threaded, so nothing else runs in that
+/// window either). The old comment rejected reuse out of a race concern; the
+/// synchronous-copy semantics are exactly what close that race.
 struct Ctx {
     subtle: JsValue,
     encrypt: Function,
     decrypt: Function,
     import_key: Function,
-    // Cached constant JsValues used to assemble the per-call algorithm object.
+    // Cached constant JsValue used by `importKey` (twice per connection).
     alg_name: JsValue, // "AES-GCM"
-    tag_len: JsValue,  // 128.0
-    k_name: JsValue,   // "name"
-    k_iv: JsValue,     // "iv"
-    k_ad: JsValue,     // "additionalData"
-    k_tag: JsValue,    // "tagLength"
+    // Reused `{ name, iv, additionalData, tagLength }` params object: built once
+    // in `build_ctx` (constant fields set there, `iv`/`ad` permanently bound to
+    // the two views below), then owned by slot 0 of `args` — no Rust handle to
+    // it is needed after that.
+    iv_buf: Uint8Array, // 12-byte nonce view, rewritten per call
+    ad_buf: Uint8Array, // 5-byte record-header AAD view, rewritten per call
+    // Reused `(params, key, data)` argument list: slot 0 fixed, 1/2 set per call.
+    args: Array,
 }
 
 impl Ctx {
-    /// Build a fresh `{ name, iv, additionalData, tagLength }` algorithm object.
-    ///
-    /// Intentionally **not** a shared/mutated object: a reused object would risk a
-    /// data race if its `iv` were changed while a prior `encrypt` promise was still
-    /// reading it, and correctness under sustained load outranks the few ops saved.
-    fn gcm_params(&self, nonce: &[u8; 12], aad: &[u8]) -> Object {
-        let p = Object::new();
-        let iv: JsValue = Uint8Array::from(&nonce[..]).into();
-        let ad: JsValue = Uint8Array::from(aad).into();
-        let _ = Reflect::set(&p, &self.k_name, &self.alg_name);
-        let _ = Reflect::set(&p, &self.k_iv, &iv);
-        let _ = Reflect::set(&p, &self.k_ad, &ad);
-        let _ = Reflect::set(&p, &self.k_tag, &self.tag_len);
-        p
+    /// Rewrite the reused iv/AAD views and fill the reused argument list for one
+    /// `subtle.<encrypt|decrypt>` call. Zero allocation; see `Ctx` for why the
+    /// reuse is sound. The returned borrow is consumed synchronously by `apply`.
+    fn gcm_args(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8; AAD_LEN],
+        key: &JsValue,
+        data: &JsValue,
+    ) -> &Array {
+        // `Uint8Array::view` wraps the wasm bytes with NO copy; it is read only by
+        // the immediately following `set`, which copies the bytes into the cached
+        // JS buffer. No wasm allocation can grow (and thus move) linear memory in
+        // that window, so the aliasing is sound.
+        self.iv_buf.set(unsafe { &Uint8Array::view(nonce) }, 0);
+        self.ad_buf.set(unsafe { &Uint8Array::view(aad) }, 0);
+        self.args.set(1, key.clone());
+        self.args.set(2, data.clone());
+        &self.args
     }
 }
 
@@ -79,35 +104,51 @@ fn build_ctx() -> Option<Ctx> {
             .dyn_into::<Function>()
             .ok()
     };
+    let alg_name = JsValue::from_str("AES-GCM");
+    // Build the reused params object once: constant fields set here, the two
+    // variable fields permanently bound to the cached views (rewritten per call).
+    // The object itself is then owned by `args` slot 0, so no Rust field holds it.
+    let params = Object::new();
+    let iv_buf = Uint8Array::new_with_length(12);
+    let ad_buf = Uint8Array::new_with_length(AAD_LEN as u32);
+    let _ = Reflect::set(&params, &JsValue::from_str("name"), &alg_name);
+    let _ = Reflect::set(&params, &JsValue::from_str("iv"), &iv_buf);
+    let _ = Reflect::set(&params, &JsValue::from_str("additionalData"), &ad_buf);
+    let _ = Reflect::set(
+        &params,
+        &JsValue::from_str("tagLength"),
+        &JsValue::from_f64(128.0),
+    );
+    let args = Array::new();
+    args.set(0, params.clone().into());
     Some(Ctx {
         encrypt: func("encrypt")?,
         decrypt: func("decrypt")?,
         import_key: func("importKey")?,
         subtle,
-        alg_name: JsValue::from_str("AES-GCM"),
-        tag_len: JsValue::from_f64(128.0),
-        k_name: JsValue::from_str("name"),
-        k_iv: JsValue::from_str("iv"),
-        k_ad: JsValue::from_str("additionalData"),
-        k_tag: JsValue::from_str("tagLength"),
+        alg_name,
+        iv_buf,
+        ad_buf,
+        args,
     })
 }
 
 /// Run `subtle.<encrypt|decrypt>(params, key, data)` and await the result. The
-/// synchronous part (assemble args, `apply`) holds the `CTX` borrow; the await
-/// happens after, on the returned Promise — so no borrow is held across `await`.
+/// synchronous part (rewrite views, fill args, `apply`) holds the `CTX` borrow;
+/// the await happens after, on the returned Promise — so no borrow is held
+/// across `await`.
 async fn run(
     key: &JsValue,
     nonce: &[u8; 12],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     data: &JsValue,
     enc: bool,
 ) -> Result<JsValue> {
     let promise = CTX.with(|c| -> Result<Promise> {
         let ctx = c.get_or_init(build_ctx).as_ref().ok_or_else(fb)?;
-        let args = Array::of3(&ctx.gcm_params(nonce, aad), key, data);
+        let args = ctx.gcm_args(nonce, aad, key, data);
         let f = if enc { &ctx.encrypt } else { &ctx.decrypt };
-        Reflect::apply(f, &ctx.subtle, &args)
+        Reflect::apply(f, &ctx.subtle, args)
             .map_err(|_| fb())?
             .dyn_into::<Promise>()
             .map_err(|_| fb())
@@ -147,7 +188,7 @@ pub async fn import_aes_gcm_key(raw: &[u8; 32]) -> Result<JsValue> {
 pub async fn encrypt_view(
     key: &JsValue,
     nonce: &[u8; 12],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     data: &JsValue,
 ) -> Result<JsValue> {
     run(key, nonce, aad, data, true).await
@@ -157,7 +198,7 @@ pub async fn encrypt_view(
 pub async fn decrypt_view(
     key: &JsValue,
     nonce: &[u8; 12],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     data: &JsValue,
 ) -> Result<JsValue> {
     run(key, nonce, aad, data, false).await
@@ -170,7 +211,7 @@ pub async fn decrypt_view(
 pub async fn encrypt(
     key: &JsValue,
     nonce: &[u8; 12],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
     let data: JsValue = Uint8Array::from(plaintext).into();
@@ -183,7 +224,7 @@ pub async fn encrypt(
 pub async fn decrypt(
     key: &JsValue,
     nonce: &[u8; 12],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
     let data: JsValue = Uint8Array::from(ciphertext).into();

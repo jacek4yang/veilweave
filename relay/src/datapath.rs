@@ -69,17 +69,30 @@ pub async fn sleep(ms: i32) {
     let _ = JsFuture::from(promise).await;
 }
 
-/// Is a stream-read result `{done: true}`?
-fn read_done(val: &JsValue) -> bool {
-    js_sys::Reflect::get(val, &JsValue::from_str("done"))
-        .map(|d| d.is_truthy())
-        .unwrap_or(true)
+// Property keys for the stream-read result object, resolved once per isolate:
+// `JsValue::from_str` allocates a fresh JS string per call, which would
+// otherwise run twice per downloaded chunk on the hottest loop we have.
+thread_local! {
+    static K_DONE: JsValue = JsValue::from_str("done");
+    static K_VALUE: JsValue = JsValue::from_str("value");
 }
 
-/// Extract `result.value` (a non-done read) as a `Uint8Array`.
+/// Is a stream-read result `{done: true}`?
+fn read_done(val: &JsValue) -> bool {
+    K_DONE.with(|k| {
+        js_sys::Reflect::get(val, k)
+            .map(|d| d.is_truthy())
+            .unwrap_or(true)
+    })
+}
+
+/// Extract `result.value` (a non-done read) as a `Uint8Array` — a VIEW over the
+/// socket's own JS buffer, no copy.
 fn read_value(val: &JsValue) -> Result<Uint8Array> {
-    let value = js_sys::Reflect::get(val, &JsValue::from_str("value")).map_err(|_| fb())?;
-    Ok(Uint8Array::new(&value))
+    K_VALUE.with(|k| {
+        let value = js_sys::Reflect::get(val, k).map_err(|_| fb())?;
+        Ok(Uint8Array::new(&value))
+    })
 }
 
 /// Merge coalesced read chunks into one contiguous JS buffer. The common
@@ -98,17 +111,30 @@ fn coalesce(mut parts: Vec<Uint8Array>, total: u32) -> Uint8Array {
     buf
 }
 
-/// Frame one record as `[5-byte header ‖ ciphertext]` and send it as a single WS
-/// message — the exact shape xray reads. The 5 header bytes are written directly
-/// into the framed buffer (no per-record temporary typed array).
-fn send_record(ws: &web_sys::WebSocket, hdr: &[u8; 5], ct: &JsValue) -> Result<()> {
+/// Frame one record as `[5-byte header ‖ ciphertext]` into the reusable
+/// `staging` buffer and send it as a single WS message — the exact shape xray
+/// reads. Staging reuse removes the per-record `Uint8Array` allocation the old
+/// code paid (a fresh `5+len` buffer for EVERY record); it is sound because
+/// `ws.send` copies the bytes synchronously ("get a copy of the bytes held by
+/// the buffer source"), so a queued frame can never be clobbered by the next
+/// record. The header bytes are written in place (5 byte-stores, no temp
+/// array); the `ct → staging` `set` is the one irreducible copy — WebCrypto
+/// returns a fresh `ArrayBuffer` and the wire needs header‖ciphertext
+/// contiguous in one frame, so something must concatenate them.
+fn send_record(
+    ws: &web_sys::WebSocket,
+    staging: &Uint8Array,
+    hdr: &[u8; 5],
+    ct: &JsValue,
+) -> Result<()> {
     let ct = Uint8Array::new(ct);
-    let out = Uint8Array::new_with_length(5 + ct.length());
     for i in 0..5u32 {
-        out.set_index(i, hdr[i as usize]);
+        staging.set_index(i, hdr[i as usize]);
     }
-    out.set(&ct, 5);
-    ws.send_with_array_buffer_view(&out).map_err(|_| fb())
+    staging.set(&ct, 5);
+    // A subarray view (no copy) limits the send to the live bytes.
+    ws.send_with_array_buffer_view(&staging.subarray(0, 5 + ct.length()))
+        .map_err(|_| fb())
 }
 
 /// Write one plaintext chunk (a JS buffer) to the target's writable side.
@@ -139,6 +165,11 @@ pub async fn relay_download(
     // Keep exactly one read in flight at all times: start the next before encrypting
     // and sending the current batch.
     let mut inflight = JsFuture::from(target_reader.read());
+
+    // One `[header ‖ ciphertext]` staging buffer for the whole connection
+    // (max record = DL_RECORD + 16-byte GCM tag + 5-byte header) — replaces a
+    // fresh per-record allocation. See `send_record` for why reuse is safe.
+    let staging = Uint8Array::new_with_length(5 + DL_RECORD + 16);
 
     loop {
         // Block only on the read started last iteration.
@@ -204,7 +235,7 @@ pub async fn relay_download(
             let mut hdr = [0u8; 5];
             put_header(&mut hdr, n as usize + 16);
             let ct = crate::webcrypto::encrypt_view(key, &nonce, &hdr, sub.as_ref()).await?;
-            send_record(ws, &hdr, &ct)?;
+            send_record(ws, &staging, &hdr, &ct)?;
             off += n;
             #[cfg(feature = "perf-log")]
             {

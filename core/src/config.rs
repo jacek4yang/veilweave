@@ -140,7 +140,7 @@ pub fn now_utc_string() -> String {
 }
 
 /// Unix seconds → RFC 3339 UTC. Days-to-civil algorithm by Howard Hinnant.
-fn format_unix_utc(secs: u64) -> String {
+pub fn format_unix_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
