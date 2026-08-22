@@ -211,7 +211,10 @@ jobs:
             artifacts/app-macos/macos/*.tar.gz \
             artifacts/app-linux/appimage/*.AppImage; do
             test -s "$artifact.sig"
-            minisign -Vm "$artifact" -p updater.pub -x "$artifact.sig"
+            decoded_signature="$artifact.minisign-decoded"
+            base64 --decode "$artifact.sig" > "$decoded_signature"
+            minisign -Vm "$artifact" -p updater.pub -x "$decoded_signature"
+            rm -f "$decoded_signature"
           done
       - name: Write QUICKSTART
         run: |
