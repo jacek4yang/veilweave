@@ -16,8 +16,13 @@
     config: null, // { accounts:[AccountView], deployments:[Deployment], ui_language }
     usage: {}, // name -> { loading, rows, analytics_error, free, ts }
     version: "",
+    zones: {}, // account label -> active zones
     deploy: {
-      sub: { account: "", worker_name: "", kv_title: "", kv_binding: "" },
+      sub: {
+        account: "", worker_name: "", kv_title: "", kv_binding: "",
+        endpoint: { mode: "workers-dev", primary: "workers-dev", custom_domain: null },
+        settings: { max_nodes: 100, fingerprint: "chrome", disable_builtin_proxyip: false, proxyip_list: [] },
+      },
       relays: [],
       encryption: false,
       running: false,
@@ -273,7 +278,7 @@
         <h2 class="card-title">${t("ac.add.title")}</h2>
         <p class="card-desc">${t("ac.add.desc")}</p>
         <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:16px">
-          ${[1, 2, 3, 4].map((i) => `<span class="chip" style="background:rgba(99,102,241,.1);color:var(--text-2);border:1px solid rgba(99,102,241,.25)">${t("ac.perm." + i)}</span>`).join("")}
+          ${[1, 2, 3, 4, 5, 6].map((i) => `<span class="chip" style="background:rgba(99,102,241,.1);color:var(--text-2);border:1px solid rgba(99,102,241,.25)">${t("ac.perm." + i)}</span>`).join("")}
         </div>
         <div class="field">
           <button class="btn btn-ghost btn-sm" id="open-token-url">↗ ${t("ac.tokenPage")}</button>
@@ -289,6 +294,7 @@
             <input type="password" id="add-token" class="mono" placeholder="${t("ac.token.ph")}" autocomplete="off" />
           </div>
         </div>
+        <div id="account-picker"></div>
         <button class="btn btn-primary" id="add-account">${t("ac.verify")}</button>
       </div>
 
@@ -313,7 +319,23 @@
       btn.disabled = true;
       btn.innerHTML = `<span class="spinner"></span> ${t("common.loading")}`;
       try {
-        const acc = await invoke("add_account", { label: label || null, token });
+        let accountId = el.querySelector("#account-choice")?.value || null;
+        if (!accountId) {
+          const candidates = await invoke("discover_accounts", { token });
+          if (candidates.length > 1) {
+            el.querySelector("#account-picker").innerHTML = `<div class="field">
+              <label class="field-label">${t("ac.chooseAccount")}</label>
+              <select id="account-choice">${candidates.map((a) =>
+                `<option value="${esc(a.account_id)}">${esc(a.name)} · ${esc(a.account_id)}</option>`).join("")}</select>
+            </div>`;
+            btn.disabled = false;
+            btn.textContent = t("ac.addSelected");
+            return;
+          }
+          accountId = candidates[0]?.account_id || null;
+        }
+        const acc = await invoke("add_account", { label: label || null, token, accountId });
+        el.querySelector("#add-token").value = "";
         toast(t("ac.added", { name: acc.name }), "success");
         await refresh();
       } catch (err) {
@@ -358,18 +380,76 @@
   // ── page: deploy ──────────────────────────────────────────────────────
   const NAME_RE = /^[a-z0-9-]{1,63}$/;
 
+  function defaultEndpoint() {
+    return { mode: "workers-dev", primary: "workers-dev", custom_domain: null };
+  }
+
+  function endpointEditor(endpoint, account, cls = "") {
+    endpoint = endpoint || defaultEndpoint();
+    const custom = endpoint.mode !== "workers-dev";
+    const domain = endpoint.custom_domain || { hostname: "", zone_id: "", zone_name: "" };
+    const zones = state.zones[account] || [];
+    const zoneOptions = zones.map((zone) =>
+      `<option value="${esc(zone.id)}" data-name="${esc(zone.name)}" ${zone.id === domain.zone_id ? "selected" : ""}>${esc(zone.name)}</option>`).join("");
+    const primaryOptions = endpoint.mode === "both"
+      ? `<option value="workers-dev" ${endpoint.primary === "workers-dev" ? "selected" : ""}>workers.dev</option><option value="custom-domain" ${endpoint.primary === "custom-domain" ? "selected" : ""}>${t("dp.endpoint.custom")}</option>`
+      : `<option value="${endpoint.mode === "custom-domain" ? "custom-domain" : "workers-dev"}">${endpoint.mode === "custom-domain" ? t("dp.endpoint.custom") : "workers.dev"}</option>`;
+    return `<div class="endpoint-editor ${cls}">
+      <div class="field"><label class="field-label">${t("dp.endpoint.mode")}</label>
+        <select class="ep-mode"><option value="workers-dev" ${endpoint.mode === "workers-dev" ? "selected" : ""}>${t("dp.endpoint.workers")}</option><option value="custom-domain" ${endpoint.mode === "custom-domain" ? "selected" : ""}>${t("dp.endpoint.customOnly")}</option><option value="both" ${endpoint.mode === "both" ? "selected" : ""}>${t("dp.endpoint.both")}</option></select></div>
+      <div class="field"><label class="field-label">${t("dp.endpoint.primary")}</label><select class="ep-primary">${primaryOptions}</select></div>
+      <div class="field ${custom ? "" : "endpoint-disabled"}"><label class="field-label">${t("dp.endpoint.zone")}</label>
+        <div class="field-row"><div class="grow"><select class="ep-zone" ${custom ? "" : "disabled"}><option value="">${t("dp.endpoint.chooseZone")}</option>${zoneOptions}</select></div><button type="button" class="btn btn-ghost btn-sm ep-load-zones" ${custom ? "" : "disabled"}>${t("dp.endpoint.loadZones")}</button></div></div>
+      <div class="field ${custom ? "" : "endpoint-disabled"}"><label class="field-label">${t("dp.endpoint.hostname")}</label><input class="ep-host mono" value="${esc(domain.hostname)}" ${custom ? "" : "disabled"} placeholder="sub.example.com" /></div>
+      ${custom && domain.hostname ? `<div class="endpoint-preview">https://${esc(domain.hostname)}</div>` : ""}
+    </div>`;
+  }
+
+  function readEndpoint(editor, existing) {
+    if (!editor) return existing || defaultEndpoint();
+    const mode = editor.querySelector(".ep-mode").value;
+    const primary = editor.querySelector(".ep-primary").value;
+    if (mode === "workers-dev") return { mode, primary: "workers-dev", custom_domain: null };
+    const zone = editor.querySelector(".ep-zone");
+    const option = zone.options[zone.selectedIndex];
+    return {
+      mode, primary,
+      custom_domain: {
+        hostname: editor.querySelector(".ep-host").value.trim(),
+        zone_id: zone.value,
+        zone_name: option?.dataset.name || option?.textContent || "",
+      },
+    };
+  }
+
+  async function loadZones(account, el) {
+    try {
+      state.zones[account] = await invoke("list_zones", { name: account });
+      readDeployForm(el);
+      renderDeploy(el);
+    } catch (err) { toast(String(err), "error", 7000); }
+  }
+
   function readDeployForm(el) {
     const d = state.deploy;
     d.sub.account = el.querySelector("#dp-sub-account")?.value ?? d.sub.account;
     d.sub.worker_name = el.querySelector("#dp-sub-name")?.value ?? d.sub.worker_name;
     d.sub.kv_title = el.querySelector("#dp-kv-title")?.value ?? d.sub.kv_title;
     d.sub.kv_binding = el.querySelector("#dp-kv-binding")?.value ?? d.sub.kv_binding;
+    d.sub.endpoint = readEndpoint(el.querySelector(".sub-endpoint"), d.sub.endpoint);
+    d.sub.settings = {
+      max_nodes: Number(el.querySelector("#dp-max-nodes")?.value || d.sub.settings?.max_nodes || 100),
+      fingerprint: el.querySelector("#dp-fingerprint")?.value || d.sub.settings?.fingerprint || "chrome",
+      disable_builtin_proxyip: el.querySelector("#dp-disable-proxyip")?.checked || false,
+      proxyip_list: (el.querySelector("#dp-proxyip-list")?.value || "").split(/[\s,]+/).filter(Boolean),
+    };
     d.encryption = el.querySelector("#dp-encryption")?.checked ?? d.encryption;
     el.querySelectorAll(".relay-row").forEach((row) => {
       const i = Number(row.dataset.idx);
       if (d.relays[i]) {
         d.relays[i].account = row.querySelector(".rl-account").value;
         d.relays[i].worker_name = row.querySelector(".rl-name").value;
+        d.relays[i].endpoint = readEndpoint(row.querySelector(".relay-endpoint"), d.relays[i].endpoint);
       }
     });
   }
@@ -391,7 +471,7 @@
     const cfg = state.config;
     const noAccounts = !cfg || cfg.accounts.length === 0;
     if (!d.relays.length && cfg && cfg.accounts.length) {
-      d.relays.push({ account: cfg.accounts[0].name, worker_name: "" });
+      d.relays.push({ account: cfg.accounts[0].name, worker_name: "", endpoint: defaultEndpoint() });
       d.sub.account = d.sub.account || cfg.accounts[0].name;
     }
 
@@ -404,6 +484,7 @@
         <input type="text" class="rl-name mono" placeholder="${t("dp.workerName")}" value="${esc(r.worker_name)}" />
         <button class="btn btn-ghost btn-sm rl-random">${t("common.random")}</button>
         <button class="icon-btn danger rl-remove" title="${t("common.delete")}" ${d.relays.length <= 1 ? "disabled style=opacity:.3" : ""}>✕</button>
+        ${endpointEditor(r.endpoint, r.account, "relay-endpoint")}
       </div>`).join("");
 
     const validCount = d.relays.filter((r) => NAME_RE.test(r.worker_name)).length;
@@ -446,6 +527,17 @@
               <button class="btn btn-ghost btn-sm" id="dp-kv-random">${t("common.random")}</button>
             </div>
           </div>
+        </div>
+        <hr class="divider" />
+        <div class="section-label">${t("dp.endpoint.title")}</div>
+        ${endpointEditor(d.sub.endpoint, d.sub.account, "sub-endpoint")}
+        <hr class="divider" />
+        <div class="section-label">${t("dp.advanced")}</div>
+        <div class="grid-2">
+          <div class="field"><label class="field-label">MAX_NODES</label><input id="dp-max-nodes" type="number" min="1" max="1000" value="${esc(d.sub.settings?.max_nodes || 100)}" /></div>
+          <div class="field"><label class="field-label">FP</label><select id="dp-fingerprint">${["chrome", "firefox", "safari", "ios", "android", "edge", "random", "randomized"].map((fp) => `<option value="${fp}" ${fp === (d.sub.settings?.fingerprint || "chrome") ? "selected" : ""}>${fp}</option>`).join("")}</select></div>
+          <div class="field"><label class="field-label">PROXYIP_LIST</label><input id="dp-proxyip-list" value="${esc((d.sub.settings?.proxyip_list || []).join(","))}" placeholder="host.example:443" /></div>
+          <label class="check-row"><input id="dp-disable-proxyip" type="checkbox" ${d.sub.settings?.disable_builtin_proxyip ? "checked" : ""} /><span>${t("dp.disableBuiltinProxyip")}</span></label>
         </div>
       </div>
 
@@ -493,7 +585,7 @@
       el.querySelector("#err-sub-name").textContent = ok ? "" : t("dp.invalidName");
       readDeployForm(el); updateDeployStartBtn(el);
     });
-    ["#dp-sub-account", "#dp-kv-title", "#dp-kv-binding"].forEach((sel) =>
+    ["#dp-sub-account", "#dp-kv-title", "#dp-kv-binding", "#dp-max-nodes", "#dp-fingerprint", "#dp-proxyip-list", "#dp-disable-proxyip"].forEach((sel) =>
       el.querySelector(sel).addEventListener("input", () => { readDeployForm(el); updateSummary(el); }));
     el.querySelector("#dp-encryption").addEventListener("change", (e) => {
       readDeployForm(el);
@@ -520,9 +612,16 @@
     });
     el.querySelector("#dp-add-relay").onclick = () => {
       readDeployForm(el);
-      state.deploy.relays.push({ account: state.config.accounts[0].name, worker_name: "" });
+      state.deploy.relays.push({ account: state.config.accounts[0].name, worker_name: "", endpoint: defaultEndpoint() });
       renderDeploy(el);
     };
+    el.querySelectorAll(".ep-mode, .ep-primary").forEach((input) => input.addEventListener("change", rerender));
+    el.querySelectorAll(".ep-zone, .ep-host").forEach((input) => input.addEventListener("input", () => readDeployForm(el)));
+    el.querySelectorAll(".ep-load-zones").forEach((button) => button.onclick = async () => {
+      const row = button.closest(".relay-row");
+      const account = row ? row.querySelector(".rl-account").value : el.querySelector("#dp-sub-account").value;
+      await loadZones(account, el);
+    });
     el.querySelector("#dp-start").onclick = () => startDeploy(el);
   }
 
@@ -611,19 +710,21 @@
     const d = state.deploy;
     const box = el.querySelector("#deploy-result");
     if (!box || !d.done) return;
-    if (d.done.ok && d.done.subscription_url) {
+    if (d.done.ok) {
       box.innerHTML = `
         <div class="success-card mt16">
           <div class="big-check">✓</div>
           <h3 style="margin:0 0 6px">${t("dp.success")}</h3>
           <p style="color:var(--text-2);margin:0">${t("dp.success.desc")}</p>
-          <div class="sub-url-box">
-            <span>${esc(d.done.subscription_url)}</span>
-            <button class="btn btn-primary btn-sm" data-copy="${esc(d.done.subscription_url)}">${t("common.copy")}</button>
-          </div>
+          ${d.done.sub_deployment_id ? `<button class="btn btn-primary mt16" data-fetch-sub="${esc(d.done.sub_deployment_id)}">${t("mg.copySub")}</button>` : ""}
           <div style="color:var(--muted);font-size:12px">${d.done.completed.map(esc).join(" · ")}</div>
         </div>`;
-      wireCopy(box);
+      box.querySelector("[data-fetch-sub]")?.addEventListener("click", async (event) => {
+        try {
+          const url = await invoke("get_subscription_url", { deploymentId: event.currentTarget.dataset.fetchSub });
+          await copyText(url, event.currentTarget);
+        } catch (err) { toast(String(err), "error", 7000); }
+      });
     } else if (!d.done.ok) {
       box.innerHTML = `<div class="hint mt16" style="border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.07);color:var(--red)">
         <span>✕</span><span class="mono" style="font-size:12px">${esc(d.done.error || "")}</span></div>`;
@@ -649,14 +750,15 @@
               <th>${t("mg.col.created")}</th><th style="text-align:right">${t("mg.col.actions")}</th>
             </tr></thead>
             <tbody>${deps.map((d) => {
-              const subUrl = d.sub ? `https://${d.domain}/sub?token=${d.sub.subscription_token}` : null;
               return `<tr>
                 <td><span class="badge badge-${d.role}">${t("mg.role." + d.role)}</span></td>
                 <td class="mono" style="font-weight:600" title="${esc(d.name)}">${esc(d.name)}</td>
-                <td>${copyvalHtml("https://" + d.domain, trunc(d.domain, 13, 7))}</td>
+                <td>${d.domain ? copyvalHtml("https://" + d.domain, trunc(d.domain, 13, 7)) : "—"}</td>
                 <td style="color:var(--muted);font-size:12.3px">${esc((d.created_at || "").slice(0, 10))}</td>
                 <td><div class="deploy-row-actions">
-                  ${subUrl ? `<button class="btn btn-ghost btn-sm" data-copy="${esc(subUrl)}">${t("mg.copySub")}</button>` : ""}
+                  ${d.sub ? `<button class="btn btn-ghost btn-sm" data-fetch-sub="${esc(d.id)}">${t("mg.copySub")}</button>` : ""}
+                  ${d.sub ? `<button class="btn btn-ghost btn-sm" data-rotate-token="${esc(d.id)}">${t("mg.rotateToken")}</button>` : ""}
+                  ${d.previous_version_id ? `<button class="btn btn-ghost btn-sm" data-rollback="${esc(d.id)}">${t("mg.rollback")}</button>` : ""}
                   <button class="btn btn-ghost btn-sm" data-update="${esc(d.account)}|${esc(d.name)}">${t("mg.update")}</button>
                   <button class="btn btn-danger btn-sm" data-del-dep="${esc(d.account)}|${esc(d.name)}">${t("common.delete")}</button>
                 </div></td>
@@ -672,6 +774,40 @@
       ${body}`;
 
     el.querySelector("#mg-refresh").onclick = refresh;
+
+    el.querySelectorAll("[data-fetch-sub]").forEach((b) => (b.onclick = async () => {
+      try {
+        const url = await invoke("get_subscription_url", { deploymentId: b.dataset.fetchSub });
+        await copyText(url, b);
+      } catch (err) { toast(String(err), "error", 7000); }
+    }));
+
+    el.querySelectorAll("[data-rollback]").forEach((b) => (b.onclick = async () => {
+      const ok = await confirmModal({
+        title: t("mg.rollback"), body: esc(t("mg.rollback.confirm")),
+        confirmLabel: t("mg.rollback"), danger: false,
+      });
+      if (!ok) return;
+      try {
+        await invoke("rollback_deployment", { deploymentId: b.dataset.rollback });
+        toast(t("mg.rolledBack"), "success");
+        await refresh();
+      } catch (err) { toast(String(err), "error", 7000); }
+    }));
+
+    el.querySelectorAll("[data-rotate-token]").forEach((b) => (b.onclick = async () => {
+      const ok = await confirmModal({
+        title: t("mg.rotateToken"), body: esc(t("mg.rotateToken.confirm")),
+        confirmLabel: t("mg.rotateToken"), danger: true,
+      });
+      if (!ok) return;
+      b.disabled = true;
+      try {
+        await invoke("rotate_subscription_token", { deploymentId: b.dataset.rotateToken });
+        toast(t("mg.tokenRotated"), "success");
+        await refresh();
+      } catch (err) { toast(String(err), "error", 7000); b.disabled = false; }
+    }));
 
     el.querySelectorAll("[data-update]").forEach((b) => (b.onclick = async () => {
       const [account, name] = b.dataset.update.split("|");
@@ -704,6 +840,8 @@
 
   // ── page: settings ────────────────────────────────────────────────────
   function renderSettings(el) {
+    const nw = state.config?.network || { mode: "direct", bypass: [], request_timeout_secs: 45 };
+    const explicitProxy = nw.mode === "socks5" || nw.mode === "http-proxy";
     el.innerHTML = `
       <div class="page-head"><div><h1>${t("st.title")}</h1><div class="sub">${t("st.sub")}</div></div></div>
       <div class="card">
@@ -724,6 +862,49 @@
         </div>
       </div>
 
+      <div class="card">
+        <h2 class="card-title">${t("st.network")}</h2>
+        <p class="card-desc">${t("st.network.desc")}</p>
+        <div class="grid-2">
+          <div class="field">
+            <label class="field-label">${t("st.network.mode")}</label>
+            <select id="nw-mode">
+              <option value="direct" ${nw.mode === "direct" ? "selected" : ""}>${t("st.network.direct")}</option>
+              <option value="system" ${nw.mode === "system" ? "selected" : ""}>${t("st.network.system")}</option>
+              <option value="socks5" ${nw.mode === "socks5" ? "selected" : ""}>SOCKS5</option>
+              <option value="http-proxy" ${nw.mode === "http-proxy" ? "selected" : ""}>HTTP / HTTPS Proxy</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label">${t("st.network.state")}</label>
+            <div class="chip ${explicitProxy ? "" : "chip-exp"}">${esc(nw.proxy_endpoint || t("st.network.noProxy"))}</div>
+          </div>
+        </div>
+        <div id="nw-explicit" style="${explicitProxy ? "" : "display:none"}">
+          <div class="grid-2">
+            <div class="field"><label class="field-label">${t("st.network.host")}</label>
+              <input id="nw-host" value="${esc(nw.host || "127.0.0.1")}" autocomplete="off" /></div>
+            <div class="field"><label class="field-label">${t("st.network.port")}</label>
+              <input id="nw-port" type="number" min="1" max="65535" value="${esc(nw.port || 10808)}" /></div>
+            <div class="field"><label class="field-label">${t("st.network.username")}</label>
+              <input id="nw-user" value="${esc(nw.username || "")}" autocomplete="off" /></div>
+            <div class="field"><label class="field-label">${t("st.network.password")}</label>
+              <input id="nw-password" type="password" value="" placeholder="${t("st.network.password.ph")}" autocomplete="new-password" /></div>
+          </div>
+          <label class="check-row"><input id="nw-remote-dns" type="checkbox" ${nw.remote_dns !== false ? "checked" : ""} />
+            <span>${t("st.network.remoteDns")}</span></label>
+          <label class="check-row"><input id="nw-fallback" type="checkbox" disabled />
+            <span>${t("st.network.fallback")}</span></label>
+          <div class="field mt12"><label class="field-label">${t("st.network.bypass")}</label>
+            <input id="nw-bypass" value="${esc((nw.bypass || []).join(","))}" placeholder="localhost,127.0.0.0/8,::1" /></div>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:14px">
+          <button class="btn btn-primary" id="save-network">${t("common.save")}</button>
+          <button class="btn btn-ghost" id="test-network">${t("st.network.test")}</button>
+        </div>
+        <div id="network-results" class="mono mt12" style="font-size:12px;color:var(--text-2)"></div>
+      </div>
+
       <div class="card about-block">
         <svg class="brand-mark" viewBox="0 0 48 48">
           <path d="M5 24 Q24 8 43 24" fill="none" stroke="#6366f1" stroke-width="2.6" stroke-linecap="round"/>
@@ -736,6 +917,52 @@
       </div>`;
 
     el.querySelectorAll("#lang-seg button").forEach((b) => (b.onclick = () => setLang(b.dataset.lang)));
+    el.querySelector("#nw-mode").onchange = (event) => {
+      const explicit = event.target.value === "socks5" || event.target.value === "http-proxy";
+      el.querySelector("#nw-explicit").style.display = explicit ? "" : "none";
+    };
+    el.querySelector("#save-network").onclick = async (event) => {
+      const btn = event.currentTarget;
+      const mode = el.querySelector("#nw-mode").value;
+      const explicit = mode === "socks5" || mode === "http-proxy";
+      const settings = {
+        mode,
+        host: explicit ? el.querySelector("#nw-host").value.trim() : null,
+        port: explicit ? Number(el.querySelector("#nw-port").value) : null,
+        username: explicit ? (el.querySelector("#nw-user").value.trim() || null) : null,
+        password: explicit ? (el.querySelector("#nw-password").value || null) : null,
+        remote_dns: explicit ? el.querySelector("#nw-remote-dns").checked : true,
+        allow_direct_fallback: false,
+        bypass: explicit ? el.querySelector("#nw-bypass").value.split(",").map((value) => value.trim()).filter(Boolean) : [],
+        connect_timeout_secs: 10,
+        request_timeout_secs: nw.request_timeout_secs || 45,
+        http_scheme: "http",
+      };
+      btn.disabled = true;
+      try {
+        await invoke("save_network", { settings });
+        el.querySelector("#nw-password").value = "";
+        toast(t("st.network.saved"), "success");
+        await loadConfig();
+        renderSettings(el);
+      } catch (err) {
+        toast(String(err), "error", 7000);
+        btn.disabled = false;
+      }
+    };
+    el.querySelector("#test-network").onclick = async (event) => {
+      const btn = event.currentTarget;
+      btn.disabled = true;
+      try {
+        const report = await invoke("test_network");
+        el.querySelector("#network-results").innerHTML = report.checks.map((check) =>
+          `<div style="display:flex;gap:12px"><span style="width:150px">${esc(check.name)}</span><b style="color:${check.ok ? "var(--green)" : "var(--red)"}">${check.ok ? "OK" : "FAIL"}</b><span>${esc(check.latency_ms)} ms · ${esc(check.detail)}</span></div>`
+        ).join("");
+      } catch (err) {
+        toast(String(err), "error", 7000);
+      }
+      btn.disabled = false;
+    };
     el.querySelector("#check-update").onclick = async (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
@@ -791,7 +1018,7 @@
   async function init() {
     document.querySelectorAll(".nav-item").forEach((n) => (n.onclick = () => setPage(n.dataset.nav)));
     document.getElementById("lang-toggle").onclick = () => setLang(state.lang === "zh" ? "en" : "zh");
-    try { state.version = await invoke("app_version"); } catch { state.version = "1.1.0"; }
+    try { state.version = await invoke("app_version"); } catch { state.version = "2.0.0"; }
     document.getElementById("sidebar-version").textContent = "v" + state.version;
     renderNavText();
     await loadConfig().catch((e) => toast(String(e), "error"));

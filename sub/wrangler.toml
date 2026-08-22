@@ -16,7 +16,6 @@ cwd = "."
 binding = "VEILWEAVE_KV"
 id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 
-[vars]
 # Relay nodes for load balancing. Each node is `domain|secret`, comma-separated.
 # DEFAULT (plaintext, `encryption=none`): `secret` is the raw shared secret from
 # `veilweave-tools gen-secret` (must equal the relay's SECRET_KEY).
@@ -27,11 +26,13 @@ id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 #
 # Multiple nodes, comma-separated:
 #   VEILWEAVE_NODES = "node-a.example.com|<secret a>,node-b.example.com|<secret b>"
-VEILWEAVE_NODES = "REPLACE_ME.example.com|REPLACE_ME_WITH_SECRET"
+# Set with: wrangler secret put VEILWEAVE_NODES
 
 # Subscription access token (independent of any relay secret).
 # For production, prefer:  wrangler secret put SUBSCRIPTION_TOKEN
-SUBSCRIPTION_TOKEN = "REPLACE_ME_WITH_RANDOM_TOKEN"
+# Set with: wrangler secret put SUBSCRIPTION_TOKEN
+
+[vars]
 
 # Maximum number of nodes to return in a single subscription response.
 MAX_NODES = "100"

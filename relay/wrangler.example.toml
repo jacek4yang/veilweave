@@ -1,11 +1,10 @@
 # This is the **reference** wrangler.toml. The committed `wrangler.toml` is
-# safe to copy as-is, but the SECRET_KEY there is a placeholder.
-# For local dev or staging you can `cp wrangler.example.toml wrangler.toml`
-# and fill the placeholder with your own secret.
+# safe to copy as-is and contains no SECRET_KEY value.
+# For local dev or staging you can `cp wrangler.example.toml wrangler.toml`.
 #
 # For production, use the secret-store path:
 #     wrangler secret put SECRET_KEY
-# and remove the `[vars].SECRET_KEY` line.
+# The value is intentionally absent from this file.
 
 name = "veilweave"
 main = "build/index.js"
@@ -19,13 +18,7 @@ cwd = "."
 [observability]
 enabled = true
 
-[vars]
-# Default (recommended on the free plan): a plain random secret string —
-# plaintext VLESS, zero crypto on the data path.
-# Experimental opt-in: the **relay blob** from
-#   cargo run --manifest-path tools/Cargo.toml -- gen-secret --encryption
-# enables VLESS Encryption (post-quantum, forward-secret, CPU-heavy).
-SECRET_KEY = "REPLACE_ME_WITH_A_PLAIN_RANDOM_SECRET"
+# Set with: wrangler secret put SECRET_KEY
 
 [[durable_objects.bindings]]
 name = "VEILWEAVE_SESSION"

@@ -3,6 +3,29 @@
 `veilweave-tools` 是**原生 Rust 命令行二进制**（不跑在 Worker 里）：
 交互式部署向导、密钥生成、单条链接签发、wrangler 部署产物打包。
 
+v2 还提供可自动化的控制面命令：
+
+```text
+veilweave-tools plan --config veilweave.toml
+veilweave-tools apply --config veilweave.toml --yes
+veilweave-tools status --json
+veilweave-tools update --deployment <uuid>
+veilweave-tools rollback --deployment <uuid>
+veilweave-tools rotate-token --deployment <sub-uuid>
+veilweave-tools doctor
+veilweave-tools recover --account <label-or-id>
+veilweave-tools recover --account production --adopt-worker edge-one \
+  --worker-secret-ref env:EDGE_ONE_WORKER_SECRET \
+  --node-secret-ref env:EDGE_ONE_NODE_SECRET
+veilweave-tools domain --account <label-or-id>
+veilweave-tools config network --mode socks5 --host 127.0.0.1 --port 10808
+veilweave-tools proxy test
+```
+
+详见 [`../docs/declarative-config.md`](../docs/declarative-config.md) 与
+[`../docs/network.md`](../docs/network.md)。Token、Worker 密钥与代理密码不会
+写进声明式拓扑或普通配置 TOML。
+
 > **要图形界面？** 那是独立的桌面应用 [`app/`](../app/)（Tauri 2，
 > 概览/账号/部署/管理/设置 五个页面，支持用量面板、扫描找回、自动更新）。
 > 从 [Releases](https://github.com/jacek4yang/veilweave/releases) 下载对应
@@ -31,8 +54,9 @@ veilweave-tools deploy
    relay 分散在其他账号）。
 2. **规划拓扑**：选 sub 所在的账号、relay 的数量和各自所在账号——**每个
    relay 自动分配独立密钥**。
-3. **确认部署**：自动创建 KV 命名空间、注入随机 nonce（每次部署产物哈希
-   唯一）、通过 Cloudflare API 上传 worker，最后打印**订阅地址**。
+3. **确认部署**：自动创建或精确复用 KV 命名空间，校验确定性 Worker
+   bundle，通过 Cloudflare Versions/Deployments API 事务式发布，最后打印
+   **订阅地址**。
 
 可选参数 `--bundle-dir <dir>` 指定预编译 worker 目录（默认用 exe 旁边的
 `bundle/`，即 release 压缩包内的布局）。
@@ -81,7 +105,7 @@ veilweave-tools gen-secret --encryption
 
 把：
 - **relay 侧**粘到 [`relay/wrangler.toml`](../relay/wrangler.toml) 的
-  `[vars].SECRET_KEY`（生产用 `wrangler secret put SECRET_KEY`）。
+  `SECRET_KEY`（使用 `wrangler secret put SECRET_KEY`，不写入 TOML）。
 - **sub 侧**粘到 [`sub/wrangler.toml`](../sub/wrangler.toml) 的
   `[vars].VEILWEAVE_NODES`，格式 `<relay-domain>|<secret>`。
 
@@ -130,12 +154,12 @@ veilweave-tools bundle
 
 每次运行都会：
 
-- 生成全新密钥（默认 raw 明文密钥；`--encryption` 换成实验性 blob 对）；
 - 随机化 worker 名称和 **KV binding 名**（如 `kv_x7f2a9`，并在 sub 的
   `wrangler.toml` 里配好对应的 `KV_BINDING` 变量）；
-- 随机化订阅令牌；
-- 给每个 `index.js` 注入一次性随机 nonce——**你的产物哈希与任何其他人都
-  不相同**，不会因批量指纹被标记。
+- 从同一份 manifest 验证过的 canonical runtime 复制模块，不包含
+  `package.json` 或任何构建元数据；
+- 生成不含密钥的 `wrangler.toml`。密钥和订阅令牌需按终端提示用
+  `wrangler secret put` 安全注入；不会修改已签名 runtime 的内容哈希。
 
 可选参数：`--out <dir>`（默认 `dist`）、`--relay-domain <域名>`、
 `--bundle-dir <dir>`。生成后按终端提示 `wrangler deploy` 即可（这是不用

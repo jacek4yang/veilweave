@@ -36,14 +36,8 @@ enabled = true
 # │  ⚠️  NEVER commit a real secret to this file.                             │
 # │  For production, run:                                                    │
 # │      wrangler secret put SECRET_KEY                                      │
-# │  and remove the `[vars].SECRET_KEY` line below entirely.                 │
+# │  The value is intentionally absent from this committed file.             │
 # └─────────────────────────────────────────────────────────────────────────┘
-[vars]
-# Default: a plain random secret string (plaintext VLESS — recommended).
-# Experimental: the relay blob from
-#   cargo run -p veilweave-tools -- gen-secret --encryption
-# Format: base64url, starts with "Vlcx..." (kind=0 relay blob).
-SECRET_KEY = "REPLACE_ME_WITH_A_PLAIN_RANDOM_SECRET"
 
 # ─── Durable Object: per-connection VLESS session ───────────────────────────
 # Every WS connection (plaintext or encrypted) is handled by its own

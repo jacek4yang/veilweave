@@ -16,12 +16,18 @@ fn main() -> anyhow::Result<()> {
 
     println!("cargo:rerun-if-changed=bundle");
     for unit in ["relay", "sub"] {
-        for file in ["index.js", "index_bg.wasm", "worker/shim.mjs"] {
-            let p = Path::new("bundle").join(unit).join("build").join(file);
+        for file in [
+            "index.js",
+            "index_bg.wasm",
+            "worker/shim.mjs",
+            "worker-manifest.json",
+        ] {
+            let p = Path::new("bundle").join(unit).join(file);
             if !p.is_file() {
                 anyhow::bail!(
-                    "embedded bundle missing {} — copy prebuilt workers first:\n  \
-                     cp -r ../{unit}/build app/src-tauri/bundle/{unit}/build\n  \
+                    "embedded bundle missing {} — prepare the canonical runtime bundle first:\n  \
+                     cargo run --manifest-path ../../tools/Cargo.toml -- worker-bundle prepare \
+                     --role {unit} --source ../../{unit}/build --out bundle/{unit}\n  \
                      (see bundle/README.md)",
                     p.display()
                 );

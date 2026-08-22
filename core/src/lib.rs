@@ -7,8 +7,12 @@
 //! - [`recover`]: rebuild config records from what exists on an account
 //! - [`util`]: secret generation, VW1 blob codec, randomizers, nonce injection
 
+pub mod bundle;
 pub mod cfapi;
 pub mod config;
+pub mod credentials;
 pub mod deploy;
+pub mod network;
 pub mod recover;
+pub mod spec;
 pub mod util;

@@ -29,3 +29,9 @@ jobs:
       - name: audit (tools)
         working-directory: tools
         run: cargo audit
+      - name: audit (core)
+        working-directory: core
+        run: cargo audit
+      - name: audit (desktop)
+        working-directory: app/src-tauri
+        run: cargo audit

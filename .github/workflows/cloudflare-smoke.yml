@@ -1,0 +1,129 @@
+name: Protected Cloudflare smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_prefix:
+        description: "Dedicated test prefix (must start with vw-smoke-)"
+        required: true
+        default: "vw-smoke-v2"
+      custom_hostname:
+        description: "Optional exact hostname in the protected test zone"
+        required: false
+      confirm_cleanup:
+        description: "Type DELETE-TEST-RESOURCES"
+        required: true
+
+concurrency:
+  group: veilweave-cloudflare-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: inputs.confirm_cleanup == 'DELETE-TEST-RESOURCES' && startsWith(inputs.resource_prefix, 'vw-smoke-')
+    runs-on: ubuntu-latest
+    environment: cloudflare-smoke
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CF_WORKERS_SUBDOMAIN: ${{ secrets.CLOUDFLARE_WORKERS_SUBDOMAIN }}
+      CF_TEST_ZONE_ID: ${{ secrets.CLOUDFLARE_TEST_ZONE_ID }}
+      CF_TEST_ZONE_NAME: ${{ secrets.CLOUDFLARE_TEST_ZONE_NAME }}
+      VW_PREFIX: ${{ inputs.resource_prefix }}
+      VW_CUSTOM_HOSTNAME: ${{ inputs.custom_hostname }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus-x11 gnome-keyring libdbus-1-dev pkg-config jq
+          cargo install --locked worker-build --version 0.8.5
+      - name: Build canonical test artifacts
+        run: |
+          (cd relay && worker-build --release)
+          (cd sub && worker-build --release)
+          cargo run --locked --manifest-path tools/Cargo.toml -- worker-bundle prepare --role relay --source relay/build --out smoke-bundle/relay
+          cargo run --locked --manifest-path tools/Cargo.toml -- worker-bundle prepare --role sub --source sub/build --out smoke-bundle/sub
+          cargo build --locked --release --manifest-path tools/Cargo.toml
+      - name: Deploy, update, rollback, and remove the dedicated topology
+        shell: bash
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/veilweave-config
+        run: |
+          dbus-run-session -- bash -euo pipefail <<'SCRIPT'
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+          mkdir -p "$XDG_CONFIG_HOME/veilweave"
+          cat > "$XDG_CONFIG_HOME/veilweave/config.toml" <<EOF
+          schema_version = 2
+          [[accounts]]
+          name = "smoke"
+          account_id = "$CF_ACCOUNT_ID"
+          credential_ref = "env:CLOUDFLARE_API_TOKEN"
+          workers_dev_subdomain = "$CF_WORKERS_SUBDOMAIN"
+          [network]
+          mode = "direct"
+          request_timeout_secs = 45
+          EOF
+
+          cleanup() {
+            set +e
+            domains=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains")
+            for id in $(jq -r --arg p "$VW_PREFIX" '.result[] | select(.service | startswith($p)) | .id' <<<"$domains"); do
+              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains/$id" >/dev/null
+            done
+            for script in "$VW_PREFIX-relay" "$VW_PREFIX-sub"; do
+              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$script" >/dev/null
+            done
+            namespaces=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces?per_page=100")
+            for id in $(jq -r --arg title "$VW_PREFIX-sub-kv" '.result[] | select(.title == $title) | .id' <<<"$namespaces"); do
+              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$id" >/dev/null
+            done
+          }
+          trap cleanup EXIT
+
+          cat > smoke.toml <<EOF
+          version = 2
+          [sub]
+          account = "smoke"
+          worker = "$VW_PREFIX-sub"
+          kv_title = "$VW_PREFIX-sub-kv"
+          kv_binding = "VEILWEAVE_KV"
+          [sub.settings]
+          max_nodes = 100
+          fingerprint = "chrome"
+          disable_builtin_proxyip = false
+          proxyip_list = []
+          [[relay]]
+          account = "smoke"
+          worker = "$VW_PREFIX-relay"
+          EOF
+          if [ -n "$VW_CUSTOM_HOSTNAME" ]; then
+            test -n "$CF_TEST_ZONE_ID"
+            test -n "$CF_TEST_ZONE_NAME"
+            cat >> smoke.toml <<EOF
+          [relay.endpoint]
+          mode = "both"
+          primary = "custom-domain"
+          hostname = "$VW_CUSTOM_HOSTNAME"
+          zone_id = "$CF_TEST_ZONE_ID"
+          zone_name = "$CF_TEST_ZONE_NAME"
+          EOF
+          fi
+
+          tools/target/release/veilweave-tools plan --config smoke.toml --bundle-dir smoke-bundle
+          tools/target/release/veilweave-tools apply --config smoke.toml --bundle-dir smoke-bundle --yes
+          tools/target/release/veilweave-tools status --json > smoke-status.json
+          for id in $(jq -r '.[].id' smoke-status.json); do
+            tools/target/release/veilweave-tools update --deployment "$id" --bundle-dir smoke-bundle
+            tools/target/release/veilweave-tools rollback --deployment "$id"
+          done
+          cleanup
+          trap - EXIT
+
+          remaining=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains")
+          test "$(jq -r --arg p "$VW_PREFIX" '[.result[] | select(.service | startswith($p))] | length' <<<"$remaining")" = 0
+          SCRIPT
