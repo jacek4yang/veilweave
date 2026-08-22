@@ -66,10 +66,8 @@ relay/
 cargo run --manifest-path tools/Cargo.toml -- gen-secret
 #    实验性加密：gen-secret --encryption（输出 relay blob + sub blob 一对）
 
-# 2. 把密钥填到 wrangler.toml 的 [vars].SECRET_KEY
-#    或更推荐：用 secret 而非 vars
-#    wrangler secret put SECRET_KEY
-#    （然后把 wrangler.toml 里的 [vars].SECRET_KEY 整行删掉）
+# 2. 使用 `wrangler secret put SECRET_KEY` 安全写入密钥
+#    已提交的 wrangler.toml 不包含任何 SECRET_KEY 值
 
 # 3. 部署
 wrangler deploy
@@ -90,7 +88,7 @@ wrangler deploy
 | `compatibility_flags = ["nodejs_compat"]` | 启用 Node.js 兼容 API |
 | `[build].command`                   | 部署时跑 `worker-build --release`（不带日志；抓现场加 `--features perf-log`） |
 | `[observability].enabled`           | 启用 Workers Logs（免费版采样） |
-| `[vars].SECRET_KEY`                 | **生产必删**，改用 `wrangler secret put SECRET_KEY` |
+| Secret binding `SECRET_KEY`         | 使用 `wrangler secret put SECRET_KEY`；TOML 中无值 |
 | `[[durable_objects.bindings]]`      | 把 `VeilweaveSession` 类绑到 `VEILWEAVE_SESSION` 名 |
 | `[[migrations]]`                    | `new_sqlite_classes = ["VeilweaveSession"]` —— free plan 强制要求 |
 

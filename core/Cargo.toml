@@ -1,6 +1,6 @@
 [package]
 name = "veilweave-core"
-version = "1.1.1"
+version = "2.0.0"
 edition = "2021"
 
 # Shared deploy core: Cloudflare API client, persistent config, deploy
@@ -16,7 +16,24 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
     "multipart",
+    "socks",
+    "system-proxy",
 ] }
 rand = "0.8"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
+tokio = { version = "1", features = ["net", "time", "macros", "rt", "io-util", "sync"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+idna = "1"
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio-rustls = "0.26"

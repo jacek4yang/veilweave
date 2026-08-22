@@ -64,9 +64,9 @@ sub/
 cargo run --manifest-path tools/Cargo.toml -- gen-secret
 #    实验性加密：gen-secret --encryption（输出 relay blob + sub blob 一对）
 
-# 2. 把同一密钥填到 wrangler.toml 的 [vars].VEILWEAVE_NODES
+# 2. 用 `wrangler secret put VEILWEAVE_NODES` 输入同一密钥
 #    格式：domain|<secret>，多个节点用逗号分隔
-#    VEILWEAVE_NODES = "veilweave.example.com|<secret>"
+#    输入值：veilweave.example.com|<secret>
 
 # 3. 建 KV namespace
 cd sub
@@ -74,8 +74,8 @@ wrangler kv:namespace create VEILWEAVE_KV
 # 把输出 id 填到 wrangler.toml 的 [[kv_namespaces]].id
 # （用了自定义 binding 名的话，记得同时设 [vars].KV_BINDING，见下文）
 
-# 4. 设访问令牌（推荐用 secret）
-#    wrangler secret put SUBSCRIPTION_TOKEN
+# 4. 设访问令牌
+wrangler secret put SUBSCRIPTION_TOKEN
 
 # 5. 部署
 wrangler deploy
@@ -159,13 +159,8 @@ KV 不是必须的（没配 KV 就退化为无缓存直出），配了的话 bin
 
 `VEILWEAVE_NODES` 支持任意多个 relay 节点，**每个节点用各自配套的密钥**：
 
-```toml
-VEILWEAVE_NODES = """
-a.example.com|<secret for node a>,
-b.example.com|<secret for node b>,
-c.example.com|<secret for node c>
-"""
-```
+使用 `wrangler secret put VEILWEAVE_NODES` 输入一个逗号分隔值：
+`a.example.com|<secret a>,b.example.com|<secret b>,c.example.com|<secret c>`。
 
 > 不同节点用不同密钥时，每个节点 UUID 是独立签的——节点 a 的链接
 > 不能被节点 b 验签通过（这是**特性**，不是 bug，避免一个节点密钥泄露

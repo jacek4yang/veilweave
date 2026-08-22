@@ -1,35 +1,818 @@
-//! Async client for the Cloudflare API v4 — everything the direct-deploy path
-//! needs: token verification, account/subdomain lookup, KV namespaces, worker
-//! script uploads (multipart), workers.dev enablement, and deletion.
+//! Typed Cloudflare API v4 client used by every control-plane operation.
 //!
-//! Verified against the official docs and wrangler's own upload code:
-//! - script upload: PUT /accounts/{id}/workers/scripts/{name}, multipart with a
-//!   `metadata` part (JSON) + one part per module file
-//! - Durable Object first deploy: `migrations: {new_tag, steps: [{new_sqlite_classes}]}`
-//! - workers.dev: POST /accounts/{id}/workers/scripts/{name}/subdomain {enabled:true}
+//! Worker code is uploaded as an inert version first. A separate deployment
+//! request promotes that version, which makes health verification and rollback
+//! possible without destroying the last known-good version.
 
+use crate::bundle::WorkerBundle;
+use crate::credentials::SecretValue;
+use crate::network::NetworkManager;
 use anyhow::{anyhow, bail, Context, Result};
+use rand::Rng;
+use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::time::Duration;
 
-const API_BASE: &str = "https://api.cloudflare.com/client/v4";
-
-/// Matches relay/wrangler.toml and sub/wrangler.toml.
+pub const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 pub const COMPATIBILITY_DATE: &str = "2026-05-26";
+pub const OWNERSHIP_BINDING: &str = "VEILWEAVE_MANAGED";
+pub const OWNERSHIP_RELAY: &str = "veilweave:v2:relay";
+pub const OWNERSHIP_SUB: &str = "veilweave:v2:sub";
+pub const FREE_TIER_DAILY_REQUESTS: u64 = 100_000;
 
-/// One file of a worker upload: part name is the path relative to the build
-/// dir (forward slashes), so module imports resolve exactly as on disk.
-pub struct UploadFile {
-    pub name: String,
-    pub contents: Vec<u8>,
-    pub content_type: &'static str,
+#[derive(Clone)]
+pub struct CfClient {
+    network: NetworkManager,
+    token: SecretValue,
+    api_base: String,
+    max_safe_retries: u8,
 }
 
-#[derive(Debug, Clone)]
-pub struct AccountSummary {
-    pub id: String,
-    pub name: String,
+impl fmt::Debug for CfClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CfClient")
+            .field("network", &self.network)
+            .field("token", &"[REDACTED]")
+            .field("api_base", &self.api_base)
+            .finish()
+    }
+}
+
+impl CfClient {
+    /// Direct-mode convenience for compatibility and tests. Application and
+    /// CLI entry points use [`CfClient::with_network`] so policy is shared.
+    pub fn new(token: &str) -> Result<Self> {
+        Self::with_network(token, NetworkManager::direct()?)
+    }
+
+    pub fn with_network(token: &str, network: NetworkManager) -> Result<Self> {
+        if token.trim().is_empty() {
+            bail!("Cloudflare API token is empty");
+        }
+        Ok(Self {
+            network,
+            token: SecretValue::new(token),
+            api_base: DEFAULT_API_BASE.into(),
+            max_safe_retries: 3,
+        })
+    }
+
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Result<Self> {
+        let api_base = api_base.into().trim_end_matches('/').to_string();
+        reqwest::Url::parse(&api_base).context("invalid Cloudflare API base URL")?;
+        self.api_base = api_base;
+        Ok(self)
+    }
+
+    pub fn network(&self) -> &NetworkManager {
+        &self.network
+    }
+
+    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+        self.network
+            .snapshot()
+            .client()
+            .request(method, format!("{}{path}", self.api_base))
+            .bearer_auth(self.token.expose())
+    }
+
+    fn get(&self, path: &str) -> RequestBuilder {
+        self.request(Method::GET, path)
+    }
+
+    async fn send<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+        safe_to_retry: bool,
+    ) -> Result<T> {
+        let attempts = if safe_to_retry {
+            self.max_safe_retries.saturating_add(1)
+        } else {
+            1
+        };
+        let mut one_shot = Some(request);
+        for attempt in 0..attempts {
+            let current = if attempts == 1 {
+                one_shot.take().expect("one-shot request is available")
+            } else {
+                one_shot
+                    .as_ref()
+                    .and_then(RequestBuilder::try_clone)
+                    .context("Cloudflare request body cannot be replayed")?
+            };
+            match self.send_once(current, operation).await {
+                Ok(result) => return Ok(result),
+                Err(error) if safe_to_retry && attempt + 1 < attempts && error.retryable() => {
+                    let delay = error.retry_after.unwrap_or_else(|| {
+                        let base = 200u64.saturating_mul(1u64 << attempt.min(5));
+                        Duration::from_millis(base + rand::thread_rng().gen_range(0..=100))
+                    });
+                    tokio::time::sleep(delay.min(Duration::from_secs(10))).await;
+                }
+                Err(error) => return Err(anyhow!(error)),
+            }
+        }
+        unreachable!("request attempt loop always returns")
+    }
+
+    async fn send_once<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+    ) -> std::result::Result<T, CfApiFailure> {
+        let response = request.send().await.map_err(|source| {
+            let category = if source.is_timeout() {
+                "timeout"
+            } else if source.is_connect() {
+                "connection"
+            } else {
+                "transport"
+            };
+            CfApiFailure {
+                operation: operation.into(),
+                status: None,
+                codes: vec![],
+                messages: vec![format!("{category} failure: {source}")],
+                cf_ray: None,
+                retry_after: None,
+            }
+        })?;
+        let status = response.status();
+        let cf_ray = response
+            .headers()
+            .get("cf-ray")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let retry_after = parse_retry_after(response.headers());
+        let bytes = response.bytes().await.map_err(|source| CfApiFailure {
+            operation: operation.into(),
+            status: Some(status),
+            codes: vec![],
+            messages: vec![format!("failed to read response: {source}")],
+            cf_ray: cf_ray.clone(),
+            retry_after,
+        })?;
+        let envelope: Envelope<T> =
+            serde_json::from_slice(&bytes).map_err(|source| CfApiFailure {
+                operation: operation.into(),
+                status: Some(status),
+                codes: vec![],
+                messages: vec![format!(
+                    "malformed API response ({source}); body preview: {}",
+                    safe_body_preview(&bytes)
+                )],
+                cf_ray: cf_ray.clone(),
+                retry_after,
+            })?;
+        if !status.is_success() || !envelope.success {
+            return Err(CfApiFailure {
+                operation: operation.into(),
+                status: Some(status),
+                codes: envelope.errors.iter().map(|error| error.code).collect(),
+                messages: envelope
+                    .errors
+                    .iter()
+                    .map(|error| error.message.clone())
+                    .collect(),
+                cf_ray,
+                retry_after,
+            });
+        }
+        envelope.result.ok_or_else(|| CfApiFailure {
+            operation: operation.into(),
+            status: Some(status),
+            codes: vec![],
+            messages: vec!["Cloudflare returned success without a result".into()],
+            cf_ray,
+            retry_after,
+        })
+    }
+
+    async fn send_ok(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+        safe_to_retry: bool,
+    ) -> Result<()> {
+        let attempts = if safe_to_retry {
+            self.max_safe_retries.saturating_add(1)
+        } else {
+            1
+        };
+        let mut one_shot = Some(request);
+        for attempt in 0..attempts {
+            let current = if attempts == 1 {
+                one_shot.take().expect("one-shot request is available")
+            } else {
+                one_shot
+                    .as_ref()
+                    .and_then(RequestBuilder::try_clone)
+                    .context("Cloudflare request body cannot be replayed")?
+            };
+            match self.send_ok_once(current, operation).await {
+                Ok(()) => return Ok(()),
+                Err(error) if safe_to_retry && attempt + 1 < attempts && error.retryable() => {
+                    let delay = error.retry_after.unwrap_or_else(|| {
+                        Duration::from_millis(200u64.saturating_mul(1u64 << attempt.min(5)))
+                    });
+                    tokio::time::sleep(delay.min(Duration::from_secs(10))).await;
+                }
+                Err(error) => return Err(anyhow!(error)),
+            }
+        }
+        unreachable!("request attempt loop always returns")
+    }
+
+    async fn send_ok_once(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+    ) -> std::result::Result<(), CfApiFailure> {
+        let response = request.send().await.map_err(|source| CfApiFailure {
+            operation: operation.into(),
+            status: None,
+            codes: vec![],
+            messages: vec![source.to_string()],
+            cf_ray: None,
+            retry_after: None,
+        })?;
+        let status = response.status();
+        let cf_ray = response
+            .headers()
+            .get("cf-ray")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let retry_after = parse_retry_after(response.headers());
+        let bytes = response.bytes().await.map_err(|source| CfApiFailure {
+            operation: operation.into(),
+            status: Some(status),
+            codes: vec![],
+            messages: vec![source.to_string()],
+            cf_ray: cf_ray.clone(),
+            retry_after,
+        })?;
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_slice(&bytes).map_err(|source| CfApiFailure {
+                operation: operation.into(),
+                status: Some(status),
+                codes: vec![],
+                messages: vec![format!(
+                    "malformed API response ({source}); body preview: {}",
+                    safe_body_preview(&bytes)
+                )],
+                cf_ray: cf_ray.clone(),
+                retry_after,
+            })?;
+        if status.is_success() && envelope.success {
+            return Ok(());
+        }
+        Err(CfApiFailure {
+            operation: operation.into(),
+            status: Some(status),
+            codes: envelope.errors.iter().map(|error| error.code).collect(),
+            messages: envelope
+                .errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect(),
+            cf_ray,
+            retry_after,
+        })
+    }
+
+    pub async fn verify_token(&self) -> Result<()> {
+        let status: TokenStatus = self
+            .send(self.get("/user/tokens/verify"), "verify API token", true)
+            .await?;
+        if status.status != "active" {
+            bail!(
+                "verify API token: expected active status, got {:?}",
+                status.status
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>> {
+        self.send(self.get("/accounts?per_page=50"), "list accounts", true)
+            .await
+    }
+
+    pub async fn get_workers_subdomain(&self, account_id: &str) -> Result<String> {
+        let value: WorkersSubdomain = self
+            .send(
+                self.get(&format!("/accounts/{account_id}/workers/subdomain")),
+                "get workers.dev subdomain",
+                true,
+            )
+            .await?;
+        Ok(value.subdomain)
+    }
+
+    pub async fn get_workers_dev_state(
+        &self,
+        account_id: &str,
+        script: &str,
+    ) -> Result<WorkersDevState> {
+        self.send(
+            self.get(&format!(
+                "/accounts/{account_id}/workers/scripts/{script}/subdomain"
+            )),
+            "get workers.dev state",
+            true,
+        )
+        .await
+    }
+
+    pub async fn set_workers_dev(
+        &self,
+        account_id: &str,
+        script: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let request = self
+            .request(
+                Method::POST,
+                &format!("/accounts/{account_id}/workers/scripts/{script}/subdomain"),
+            )
+            .json(&serde_json::json!({ "enabled": enabled }));
+        self.send_ok(request, "set workers.dev state", false).await
+    }
+
+    pub async fn enable_workers_dev(&self, account_id: &str, script: &str) -> Result<()> {
+        self.set_workers_dev(account_id, script, true).await
+    }
+
+    pub async fn create_kv_namespace(&self, account_id: &str, title: &str) -> Result<String> {
+        let namespace: KvNamespace = self
+            .send(
+                self.request(
+                    Method::POST,
+                    &format!("/accounts/{account_id}/storage/kv/namespaces"),
+                )
+                .json(&serde_json::json!({ "title": title })),
+                "create KV namespace",
+                false,
+            )
+            .await?;
+        Ok(namespace.id)
+    }
+
+    pub async fn find_kv_namespace(
+        &self,
+        account_id: &str,
+        title: &str,
+    ) -> Result<Option<KvNamespace>> {
+        Ok(self
+            .list_kv_namespaces(account_id)
+            .await?
+            .into_iter()
+            .find(|namespace| namespace.title == title))
+    }
+
+    pub async fn list_kv_namespaces(&self, account_id: &str) -> Result<Vec<KvNamespace>> {
+        let mut namespaces = Vec::new();
+        for page in 1u32.. {
+            let batch: Vec<KvNamespace> = self
+                .send(
+                    self.get(&format!(
+                        "/accounts/{account_id}/storage/kv/namespaces?per_page=100&page={page}"
+                    )),
+                    "list KV namespaces",
+                    true,
+                )
+                .await?;
+            let done = batch.len() < 100;
+            namespaces.extend(batch);
+            if done {
+                return Ok(namespaces);
+            }
+        }
+        unreachable!()
+    }
+
+    pub async fn delete_kv_namespace(&self, account_id: &str, namespace_id: &str) -> Result<()> {
+        self.send_ok(
+            self.request(
+                Method::DELETE,
+                &format!("/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"),
+            ),
+            "delete KV namespace",
+            true,
+        )
+        .await
+    }
+
+    /// Upload an inert Worker version. This operation is intentionally not
+    /// retried because a timed-out creation can be reconciled by listing
+    /// versions and matching the deterministic bundle annotation.
+    pub async fn upload_version(
+        &self,
+        account_id: &str,
+        script: &str,
+        bundle: &WorkerBundle,
+        mut metadata: serde_json::Value,
+    ) -> Result<WorkerVersion> {
+        let existing_tag = metadata["annotations"]["workers/tag"]
+            .as_str()
+            .filter(|value| *value != "veilweave-v2")
+            .map(str::to_string);
+        let operation_tag = existing_tag
+            .unwrap_or_else(|| format!("veilweave-v2:{}", uuid::Uuid::new_v4().simple()));
+        metadata["annotations"]["workers/tag"] = serde_json::Value::String(operation_tag.clone());
+        let mut form = reqwest::multipart::Form::new().part(
+            "metadata",
+            reqwest::multipart::Part::text(metadata.to_string()).mime_str("application/json")?,
+        );
+        for module in bundle.modules() {
+            let part = reqwest::multipart::Part::bytes(module.contents.clone())
+                .file_name(module.path.clone())
+                .mime_str(module.kind.content_type())
+                .with_context(|| format!("model MIME type for {}", module.path))?;
+            form = form.part(module.path.clone(), part);
+        }
+        let result = self
+            .send(
+            self.request(
+                Method::POST,
+                &format!(
+                    "/accounts/{account_id}/workers/scripts/{script}/versions?bindings_inherit=strict"
+                ),
+            )
+            .multipart(form),
+            &format!("upload Worker version for {script:?}"),
+            false,
+        )
+        .await;
+        match result {
+            Ok(version) => Ok(version),
+            Err(upload_error) if !creation_outcome_ambiguous(&upload_error) => Err(upload_error),
+            Err(upload_error) => match self.list_versions(account_id, script).await {
+                Ok(versions) => versions
+                    .into_iter()
+                    .find(|version| {
+                        version.annotations.get("workers/tag") == Some(&operation_tag)
+                    })
+                    .ok_or_else(|| {
+                        upload_error.context(format!(
+                            "version creation outcome was ambiguous and no version carried operation tag {operation_tag:?}"
+                        ))
+                    }),
+                Err(reconcile_error) => Err(upload_error.context(format!(
+                    "version creation outcome was ambiguous and reconciliation failed: {reconcile_error:#}"
+                ))),
+            },
+        }
+    }
+
+    pub async fn create_deployment(
+        &self,
+        account_id: &str,
+        script: &str,
+        version_id: &str,
+        message: &str,
+    ) -> Result<WorkerDeployment> {
+        let operation_message = if message.contains("[vw-op:") {
+            message.to_string()
+        } else {
+            format!("{message} [vw-op:{}]", uuid::Uuid::new_v4().simple())
+        };
+        let body = serde_json::json!({
+            "strategy": "percentage",
+            "versions": [{ "version_id": version_id, "percentage": 100 }],
+            "annotations": {
+                "workers/message": operation_message,
+                "workers/triggered_by": "veilweave"
+            }
+        });
+        let result = self
+            .send(
+                self.request(
+                    Method::POST,
+                    &format!("/accounts/{account_id}/workers/scripts/{script}/deployments"),
+                )
+                .json(&body),
+                &format!("deploy Worker version {version_id}"),
+                false,
+            )
+            .await;
+        match result {
+            Ok(deployment) => Ok(deployment),
+            Err(deploy_error) if !creation_outcome_ambiguous(&deploy_error) => Err(deploy_error),
+            Err(deploy_error) => match self.list_deployments(account_id, script).await {
+                Ok(deployments) => deployments
+                    .into_iter()
+                    .find(|deployment| {
+                        deployment.annotations.get("workers/message")
+                            == Some(&operation_message)
+                    })
+                    .ok_or_else(|| {
+                        deploy_error.context(
+                            "deployment creation outcome was ambiguous and reconciliation found no matching operation",
+                        )
+                    }),
+                Err(reconcile_error) => Err(deploy_error.context(format!(
+                    "deployment creation outcome was ambiguous and reconciliation failed: {reconcile_error:#}"
+                ))),
+            },
+        }
+    }
+
+    /// Compatibility entry point now implemented as version creation plus a
+    /// separate 100% deployment; no multipart request directly mutates live.
+    pub async fn upload_worker(
+        &self,
+        account_id: &str,
+        script: &str,
+        bundle: WorkerBundle,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        let version = self
+            .upload_version(account_id, script, &bundle, metadata)
+            .await?;
+        self.create_deployment(
+            account_id,
+            script,
+            &version.id,
+            "Veilweave compatibility deployment",
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_versions(
+        &self,
+        account_id: &str,
+        script: &str,
+    ) -> Result<Vec<WorkerVersion>> {
+        self.send(
+            self.get(&format!(
+                "/accounts/{account_id}/workers/scripts/{script}/versions"
+            )),
+            "list Worker versions",
+            true,
+        )
+        .await
+    }
+
+    pub async fn list_deployments(
+        &self,
+        account_id: &str,
+        script: &str,
+    ) -> Result<Vec<WorkerDeployment>> {
+        self.send(
+            self.get(&format!(
+                "/accounts/{account_id}/workers/scripts/{script}/deployments"
+            )),
+            "list Worker deployments",
+            true,
+        )
+        .await
+    }
+
+    pub async fn delete_worker(&self, account_id: &str, script: &str) -> Result<()> {
+        self.send_ok(
+            self.request(
+                Method::DELETE,
+                &format!("/accounts/{account_id}/workers/scripts/{script}"),
+            ),
+            &format!("delete Worker {script:?}"),
+            true,
+        )
+        .await
+    }
+
+    pub async fn list_workers(&self, account_id: &str) -> Result<Vec<WorkerScript>> {
+        self.send(
+            self.get(&format!("/accounts/{account_id}/workers/scripts")),
+            "list Workers",
+            true,
+        )
+        .await
+    }
+
+    pub async fn get_script_settings(
+        &self,
+        account_id: &str,
+        script: &str,
+    ) -> Result<Vec<BindingInfo>> {
+        let settings: ScriptSettings = self
+            .send(
+                self.get(&format!(
+                    "/accounts/{account_id}/workers/scripts/{script}/settings"
+                )),
+                "get Worker settings",
+                true,
+            )
+            .await?;
+        Ok(settings.bindings)
+    }
+
+    pub async fn worker_ownership(
+        &self,
+        account_id: &str,
+        script: &str,
+    ) -> Result<WorkerOwnership> {
+        let bindings = self.get_script_settings(account_id, script).await?;
+        let marker = bindings
+            .iter()
+            .find(|binding| binding.name == OWNERSHIP_BINDING);
+        Ok(match marker.and_then(|binding| binding.text.as_deref()) {
+            Some(OWNERSHIP_RELAY) => WorkerOwnership::VeilweaveRelay,
+            Some(OWNERSHIP_SUB) => WorkerOwnership::VeilweaveSub,
+            Some(_) => WorkerOwnership::UnknownVeilweave,
+            None => WorkerOwnership::Unrelated,
+        })
+    }
+
+    pub async fn list_domains(&self, account_id: &str) -> Result<Vec<WorkerDomain>> {
+        self.send(
+            self.get(&format!("/accounts/{account_id}/workers/domains")),
+            "list Worker Custom Domains",
+            true,
+        )
+        .await
+    }
+
+    pub async fn attach_domain(
+        &self,
+        account_id: &str,
+        request: &AttachDomainRequest,
+    ) -> Result<WorkerDomain> {
+        self.send(
+            self.request(
+                Method::PUT,
+                &format!("/accounts/{account_id}/workers/domains"),
+            )
+            .json(request),
+            &format!("attach Worker Custom Domain {:?}", request.hostname),
+            false,
+        )
+        .await
+    }
+
+    pub async fn detach_domain(&self, account_id: &str, domain_id: &str) -> Result<()> {
+        self.send_ok(
+            self.request(
+                Method::DELETE,
+                &format!("/accounts/{account_id}/workers/domains/{domain_id}"),
+            ),
+            "detach Worker Custom Domain",
+            true,
+        )
+        .await
+    }
+
+    pub async fn list_zones(&self, account_id: &str) -> Result<Vec<Zone>> {
+        self.send(
+            self.get(&format!(
+                "/zones?account.id={account_id}&status=active&per_page=50"
+            )),
+            "list active zones",
+            true,
+        )
+        .await
+    }
+
+    pub async fn list_dns_records(&self, zone_id: &str, hostname: &str) -> Result<Vec<DnsRecord>> {
+        self.send(
+            self.get(&format!(
+                "/zones/{zone_id}/dns_records?name={hostname}&per_page=100"
+            )),
+            "check DNS conflicts",
+            true,
+        )
+        .await
+    }
+
+    pub async fn account_usage(&self, account_id: &str) -> Result<Vec<UsageRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let from = now - now % 86_400;
+        let body = serde_json::json!({
+            "query": "query($account: String!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $account}) { workersInvocationsAdaptive(limit: 100, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { scriptName } sum { requests errors } quantiles { cpuTimeP50 } } } } }",
+            "variables": {
+                "account": account_id,
+                "from": crate::config::format_unix_utc(from),
+                "to": crate::config::format_unix_utc(now),
+            },
+        });
+        let response = self
+            .request(Method::POST, "/graphql")
+            .json(&body)
+            .send()
+            .await
+            .context("account usage request failed")?;
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .with_context(|| format!("account usage returned malformed HTTP {status}"))?;
+        if let Some(errors) = value["errors"]
+            .as_array()
+            .filter(|errors| !errors.is_empty())
+        {
+            let messages = errors
+                .iter()
+                .filter_map(|error| error["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("account usage: {messages}");
+        }
+        Ok(
+            value["data"]["viewer"]["accounts"][0]["workersInvocationsAdaptive"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|group| UsageRow {
+                    script: group["dimensions"]["scriptName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    requests: group["sum"]["requests"].as_u64().unwrap_or(0),
+                    errors: group["sum"]["errors"].as_u64().unwrap_or(0),
+                    cpu_p50_us: group["quantiles"]["cpuTimeP50"].as_f64().unwrap_or(0.0),
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CfApiFailure {
+    operation: String,
+    status: Option<StatusCode>,
+    codes: Vec<i64>,
+    messages: Vec<String>,
+    cf_ray: Option<String>,
+    retry_after: Option<Duration>,
+}
+
+impl CfApiFailure {
+    fn retryable(&self) -> bool {
+        self.status.is_none()
+            || self.status == Some(StatusCode::TOO_MANY_REQUESTS)
+            || self.status.is_some_and(|status| status.is_server_error())
+    }
+}
+
+fn creation_outcome_ambiguous(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CfApiFailure>().is_some_and(|failure| {
+        failure.status.is_none()
+            || failure
+                .status
+                .is_some_and(|status| status.is_server_error())
+    })
+}
+
+impl fmt::Display for CfApiFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.operation)?;
+        if let Some(status) = self.status {
+            write!(formatter, " (HTTP {status})")?;
+        }
+        if !self.codes.is_empty() {
+            write!(formatter, ": codes {:?}", self.codes)?;
+        }
+        if !self.messages.is_empty() {
+            write!(formatter, ": {}", self.messages.join("; "))?;
+        }
+        if let Some(cf_ray) = &self.cf_ray {
+            write!(formatter, " [CF-Ray {cf_ray}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CfApiFailure {}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn safe_body_preview(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -40,393 +823,146 @@ struct Envelope<T> {
     result: Option<T>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug, Deserialize)]
 struct ApiError {
     code: i64,
     message: String,
 }
 
-pub struct CfClient {
-    http: reqwest::Client,
-    token: String,
+#[derive(Debug, Deserialize)]
+struct TokenStatus {
+    status: String,
 }
 
-impl CfClient {
-    pub fn new(token: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("veilweave-tools/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("build HTTP client")?;
-        Ok(Self {
-            http,
-            token: token.to_string(),
-        })
-    }
-
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        self.http
-            .get(format!("{API_BASE}{path}"))
-            .bearer_auth(&self.token)
-    }
-
-    /// Send a request and unwrap the Cloudflare `{success, errors, result}`
-    /// envelope into either the typed result or a readable error.
-    async fn send<T: DeserializeOwned>(
-        &self,
-        req: reqwest::RequestBuilder,
-        what: &str,
-    ) -> Result<T> {
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("{what}: request failed"))?;
-        let status = resp.status();
-        let body: Envelope<T> = resp
-            .json()
-            .await
-            .with_context(|| format!("{what}: unexpected response (HTTP {status})"))?;
-        if !body.success {
-            bail!("{what}: {}", format_api_errors(&body.errors, status));
-        }
-        body.result
-            .ok_or_else(|| anyhow!("{what}: API returned no result"))
-    }
-
-    /// Like `send` for endpoints whose `result` payload we ignore (uploads,
-    /// subdomain toggles, deletes — some of these return `result: null`).
-    async fn send_ok(&self, req: reqwest::RequestBuilder, what: &str) -> Result<()> {
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("{what}: request failed"))?;
-        let status = resp.status();
-        let body: Envelope<serde_json::Value> = resp
-            .json()
-            .await
-            .with_context(|| format!("{what}: unexpected response (HTTP {status})"))?;
-        if !body.success {
-            bail!("{what}: {}", format_api_errors(&body.errors, status));
-        }
-        Ok(())
-    }
-
-    /// GET /user/tokens/verify — fails unless the token is active.
-    pub async fn verify_token(&self) -> Result<()> {
-        #[derive(Deserialize)]
-        struct TokenStatus {
-            status: String,
-        }
-        let r: TokenStatus = self
-            .send(self.get("/user/tokens/verify"), "verify API token")
-            .await?;
-        if r.status != "active" {
-            bail!(
-                "verify API token: token status is {:?}, expected \"active\"",
-                r.status
-            );
-        }
-        Ok(())
-    }
-
-    /// GET /accounts — accounts the token can see.
-    pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>> {
-        #[derive(Deserialize)]
-        struct Raw {
-            id: String,
-            name: String,
-        }
-        let r: Vec<Raw> = self
-            .send(self.get("/accounts?per_page=50"), "list accounts")
-            .await?;
-        Ok(r.into_iter()
-            .map(|a| AccountSummary {
-                id: a.id,
-                name: a.name,
-            })
-            .collect())
-    }
-
-    /// GET /accounts/{id}/workers/subdomain — the account's workers.dev subdomain.
-    pub async fn get_workers_subdomain(&self, account_id: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Subdomain {
-            subdomain: String,
-        }
-        let r: Subdomain = self
-            .send(
-                self.get(&format!("/accounts/{account_id}/workers/subdomain")),
-                "get workers.dev subdomain",
-            )
-            .await
-            .context(
-                "no workers.dev subdomain — create one in the dashboard \
-                 (Workers & Pages → your account → workers.dev)",
-            )?;
-        Ok(r.subdomain)
-    }
-
-    /// POST /accounts/{id}/storage/kv/namespaces — returns the new namespace id.
-    pub async fn create_kv_namespace(&self, account_id: &str, title: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Ns {
-            id: String,
-        }
-        let req = self
-            .http
-            .post(format!(
-                "{API_BASE}/accounts/{account_id}/storage/kv/namespaces"
-            ))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "title": title }));
-        let r: Ns = self.send(req, "create KV namespace").await?;
-        Ok(r.id)
-    }
-
-    /// PUT /accounts/{id}/workers/scripts/{name} — multipart upload of `files`
-    /// plus the JSON `metadata` part (see `relay_metadata` / `sub_metadata`).
-    pub async fn upload_worker(
-        &self,
-        account_id: &str,
-        name: &str,
-        files: Vec<UploadFile>,
-        metadata: serde_json::Value,
-    ) -> Result<()> {
-        let mut form = reqwest::multipart::Form::new().part(
-            "metadata",
-            reqwest::multipart::Part::text(metadata.to_string())
-                .mime_str("application/json")
-                .context("metadata content type")?,
-        );
-        for f in files {
-            let part = reqwest::multipart::Part::bytes(f.contents)
-                .file_name(f.name.clone())
-                .mime_str(f.content_type)
-                .with_context(|| format!("content type for {}", f.name))?;
-            form = form.part(f.name, part);
-        }
-        let req = self
-            .http
-            .put(format!(
-                "{API_BASE}/accounts/{account_id}/workers/scripts/{name}"
-            ))
-            .bearer_auth(&self.token)
-            .multipart(form);
-        self.send_ok(req, &format!("upload worker {name:?}"))
-            .await?;
-        Ok(())
-    }
-
-    /// POST /accounts/{id}/workers/scripts/{name}/subdomain {enabled:true}.
-    pub async fn enable_workers_dev(&self, account_id: &str, name: &str) -> Result<()> {
-        let req = self
-            .http
-            .post(format!(
-                "{API_BASE}/accounts/{account_id}/workers/scripts/{name}/subdomain"
-            ))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "enabled": true }));
-        self.send_ok(req, &format!("enable workers.dev for {name:?}"))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn delete_worker(&self, account_id: &str, name: &str) -> Result<()> {
-        let req = self
-            .http
-            .delete(format!(
-                "{API_BASE}/accounts/{account_id}/workers/scripts/{name}"
-            ))
-            .bearer_auth(&self.token);
-        self.send_ok(req, &format!("delete worker {name:?}"))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn delete_kv_namespace(&self, account_id: &str, namespace_id: &str) -> Result<()> {
-        let req = self
-            .http
-            .delete(format!(
-                "{API_BASE}/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"
-            ))
-            .bearer_auth(&self.token);
-        self.send_ok(req, "delete KV namespace").await?;
-        Ok(())
-    }
-
-    /// GET /accounts/{id}/workers/scripts — every script on the account.
-    pub async fn list_workers(&self, account_id: &str) -> Result<Vec<WorkerScript>> {
-        #[derive(Deserialize)]
-        struct Raw {
-            id: String,
-            created_on: Option<String>,
-        }
-        let r: Vec<Raw> = self
-            .send(
-                self.get(&format!("/accounts/{account_id}/workers/scripts")),
-                "list workers",
-            )
-            .await?;
-        Ok(r.into_iter()
-            .map(|w| WorkerScript {
-                id: w.id,
-                created_on: w.created_on,
-            })
-            .collect())
-    }
-
-    /// GET /accounts/{id}/workers/scripts/{name}/settings — the
-    /// ScriptAndVersionSettings endpoint (wrangler's own SDK uses it; unlike
-    /// the newer `script-settings` variant it returns `bindings`). plain_text
-    /// values ARE readable here — this is the config-recovery mechanism.
-    pub async fn get_script_settings(
-        &self,
-        account_id: &str,
-        name: &str,
-    ) -> Result<Vec<BindingInfo>> {
-        let v: serde_json::Value = self
-            .send(
-                self.get(&format!(
-                    "/accounts/{account_id}/workers/scripts/{name}/settings"
-                )),
-                &format!("get settings for {name:?}"),
-            )
-            .await?;
-        let bindings = v["bindings"].as_array().cloned().unwrap_or_default();
-        Ok(bindings
-            .iter()
-            .map(|b| BindingInfo {
-                name: b["name"].as_str().unwrap_or_default().to_string(),
-                kind: b["type"].as_str().unwrap_or_default().to_string(),
-                text: b["text"].as_str().map(str::to_string),
-                namespace_id: b["namespace_id"].as_str().map(str::to_string),
-                class_name: b["class_name"].as_str().map(str::to_string),
-            })
-            .collect())
-    }
-
-    /// GET /accounts/{id}/storage/kv/namespaces — all namespaces, following
-    /// `page` until a short page comes back (per_page=100).
-    pub async fn list_kv_namespaces(&self, account_id: &str) -> Result<Vec<KvNamespace>> {
-        #[derive(Deserialize)]
-        struct Raw {
-            id: String,
-            title: String,
-        }
-        let mut out = Vec::new();
-        let mut page = 1u32;
-        loop {
-            let batch: Vec<Raw> = self
-                .send(
-                    self.get(&format!(
-                        "/accounts/{account_id}/storage/kv/namespaces?per_page=100&page={page}"
-                    )),
-                    "list KV namespaces",
-                )
-                .await?;
-            let short = batch.len() < 100;
-            out.extend(batch.into_iter().map(|n| KvNamespace {
-                id: n.id,
-                title: n.title,
-            }));
-            if short {
-                return Ok(out);
-            }
-            page += 1;
-        }
-    }
-
-    /// Today's per-script usage via the GraphQL Analytics API
-    /// (POST /client/v4/graphql, dataset `workersInvocationsAdaptive`).
-    ///
-    /// REQUIRES the `Account → Account Analytics → Read` token permission;
-    /// without it Cloudflare hides the dataset and the query fails with
-    /// `unknown field "workersInvocationsAdaptive"` — callers must treat any
-    /// error here as non-fatal (the UI shows "需要 Analytics Read 权限 /
-    /// needs Analytics Read").
-    pub async fn account_usage(&self, account_id: &str) -> Result<Vec<UsageRow>> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let day_start = now - now % 86_400;
-        let body = serde_json::json!({
-            "query": "query($account: String!, $from: Time!, $to: Time!) { viewer { accounts(filter: {accountTag: $account}) { workersInvocationsAdaptive(limit: 100, filter: {datetime_geq: $from, datetime_leq: $to}) { dimensions { scriptName } sum { requests errors } quantiles { cpuTimeP50 } } } } }",
-            "variables": {
-                "account": account_id,
-                "from": crate::config::format_unix_utc(day_start),
-                "to": crate::config::format_unix_utc(now),
-            },
-        });
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/graphql"))
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await
-            .context("account usage: request failed")?;
-        // GraphQL returns HTTP 200 even for errors — check the errors array.
-        let v: serde_json::Value = resp.json().await.context("account usage: bad response")?;
-        if let Some(errors) = v["errors"].as_array().filter(|e| !e.is_empty()) {
-            let msgs = errors
-                .iter()
-                .filter_map(|e| e["message"].as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            bail!("account usage: {msgs}");
-        }
-        let groups = v["data"]["viewer"]["accounts"][0]["workersInvocationsAdaptive"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        Ok(groups
-            .iter()
-            .map(|g| UsageRow {
-                script: g["dimensions"]["scriptName"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                requests: g["sum"]["requests"].as_u64().unwrap_or(0),
-                errors: g["sum"]["errors"].as_u64().unwrap_or(0),
-                cpu_p50_us: g["quantiles"]["cpuTimeP50"].as_f64().unwrap_or(0.0),
-            })
-            .collect())
-    }
+#[derive(Debug, Deserialize)]
+struct WorkersSubdomain {
+    subdomain: String,
 }
 
-/// A worker script as returned by the scripts list endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkersDevState {
+    pub enabled: bool,
+    #[serde(default)]
+    pub previews_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerScript {
     pub id: String,
+    #[serde(default)]
     pub created_on: Option<String>,
+    #[serde(default)]
+    pub modified_on: Option<String>,
 }
 
-/// One binding as reported by the script settings endpoint. `text` is only
-/// present for `plain_text` (secrets of type `secret_text` are never
-/// readable via the API).
-#[derive(Debug, Clone, Default)]
-pub struct BindingInfo {
-    pub name: String,
-    /// Binding type string: "plain_text", "kv_namespace",
-    /// "durable_object_namespace", "secret_text", …
-    pub kind: String,
-    pub text: Option<String>,
-    pub namespace_id: Option<String>,
-    pub class_name: Option<String>,
-}
-
-/// A KV namespace (id + title).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KvNamespace {
     pub id: String,
     pub title: String,
 }
 
-/// Free-plan daily request cap — for UI usage ratios.
-pub const FREE_TIER_DAILY_REQUESTS: u64 = 100_000;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerVersion {
+    pub id: String,
+    #[serde(default)]
+    pub number: Option<u64>,
+    #[serde(default)]
+    pub created_on: Option<String>,
+    #[serde(default)]
+    pub annotations: std::collections::BTreeMap<String, String>,
+}
 
-/// Per-script usage for the current UTC day. `cpu_p50_us` is the P50 CPU
-/// time per invocation in microseconds (GraphQL `cpuTimeP50`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerDeployment {
+    pub id: String,
+    #[serde(default)]
+    pub created_on: Option<String>,
+    #[serde(default)]
+    pub versions: Vec<DeploymentVersion>,
+    #[serde(default)]
+    pub annotations: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeploymentVersion {
+    pub version_id: String,
+    #[serde(default)]
+    pub percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BindingInfo {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub namespace_id: Option<String>,
+    #[serde(default)]
+    pub class_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptSettings {
+    #[serde(default)]
+    bindings: Vec<BindingInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOwnership {
+    VeilweaveRelay,
+    VeilweaveSub,
+    UnknownVeilweave,
+    Unrelated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Zone {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerDomain {
+    pub id: String,
+    pub hostname: String,
+    pub service: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub zone_name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachDomainRequest {
+    pub hostname: String,
+    pub service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UsageRow {
     pub script: String,
@@ -435,183 +971,666 @@ pub struct UsageRow {
     pub cpu_p50_us: f64,
 }
 
-fn format_api_errors(errors: &[ApiError], status: reqwest::StatusCode) -> String {
-    if errors.is_empty() {
-        return format!("Cloudflare API error (HTTP {status})");
-    }
-    errors
-        .iter()
-        .map(|e| format!("[{}] {}", e.code, e.message))
-        .collect::<Vec<_>>()
-        .join("; ")
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubSettings {
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: u16,
+    #[serde(default = "default_fingerprint")]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub disable_builtin_proxyip: bool,
+    #[serde(default)]
+    pub proxyip_list: Vec<String>,
 }
 
-/// Read every file under `build_dir` into upload parts. Part names are
-/// relative paths with forward slashes, matching the module import specifiers.
-pub fn collect_build_files(build_dir: &Path) -> Result<Vec<UploadFile>> {
-    let mut files = Vec::new();
-    collect_into(build_dir, build_dir, &mut files)?;
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(files)
-}
-
-/// MIME content type for a worker upload part, by file extension.
-pub fn content_type_for(name: &str) -> &'static str {
-    match name.rsplit('.').next() {
-        Some("js") | Some("mjs") => "application/javascript+module",
-        Some("wasm") => "application/wasm",
-        Some("json") => "application/json",
-        _ => "application/octet-stream",
-    }
-}
-
-fn collect_into(root: &Path, dir: &Path, out: &mut Vec<UploadFile>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let path: PathBuf = entry?.path();
-        if path.is_dir() {
-            collect_into(root, &path, out)?;
-            continue;
+impl Default for SubSettings {
+    fn default() -> Self {
+        Self {
+            max_nodes: default_max_nodes(),
+            fingerprint: default_fingerprint(),
+            disable_builtin_proxyip: false,
+            proxyip_list: Vec::new(),
         }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        out.push(UploadFile {
-            content_type: content_type_for(&rel),
-            name: rel,
-            contents: std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        });
+    }
+}
+
+impl SubSettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_nodes == 0 || self.max_nodes > 1000 {
+            bail!("MAX_NODES must be between 1 and 1000");
+        }
+        if self.fingerprint.trim().is_empty()
+            || !self
+                .fingerprint
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+        {
+            bail!("FP must be a non-empty alphanumeric preset/custom value");
+        }
+        for entry in &self.proxyip_list {
+            validate_proxyip_entry(entry)?;
+        }
+        Ok(())
+    }
+}
+
+fn default_max_nodes() -> u16 {
+    100
+}
+
+fn default_fingerprint() -> String {
+    "chrome".into()
+}
+
+fn validate_proxyip_entry(entry: &str) -> Result<()> {
+    let value = entry.trim();
+    if value.is_empty()
+        || value.contains(char::is_whitespace)
+        || value.contains("//")
+        || value.contains('/')
+        || value.contains('@')
+    {
+        bail!("invalid PROXYIP_LIST entry {entry:?}; expected host or host:port");
     }
     Ok(())
 }
 
-/// Upload metadata for a relay worker. The Durable Object binding and the
-/// SQLite migration are REQUIRED even in plaintext mode — VeilweaveSession
-/// still hosts the WebSocket connection state.
-pub fn relay_metadata(secret: &str) -> serde_json::Value {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionKind {
+    Initial,
+    Update,
+}
+
+fn metadata_base(role: &str, bundle_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "main_module": "index.js",
         "compatibility_date": COMPATIBILITY_DATE,
         "compatibility_flags": ["nodejs_compat"],
-        "bindings": [
-            { "name": "SECRET_KEY", "type": "plain_text", "text": secret },
-            {
-                "name": "VEILWEAVE_SESSION",
-                "type": "durable_object_namespace",
-                "class_name": "VeilweaveSession",
-            },
-        ],
-        "migrations": {
-            "new_tag": "v1",
-            "steps": [{ "new_sqlite_classes": ["VeilweaveSession"] }],
-        },
+        "annotations": {
+            "workers/message": format!("Veilweave {role} bundle {bundle_hash}"),
+            "workers/tag": "veilweave-v2"
+        }
     })
 }
 
-/// Upload metadata for a sub worker. The worker resolves its KV namespace via
-/// the `KV_BINDING` var (lookup order: KV_BINDING → VEILWEAVE_KV → KV), so the
-/// `KV_BINDING` plain-text var and the `kv_namespace` binding must match.
+pub fn relay_metadata_for(
+    kind: VersionKind,
+    secret: Option<&str>,
+    bundle_hash: &str,
+) -> Result<serde_json::Value> {
+    let mut metadata = metadata_base("relay", bundle_hash);
+    let secret_binding = match kind {
+        VersionKind::Initial => serde_json::json!({
+            "name": "SECRET_KEY", "type": "secret_text",
+            "text": secret.context("initial relay version requires SECRET_KEY")?
+        }),
+        VersionKind::Update => serde_json::json!({ "name": "SECRET_KEY", "type": "inherit" }),
+    };
+    metadata["bindings"] = serde_json::json!([
+        secret_binding,
+        { "name": OWNERSHIP_BINDING, "type": "plain_text", "text": OWNERSHIP_RELAY },
+        {
+            "name": "VEILWEAVE_SESSION",
+            "type": "durable_object_namespace",
+            "class_name": "VeilweaveSession"
+        }
+    ]);
+    if kind == VersionKind::Initial {
+        // Declarative exports create the free-plan SQLite namespace once. An
+        // update omits this block and therefore cannot replay class creation.
+        metadata["exports"] = serde_json::json!({
+            "VeilweaveSession": {
+                "type": "durable-object",
+                "storage": "sqlite",
+                "state": "created"
+            }
+        });
+    }
+    Ok(metadata)
+}
+
+pub fn sub_metadata_for(
+    kind: VersionKind,
+    nodes: Option<&str>,
+    subscription_token: Option<&str>,
+    kv_binding: &str,
+    kv_namespace_id: &str,
+    settings: &SubSettings,
+    bundle_hash: &str,
+) -> Result<serde_json::Value> {
+    settings.validate()?;
+    if !is_js_identifier(kv_binding) {
+        bail!("KV binding must be a valid JavaScript identifier");
+    }
+    let secret = |name: &str, value: Option<&str>| -> Result<serde_json::Value> {
+        Ok(match (kind, value) {
+            (VersionKind::Initial, None) => {
+                bail!("initial sub version requires {name}")
+            }
+            (_, Some(text)) => {
+                serde_json::json!({ "name": name, "type": "secret_text", "text": text })
+            }
+            (VersionKind::Update, None) => {
+                serde_json::json!({ "name": name, "type": "inherit" })
+            }
+        })
+    };
+    let mut metadata = metadata_base("sub", bundle_hash);
+    metadata["bindings"] = serde_json::json!([
+        secret("VEILWEAVE_NODES", nodes)?,
+        secret("SUBSCRIPTION_TOKEN", subscription_token)?,
+        { "name": OWNERSHIP_BINDING, "type": "plain_text", "text": OWNERSHIP_SUB },
+        { "name": "KV_BINDING", "type": "plain_text", "text": kv_binding },
+        { "name": "MAX_NODES", "type": "plain_text", "text": settings.max_nodes.to_string() },
+        { "name": "FP", "type": "plain_text", "text": settings.fingerprint },
+        { "name": "DISABLE_BUILTIN_PROXYIP", "type": "plain_text", "text": settings.disable_builtin_proxyip.to_string() },
+        { "name": "PROXYIP_LIST", "type": "plain_text", "text": settings.proxyip_list.join(",") },
+        { "name": kv_binding, "type": "kv_namespace", "namespace_id": kv_namespace_id }
+    ]);
+    Ok(metadata)
+}
+
+/// Compatibility helpers create secure initial-version metadata.
+pub fn relay_metadata(secret: &str) -> serde_json::Value {
+    relay_metadata_for(VersionKind::Initial, Some(secret), "legacy-call")
+        .expect("static relay metadata is valid")
+}
+
 pub fn sub_metadata(
     nodes: &str,
     subscription_token: &str,
     kv_binding: &str,
     kv_namespace_id: &str,
 ) -> serde_json::Value {
-    let var = |name: &str, text: &str| serde_json::json!({ "name": name, "type": "plain_text", "text": text });
-    serde_json::json!({
-        "main_module": "index.js",
-        "compatibility_date": COMPATIBILITY_DATE,
-        "compatibility_flags": ["nodejs_compat"],
-        "bindings": [
-            var("KV_BINDING", kv_binding),
-            var("VEILWEAVE_NODES", nodes),
-            var("SUBSCRIPTION_TOKEN", subscription_token),
-            var("MAX_NODES", "100"),
-            var("FP", "chrome"),
-            var("DISABLE_BUILTIN_PROXYIP", "false"),
-            {
-                "name": kv_binding,
-                "type": "kv_namespace",
-                "namespace_id": kv_namespace_id,
-            },
-        ],
-    })
+    sub_metadata_for(
+        VersionKind::Initial,
+        Some(nodes),
+        Some(subscription_token),
+        kv_binding,
+        kv_namespace_id,
+        &SubSettings::default(),
+        "legacy-call",
+    )
+    .expect("caller supplied a valid KV binding")
+}
+
+fn is_js_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::{WorkerBundle, WorkerRole};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn relay_metadata_has_do_binding_and_sqlite_migration() {
-        let m = relay_metadata("test-secret");
-        assert_eq!(m["main_module"], "index.js");
-        assert_eq!(
-            m["compatibility_flags"],
-            serde_json::json!(["nodejs_compat"])
-        );
-
-        let bindings = m["bindings"].as_array().unwrap();
-        let secret = bindings
+    fn new_bindings_are_secret_and_updates_inherit() {
+        let initial = relay_metadata_for(VersionKind::Initial, Some("secret"), "abc").unwrap();
+        let secret = initial["bindings"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|b| b["name"] == "SECRET_KEY")
-            .expect("SECRET_KEY binding");
-        assert_eq!(secret["type"], "plain_text");
-        assert_eq!(secret["text"], "test-secret");
+            .find(|binding| binding["name"] == "SECRET_KEY")
+            .unwrap();
+        assert_eq!(secret["type"], "secret_text");
+        assert!(initial.get("exports").is_some());
+        assert!(initial.get("migrations").is_none());
 
-        let dob = bindings
+        let update = relay_metadata_for(VersionKind::Update, None, "def").unwrap();
+        let inherited = update["bindings"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|b| b["name"] == "VEILWEAVE_SESSION")
-            .expect("DO binding");
-        assert_eq!(dob["type"], "durable_object_namespace");
-        assert_eq!(dob["class_name"], "VeilweaveSession");
-
-        // First deploy of a SQLite-backed DO class: new_tag + steps form,
-        // exactly what wrangler sends (verified against wrangler source).
-        assert_eq!(m["migrations"]["new_tag"], "v1");
-        assert_eq!(
-            m["migrations"]["steps"][0]["new_sqlite_classes"],
-            serde_json::json!(["VeilweaveSession"])
-        );
+            .find(|binding| binding["name"] == "SECRET_KEY")
+            .unwrap();
+        assert_eq!(inherited["type"], "inherit");
+        assert!(update.get("exports").is_none());
+        assert!(!update.to_string().contains("secret"));
     }
 
     #[test]
-    fn sub_metadata_has_kv_binding_var_and_namespace() {
-        let m = sub_metadata("a.dev|s1,b.dev|s2", "tok", "kv_x7f2a9", "ns-id-123");
-        assert_eq!(m["main_module"], "index.js");
-
-        let bindings = m["bindings"].as_array().unwrap();
-        let var = bindings
-            .iter()
-            .find(|b| b["name"] == "KV_BINDING")
-            .expect("KV_BINDING var");
-        assert_eq!(var["type"], "plain_text");
-        assert_eq!(var["text"], "kv_x7f2a9");
-
-        let nodes = bindings
-            .iter()
-            .find(|b| b["name"] == "VEILWEAVE_NODES")
-            .expect("VEILWEAVE_NODES var");
-        assert_eq!(nodes["text"], "a.dev|s1,b.dev|s2");
-
-        let kv = bindings
-            .iter()
-            .find(|b| b["type"] == "kv_namespace")
-            .expect("kv_namespace binding");
-        assert_eq!(kv["name"], "kv_x7f2a9");
-        assert_eq!(kv["namespace_id"], "ns-id-123");
-
-        for required in [
-            "SUBSCRIPTION_TOKEN",
-            "MAX_NODES",
-            "FP",
-            "DISABLE_BUILTIN_PROXYIP",
-        ] {
-            assert!(
-                bindings.iter().any(|b| b["name"] == required),
-                "missing var {required}"
-            );
+    fn sub_settings_are_typed_and_sensitive_values_are_secret_bindings() {
+        let metadata = sub_metadata_for(
+            VersionKind::Initial,
+            Some("relay.example|node-secret"),
+            Some("subscription-secret"),
+            "VEILWEAVE_KV",
+            "namespace-id",
+            &SubSettings::default(),
+            "hash",
+        )
+        .unwrap();
+        for name in ["VEILWEAVE_NODES", "SUBSCRIPTION_TOKEN"] {
+            let binding = metadata["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["name"] == name)
+                .unwrap();
+            assert_eq!(binding["type"], "secret_text");
         }
+        assert_eq!(metadata["bindings"][4]["text"], "100");
+        assert!(SubSettings {
+            max_nodes: 0,
+            ..SubSettings::default()
+        }
+        .validate()
+        .is_err());
+
+        let topology_update = sub_metadata_for(
+            VersionKind::Update,
+            Some("new-relay.example|rotated-secret"),
+            None,
+            "VEILWEAVE_KV",
+            "namespace-id",
+            &SubSettings::default(),
+            "hash-2",
+        )
+        .unwrap();
+        let binding = |name| {
+            topology_update["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(binding("VEILWEAVE_NODES")["type"], "secret_text");
+        assert_eq!(binding("SUBSCRIPTION_TOKEN")["type"], "inherit");
+
+        let token_rotation = sub_metadata_for(
+            VersionKind::Update,
+            None,
+            Some("new-subscription-token"),
+            "VEILWEAVE_KV",
+            "namespace-id",
+            &SubSettings::default(),
+            "hash-3",
+        )
+        .unwrap();
+        let binding = |name| {
+            token_rotation["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(binding("VEILWEAVE_NODES")["type"], "inherit");
+        assert_eq!(binding("SUBSCRIPTION_TOKEN")["type"], "secret_text");
+    }
+
+    #[test]
+    fn errors_are_actionable_and_never_include_token() {
+        let failure = CfApiFailure {
+            operation: "upload".into(),
+            status: Some(StatusCode::BAD_REQUEST),
+            codes: vec![10162],
+            messages: vec!["unsupported module".into()],
+            cf_ray: Some("abc-SJC".into()),
+            retry_after: None,
+        };
+        let rendered = failure.to_string();
+        assert!(rendered.contains("10162"));
+        assert!(rendered.contains("CF-Ray abc-SJC"));
+    }
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: String,
+    }
+
+    async fn mock_api(
+        responses: Vec<MockResponse>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let responses = responses.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    let header_end = loop {
+                        let Ok(length) = stream.read(&mut buffer).await else {
+                            return;
+                        };
+                        if length == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..length]);
+                        if let Some(position) =
+                            bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + content_length {
+                        let Ok(length) = stream.read(&mut buffer).await else {
+                            return;
+                        };
+                        if length == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buffer[..length]);
+                    }
+                    captured.lock().unwrap().push(bytes);
+                    let response = responses.lock().unwrap().pop_front().unwrap_or(MockResponse {
+                        status: 500,
+                        headers: Vec::new(),
+                        body: r#"{"success":false,"errors":[{"code":999,"message":"missing mock response"}],"result":null}"#.into(),
+                    });
+                    let reason = match response.status {
+                        200 => "OK",
+                        400 => "Bad Request",
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        502 => "Bad Gateway",
+                        _ => "Response",
+                    };
+                    let extra_headers = response
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>();
+                    let wire = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.status,
+                        reason,
+                        extra_headers,
+                        response.body.len(),
+                        response.body
+                    );
+                    let _ = stream.write_all(wire.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), requests, task)
+    }
+
+    fn test_bundle(role: WorkerRole) -> WorkerBundle {
+        let root = std::env::temp_dir().join(format!(
+            "veilweave-cfapi-bundle-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(root.join("worker")).unwrap();
+        std::fs::write(root.join("index.js"), b"export default {}").unwrap();
+        std::fs::write(root.join("index_bg.wasm"), b"\0asm").unwrap();
+        std::fs::write(root.join("worker/shim.mjs"), b"export {}").unwrap();
+        std::fs::write(root.join("package.json"), b"{\"private\":true}").unwrap();
+        let bundle = WorkerBundle::from_worker_build(&root, role).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        bundle
+    }
+
+    #[tokio::test]
+    async fn version_multipart_contains_only_manifest_modules_with_modeled_mime() {
+        let (base, requests, task) = mock_api(vec![MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: r#"{"success":true,"errors":[],"result":{"id":"version-1"}}"#.into(),
+        }])
+        .await;
+        let client = CfClient::new("never-serialized-token")
+            .unwrap()
+            .with_api_base(base)
+            .unwrap();
+        let bundle = test_bundle(WorkerRole::Relay);
+        let metadata =
+            relay_metadata_for(VersionKind::Initial, Some("secret"), "bundle-hash").unwrap();
+        let version = client
+            .upload_version("account", "relay-worker", &bundle, metadata)
+            .await
+            .unwrap();
+        assert_eq!(version.id, "version-1");
+        let request = requests.lock().unwrap()[0].clone();
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with(
+            "POST /accounts/account/workers/scripts/relay-worker/versions?bindings_inherit=strict HTTP/1.1"
+        ));
+        assert!(request.contains("name=\"index.js\""));
+        assert!(request.contains("application/javascript+module"));
+        assert!(request.contains("name=\"index_bg.wasm\""));
+        assert!(request.contains("application/wasm"));
+        assert!(request.contains("name=\"worker/shim.mjs\""));
+        assert!(!request.contains("package.json"));
+        assert!(!request
+            .contains("application/json\r\nContent-Disposition: form-data; name=\"package.json\""));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_version_creation_is_reconciled_by_operation_tag() {
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: r#"{"success":false,"errors":[{"code":10000,"message":"unknown outcome"}],"result":null}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":[{"id":"version-reconciled","annotations":{"workers/tag":"test-operation"}}]}"#.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        let bundle = test_bundle(WorkerRole::Relay);
+        let mut metadata =
+            relay_metadata_for(VersionKind::Initial, Some("secret"), "hash").unwrap();
+        metadata["annotations"]["workers/tag"] = "test-operation".into();
+        let version = client
+            .upload_version("account", "relay-worker", &bundle, metadata)
+            .await
+            .unwrap();
+        assert_eq!(version.id, "version-reconciled");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_deployment_creation_is_reconciled_by_operation_message() {
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: r#"{"success":false,"errors":[{"code":10000,"message":"unknown outcome"}],"result":null}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":[{"id":"deployment-reconciled","versions":[{"version_id":"version-1","percentage":100}],"annotations":{"workers/message":"promote [vw-op:test-operation]"}}]}"#.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        let deployment = client
+            .create_deployment(
+                "account",
+                "relay-worker",
+                "version-1",
+                "promote [vw-op:test-operation]",
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployment.id, "deployment-reconciled");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_domain_attach_uses_the_domains_api_without_dns_mutation() {
+        let (base, requests, task) = mock_api(vec![MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: r#"{"success":true,"errors":[],"result":{"id":"domain-1","hostname":"relay.example.com","service":"relay-worker","zone_id":"zone-1","zone_name":"example.com","status":"pending"}}"#.into(),
+        }])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        client
+            .attach_domain(
+                "account",
+                &AttachDomainRequest {
+                    hostname: "relay.example.com".into(),
+                    service: "relay-worker".into(),
+                    zone_id: Some("zone-1".into()),
+                    zone_name: Some("example.com".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let request = String::from_utf8_lossy(&requests.lock().unwrap()[0]).to_string();
+        assert!(request.starts_with("PUT /accounts/account/workers/domains HTTP/1.1"));
+        assert!(request.contains(r#""hostname":"relay.example.com""#));
+        assert!(request.contains(r#""service":"relay-worker""#));
+        assert!(!request.contains("dns_records"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn safe_get_retries_429_and_honors_retry_after() {
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 429,
+                headers: vec![("Retry-After", "0")],
+                body: r#"{"success":false,"errors":[{"code":10000,"message":"rate limited"}],"result":null}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{"status":"active"}}"#.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        client.verify_token().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn non_json_error_reports_http_status_body_preview_and_cf_ray() {
+        let (base, _, task) = mock_api(vec![MockResponse {
+            status: 502,
+            headers: vec![("CF-Ray", "ray-test-SJC")],
+            body: "upstream gateway unavailable".into(),
+        }])
+        .await;
+        let mut client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        client.max_safe_retries = 0;
+        let error = client.verify_token().await.unwrap_err().to_string();
+        assert!(error.contains("HTTP 502"));
+        assert!(error.contains("upstream gateway unavailable"));
+        assert!(error.contains("ray-test-SJC"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn deployment_request_is_separate_from_version_creation() {
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{"id":"version-2"}}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{"id":"deployment-2","versions":[{"version_id":"version-2","percentage":100}]}}"#.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        client
+            .upload_worker(
+                "account",
+                "sub-worker",
+                test_bundle(WorkerRole::Sub),
+                sub_metadata_for(
+                    VersionKind::Initial,
+                    Some("relay.example|secret"),
+                    Some("token"),
+                    "VEILWEAVE_KV",
+                    "kv-id",
+                    &SubSettings::default(),
+                    "hash",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let first = String::from_utf8_lossy(&requests[0]);
+        let second = String::from_utf8_lossy(&requests[1]);
+        assert!(first.starts_with(
+            "POST /accounts/account/workers/scripts/sub-worker/versions?bindings_inherit=strict"
+        ));
+        assert!(second.starts_with("POST /accounts/account/workers/scripts/sub-worker/deployments"));
+        assert!(second.contains(r#""version_id":"version-2""#));
+        assert!(second.contains(r#""percentage":100"#));
+        assert!(second.contains(r#""workers/triggered_by":"veilweave""#));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn kv_listing_follows_pagination() {
+        let first = (0..100)
+            .map(|index| serde_json::json!({"id": format!("id-{index}"), "title": format!("title-{index}")}))
+            .collect::<Vec<_>>();
+        let second = vec![serde_json::json!({"id":"id-100","title":"title-100"})];
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({"success":true,"errors":[],"result":first}).to_string(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({"success":true,"errors":[],"result":second}).to_string(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        assert_eq!(
+            client.list_kv_namespaces("account").await.unwrap().len(),
+            101
+        );
+        let requests = requests.lock().unwrap();
+        assert!(String::from_utf8_lossy(&requests[0]).contains("page=1"));
+        assert!(String::from_utf8_lossy(&requests[1]).contains("page=2"));
+        task.abort();
     }
 }
