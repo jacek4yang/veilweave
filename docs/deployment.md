@@ -58,7 +58,7 @@ unchanged.
 ## 1. Generate secrets
 
 ```bash
-git clone https://github.com/<owner>/veilweave.git
+git clone https://github.com/jacek4yang/veilweave.git
 cd veilweave
 rustup target add wasm32-unknown-unknown
 cargo run --manifest-path tools/Cargo.toml -- gen-secret
@@ -84,8 +84,7 @@ wrangler secret put SECRET_KEY
 # paste the raw secret (or, for experimental encryption, the **relay blob**)
 ```
 
-Then open `wrangler.toml` and **delete the entire `[vars]` block**
-(the placeholder line is not needed once the secret is set).
+The committed `wrangler.toml` intentionally has no plaintext `SECRET_KEY`.
 
 ### 2.2 Bind a custom domain (optional but recommended)
 
@@ -159,22 +158,16 @@ openssl rand -hex 32
 wrangler secret put SUBSCRIPTION_TOKEN
 ```
 
-### 3.3 Fill `VEILWEAVE_NODES`
+### 3.3 Set `VEILWEAVE_NODES`
 
-Edit `wrangler.toml` and replace the placeholder:
-
-```toml
-VEILWEAVE_NODES = "relay.your-domain.com|<the same raw secret from step 1>"
-```
+Run `wrangler secret put VEILWEAVE_NODES` and enter
+`relay.your-domain.com|<the same raw secret from step 1>`. The value is not
+written to `wrangler.toml`.
 
 For multiple relay nodes, comma-separate, each with its own secret:
 
-```toml
-VEILWEAVE_NODES = """
-node-a.example.com|<secret a>,
-node-b.example.com|<secret b>
-"""
-```
+Enter multiple nodes as one comma-separated secret value:
+`node-a.example.com|<secret a>,node-b.example.com|<secret b>`.
 
 > Different nodes with different secrets sign their UUIDs independently —
 > a UUID issued for node a won't validate on node b (this is **a feature**:
@@ -313,10 +306,11 @@ stock one:
 
 - Pick your own **worker names** (not `veilweave` / `veilweave-sub`).
 - Pick your own **KV namespace title and binding name** (set `KV_BINDING`).
-- `veilweave-tools bundle` and the deployer already randomize worker names,
-  the KV binding, and inject a per-run nonce into each script so artifacts
-  never share a content hash — if you deploy manually, at least rename the
-  workers.
+- `veilweave-tools bundle` randomizes worker names and the KV binding, while
+  keeping the signed runtime deterministic and manifest-verifiable. It never
+  injects a nonce into code or writes secret values to TOML. If you deploy
+  manually, rename the workers and inject every secret with `wrangler secret
+  put`.
 
 ## 8. Cost & limits (free plan)
 

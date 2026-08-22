@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v1.0.0)"
+        description: "Release tag to create (e.g. v2.0.0)"
         required: true
-        default: "v1.0.0"
+        default: "v2.0.0"
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,7 +41,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libwayland-dev
+            libxkbcommon-dev libwayland-dev libdbus-1-dev pkg-config
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
         with:
@@ -66,6 +66,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install credential-store build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,7 +82,7 @@ jobs:
             relay -> target
             sub -> target
       - name: Install worker-build
-        run: cargo install -q "worker-build@^0.8" --locked
+        run: cargo install -q --locked worker-build --version 0.8.5
       - name: Build relay worker
         working-directory: relay
         run: worker-build --release
@@ -87,11 +91,16 @@ jobs:
         run: worker-build --release
       - name: Stage bundles
         run: |
-          mkdir -p stage/bundle/relay stage/bundle/sub
-          cp -r relay/build stage/bundle/relay/build
-          cp -r sub/build   stage/bundle/sub/build
-          test -f stage/bundle/relay/build/index.js
-          test -f stage/bundle/sub/build/index.js
+          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle prepare --role relay --source relay/build --out stage/bundle/relay
+          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle prepare --role sub --source sub/build --out stage/bundle/sub
+          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle validate --role relay --dir stage/bundle/relay
+          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle validate --role sub --dir stage/bundle/sub
+          test ! -e stage/bundle/relay/package.json
+          test ! -e stage/bundle/sub/package.json
       - name: Upload worker bundles
         uses: actions/upload-artifact@v4
         with:
@@ -121,15 +130,21 @@ jobs:
           name: worker-bundles
           path: app/src-tauri
       - name: Verify embedded worker bundle
+        shell: bash
         run: |
-          test -f app/src-tauri/bundle/relay/build/index.js
-          test -f app/src-tauri/bundle/sub/build/index.js
+          test -f app/src-tauri/bundle/relay/index.js
+          test -f app/src-tauri/bundle/sub/index.js
+          test -f app/src-tauri/bundle/relay/worker-manifest.json
+          test -f app/src-tauri/bundle/sub/worker-manifest.json
+          test ! -e app/src-tauri/bundle/relay/package.json
+          test ! -e app/src-tauri/bundle/sub/package.json
       - name: Install Linux app deps (webkit2gtk etc.)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev \
+            libdbus-1-dev pkg-config
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry & target
@@ -139,6 +154,9 @@ jobs:
       - name: npm ci (tauri-cli)
         working-directory: app
         run: npm ci
+      - name: Require updater signing credentials
+        shell: bash
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
       - name: tauri build
         working-directory: app
         run: npm run tauri -- build
@@ -169,10 +187,32 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tag and component versions
+        run: |
+          python3 scripts/check_version.py
+          test "$TAG" = "v$(cat VERSION)"
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Verify updater signatures against the committed public key
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          python3 - <<'PYEOF'
+          import base64, json
+          config = json.load(open("app/src-tauri/tauri.conf.json", encoding="utf-8"))
+          public = base64.b64decode(config["plugins"]["updater"]["pubkey"], validate=True)
+          assert public.startswith(b"untrusted comment: minisign public key")
+          open("updater.pub", "wb").write(public)
+          PYEOF
+          for artifact in \
+            artifacts/app-windows/nsis/*.exe \
+            artifacts/app-macos/macos/*.tar.gz \
+            artifacts/app-linux/appimage/*.AppImage; do
+            test -s "$artifact.sig"
+            minisign -Vm "$artifact" -p updater.pub -x "$artifact.sig"
+          done
       - name: Write QUICKSTART
         run: |
           cat > QUICKSTART.txt <<'EOF'
@@ -205,6 +245,13 @@ jobs:
             cp -r artifacts/worker-bundles/bundle "$pkg/bundle"
             cp artifacts/tools-${platform}/veilweave-tools* "$pkg/"
             cp QUICKSTART.txt "$pkg/"
+            chmod +x artifacts/tools-linux-x64/veilweave-tools
+            artifacts/tools-linux-x64/veilweave-tools worker-bundle validate \
+              --role relay --dir "$pkg/bundle/relay"
+            artifacts/tools-linux-x64/veilweave-tools worker-bundle validate \
+              --role sub --dir "$pkg/bundle/sub"
+            test ! -e "$pkg/bundle/relay/package.json"
+            test ! -e "$pkg/bundle/sub/package.json"
             if [ "$platform" = "windows-x64" ]; then
               (cd "$pkg" && zip -qr "../out/${pkg}.zip" .)
             else
@@ -218,9 +265,13 @@ jobs:
         run: |
           set -euo pipefail
           cp artifacts/app-windows/nsis/*.exe out/ 2>/dev/null || true
+          cp artifacts/app-windows/nsis/*.sig out/ 2>/dev/null || true
           cp artifacts/app-windows/msi/*.msi out/ 2>/dev/null || true
           cp artifacts/app-macos/dmg/*.dmg out/ 2>/dev/null || true
+          cp artifacts/app-macos/macos/*.tar.gz out/ 2>/dev/null || true
+          cp artifacts/app-macos/macos/*.sig out/ 2>/dev/null || true
           cp artifacts/app-linux/appimage/*.AppImage out/ 2>/dev/null || true
+          cp artifacts/app-linux/appimage/*.sig out/ 2>/dev/null || true
           cp artifacts/app-linux/deb/*.deb out/ 2>/dev/null || true
 
           python3 - "$TAG" <<'PYEOF'
@@ -253,9 +304,24 @@ jobs:
           with open("out/latest.json", "w", encoding="utf-8") as fh:
               json.dump(manifest, fh, indent=2)
           print(json.dumps(manifest, indent=2))
-          assert platforms, "no updater platforms collected"
+          expected = {"windows-x86_64", "darwin-aarch64", "linux-x86_64"}
+          assert set(platforms) == expected, f"incomplete updater platforms: {set(platforms)}"
+          for platform in platforms.values():
+              assert platform["signature"], "empty updater signature"
+              assert os.path.isfile(os.path.join("out", os.path.basename(platform["url"]))), "updater URL asset was not staged"
           PYEOF
           ls -la out/
+      - name: Generate release SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: out
+          format: cyclonedx-json
+          output-file: out/veilweave-${{ env.TAG }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Generate SHA-256 checksums
+        working-directory: out
+        run: sha256sum * > SHA256SUMS
       - name: Create release
         run: |
           # Idempotent: re-running for an existing tag just re-uploads assets.

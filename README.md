@@ -32,6 +32,20 @@ worker 用独立的 Durable Object 逐连接转发，每帧 CPU 开销接近零�
 
 ---
 
+## Veilweave 2.0 control plane
+
+Version 2.0 deploys manifest-validated Worker bundles through Cloudflare's
+Version API and promotes them separately through the Deployment API. API
+tokens and deployment secrets are stored in the operating-system credential
+store; the normal TOML configuration contains references only. Every operation
+supports workers.dev, an exact Custom Domain, or both, and updates retain a
+known-good version for one-click rollback.
+
+The desktop app and CLI also share one network policy. Choose Direct, System,
+SOCKS5/SOCKS5H, or HTTP(S) proxy mode in **Settings → Network**. An explicit
+proxy is fail-closed by default and applies to Cloudflare operations, network
+diagnostics, update checks, and signed update downloads.
+
 ## ⚡ Quick deploy — no build required / 快捷部署 —— 无需编译
 
 > **You don't need Rust, cargo, wrangler, Node.js, or the source code.**
@@ -89,10 +103,13 @@ five pages: **概览 / 账号 / 部署 / 管理 / 设置**.
    - Account → Workers Scripts → **Edit**
    - Account → Workers KV Storage → **Edit**
    - Account → Account Settings → **Read**（解析 workers.dev 子域用）
+   - Zone → Zone → **Read**（Custom Domain 区域选择；仅使用 workers.dev 时可省略）
    - Account → Account Analytics → **Read**（**可选** — 启用「概览」用量面板 /
      optional — powers the usage dashboard）
 2. **部署** — pick the topology: which account hosts the **sub** worker, and
    how many **relays** on which accounts (each relay gets its own secret).
+   For each Worker, choose workers.dev, an exact Custom Domain, or both and
+   select the primary public endpoint.
    All names are customizable, with one-click 随机 buttons. Confirm — the app
    creates the KV namespace, uploads both workers via the Cloudflare API, and
    shows your **subscription URL**.
@@ -103,7 +120,8 @@ five pages: **概览 / 账号 / 部署 / 管理 / 设置**.
    100k/day free tier, error counts, per-worker rows.
    按账号查看用量：今日请求数（对照免费版 100k/天上限）、错误数、分
    worker 明细。
-4. **管理** — copy subscription URLs, **update** a deployment in place
+4. **管理** — copy subscription URLs, **update** a deployment in place,
+   **rollback** to the previous stable version,
    (re-uploads the latest embedded worker code, secrets untouched), or delete
    a worker (and its KV namespace).
    复制订阅地址、**更新**部署（重新上传应用内嵌的最新 worker 代码，密钥
@@ -144,10 +162,14 @@ still there — it needs [`wrangler`](https://developers.cloudflare.com/workers/
 wrangler：`npm i -g wrangler`，然后 `wrangler login`）：
 
 ```bash
-./veilweave-tools bundle                       # writes dist/<relay>/ + dist/<sub>/
-cd dist/<relay-name> && wrangler deploy        # note the *.workers.dev domain
-# edit dist/<sub-name>/wrangler.toml → put that domain in VEILWEAVE_NODES
+./veilweave-tools bundle                       # writes secret-free TOML
+./veilweave-tools gen-secret                   # generate once; keep it private
+cd dist/<relay-name>
+wrangler secret put SECRET_KEY
+wrangler deploy                                # note the public domain
 cd dist/<sub-name>
+wrangler secret put VEILWEAVE_NODES
+wrangler secret put SUBSCRIPTION_TOKEN
 wrangler kv:namespace create <KV_BINDING>      # binding name is in the generated
                                                # wrangler.toml (randomized, e.g. kv_x7f2a9);
                                                # paste the printed id into [[kv_namespaces]].id
@@ -165,15 +187,15 @@ wrangler kv:namespace create <KV_BINDING>       # 绑定名见生成的 wrangler
 wrangler deploy
 ```
 
-> **Every run is unique / 每次运行都独一无二：**
+> **Deployment identity stays private / 部署身份保持私有：**
 >
-> - fresh UUID-signing secret per relay / 每个 relay 全新的 UUID 签名密钥
 > - randomized worker names and KV binding / 随机化的 worker 名称与 KV 绑定名
-> - randomized subscription token / 随机订阅令牌
-> - a per-run nonce injected into each script, so **your artifact never shares a
->   content hash with anyone else's** — no fleet-wide fingerprint for Cloudflare
->   to flag / 每个脚本注入一次性随机串，**你的产物哈希与任何其他人都不相同**，
->   不会因批量指纹被 Cloudflare 标记
+> - secret values are supplied separately with `wrangler secret put` and never
+>   written into the generated files / 密钥通过 `wrangler secret put` 独立注入，
+>   不写入生成文件
+> - Worker runtime bytes stay deterministic and manifest-verifiable; Veilweave
+>   does not mutate signed code to evade content fingerprints / Worker 运行时代码
+>   保持确定性并可按清单验证，不通过篡改签名代码规避内容指纹
 
 ---
 
@@ -359,14 +381,16 @@ cargo run --manifest-path tools/Cargo.toml -- gen-secret
 #    (add --encryption for the EXPERIMENTAL mlkem768x25519plus blob pair)
 #   （加 --encryption 则生成实验性 mlkem768x25519plus blob 对）
 
-# 2. paste the secret into relay/wrangler.toml [vars].SECRET_KEY, then:
-#    把密钥填入 relay/wrangler.toml 后：
+# 2. set the secret without writing it to TOML, then:
+wrangler secret put SECRET_KEY
 cd relay && wrangler deploy
 
-# 3. paste the same secret into sub/wrangler.toml [vars].VEILWEAVE_NODES as
+# 3. set the same secret with `wrangler secret put VEILWEAVE_NODES` as
 #    <relay-domain>|<secret>, create the KV namespace, then:
-#    把同一密钥以 <relay域名>|<密钥> 填入 sub/wrangler.toml，创建 KV 后：
+#    用 secret put 输入 <relay域名>|<密钥>，创建 KV 后：
 cd ../sub
+wrangler secret put VEILWEAVE_NODES
+wrangler secret put SUBSCRIPTION_TOKEN
 wrangler kv:namespace create VEILWEAVE_KV   # paste id into wrangler.toml
 wrangler deploy
 
@@ -422,7 +446,7 @@ during the handshake.
 
 ```
 1. tools gen-secret                                    → 1 raw secret
-2. relay/wrangler.toml: SECRET_KEY=<raw secret>  →  wrangler deploy
+2. wrangler secret put SECRET_KEY  →  wrangler deploy
 3. tools gen-link --type proxyip --proxy-ip 1.2.3.4 …  → one vless:// link
 4. import into client / 客户端导入
 ```
@@ -513,6 +537,13 @@ CLI 和桌面应用安装包——Windows（NSIS `*-setup.exe` + MSI）、macOS 
 
 ## Docs / 文档
 
+- [`docs/control-plane-v2.md`](docs/control-plane-v2.md) — bundles, transactions, versions, domains, recovery
+- [`docs/network.md`](docs/network.md) — Direct/System/SOCKS5/HTTP transport and diagnostics
+- [`docs/declarative-config.md`](docs/declarative-config.md) — secret-free GitOps topology schema and CLI
+- [`docs/migration-v2.md`](docs/migration-v2.md) — verified v1 → v2 credential/config migration
+- [`docs/security-v2.md`](docs/security-v2.md) — control-plane threat model and mitigations
+- [`docs/troubleshooting-v2.md`](docs/troubleshooting-v2.md) — doctor, 10162, proxy, domain, and recovery help
+- [`docs/release-v2.md`](docs/release-v2.md) — CI, signing, checksums, SBOM, and release verification
 - [`docs/architecture.md`](docs/architecture.md) — data plane / handshake / protocol design · 数据面/握手/协议设计
 - [`docs/deployment.md`](docs/deployment.md) — production deploy, key rotation, monitoring · 生产部署、密钥轮换、监控
 - [`docs/protocol.md`](docs/protocol.md) — wire format of signed UUIDs and encrypted records · 签名 UUID 与加密 record 线格式

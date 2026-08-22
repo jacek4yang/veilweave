@@ -4,10 +4,49 @@ All notable changes to veilweave are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-> **Note:** Until `1.0.0`, breaking changes are documented under
-> `Changed` with a clear migration note. Patch-level releases are
-> wire-compatible with the previous patch release; minor releases
-> may change the build profile but stay wire-compatible.
+## [Unreleased]
+
+## [2.0.0] — 2026-08-22
+
+### Added
+
+- Canonical, manifest-backed Worker bundles shared by the CLI, desktop app,
+  release packaging, and Cloudflare client. Runtime modules are allowlisted,
+  typed, hashed, and validated before any network request.
+- Transactional Cloudflare Version/Deployment flow with a resource journal,
+  compensation, health verification, stored stable/previous version IDs, and
+  explicit update and rollback commands.
+- Exact-hostname Custom Domains for every relay and Sub Worker, including
+  workers.dev-only, Custom-Domain-only, and dual exposure with a selectable
+  primary endpoint and asynchronous certificate state.
+- Schema-v2 configuration, stable account/deployment IDs, OS credential-store
+  references, verified v1 migration, redacted WebView DTOs, and secret-aware
+  recovery classifications.
+- Declarative TOML topology specifications plus `plan`, `apply`, `status`,
+  `update`, `rollback`, `doctor`, `recover`, and `domain` CLI workflows.
+- Application-wide Direct, System, SOCKS5/SOCKS5H, and HTTP(S) proxy policy.
+  Cloudflare calls, diagnostics, update checks, and update downloads share one
+  immutable runtime transport generation. Explicit proxies fail closed and
+  authenticated proxy passwords live only in the secure credential store.
+
+### Changed
+
+- Worker code is uploaded as an inert version and promoted separately. Updates
+  inherit secrets strictly; coordinated topology updates rotate only the Sub
+  node binding while preserving the subscription token.
+- Relay Durable Object creation is declarative only for a new Worker. Code-only
+  updates preserve the existing free-plan SQLite namespace.
+- Manual Wrangler bundles no longer write relay, node, or subscription secrets
+  to TOML; operators use `wrangler secret put`.
+- All shipped component versions are checked against the root `VERSION` file.
+
+### Fixed
+
+- Cloudflare error 10162: `worker-build`'s `package.json` was recursively staged
+  and uploaded as an `application/json` Worker module. Build metadata is now
+  excluded and unsupported runtime files fail locally.
+- Rollback can no longer delete pre-existing Workers, KV namespaces, domains,
+  or exposure state owned outside the failed transaction.
 
 ## [1.1.1] — 2026-08-22
 
@@ -128,8 +167,6 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - N/A.
 
-## [Unreleased]
-
 ## [0.1.0] — 2026-05-26
 
 ### Added
@@ -144,9 +181,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Apache 2.4.62 / Debian camouflage page (`static/apache_default.html`).
 - Signed-UUID scheme with per-isolate HKDF derivation and bounded LRU.
 
-[Unreleased]: https://github.com/<owner>/veilweave/compare/v1.1.1...HEAD
-[1.1.1]: https://github.com/<owner>/veilweave/compare/v1.1.0...v1.1.1
-[1.1.0]: https://github.com/<owner>/veilweave/compare/v1.0.1...v1.1.0
-[1.0.1]: https://github.com/<owner>/veilweave/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/<owner>/veilweave/compare/v0.1.0...v1.0.0
-[0.1.0]: https://github.com/<owner>/veilweave/releases/tag/v0.1.0
+[Unreleased]: https://github.com/jacek4yang/veilweave/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jacek4yang/veilweave/compare/v1.1.1...v2.0.0
+[1.1.1]: https://github.com/jacek4yang/veilweave/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/jacek4yang/veilweave/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/jacek4yang/veilweave/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/jacek4yang/veilweave/compare/v0.1.0...v1.0.0
+[0.1.0]: https://github.com/jacek4yang/veilweave/releases/tag/v0.1.0

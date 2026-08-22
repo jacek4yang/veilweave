@@ -31,7 +31,7 @@ We will acknowledge within 72 hours. Please include:
 - The commit/tag you reproduced against.
 - Whether you intend to disclose publicly, and on what timeline.
 
-[adv]: https://github.com/<owner>/veilweave/security/advisories/new
+[adv]: https://github.com/jacek4yang/veilweave/security/advisories/new
 
 ## Cryptographic claims
 
