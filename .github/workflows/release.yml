@@ -116,9 +116,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, name: windows }
-          - { os: macos-latest,   name: macos }
-          - { os: ubuntu-latest,  name: linux }
+          - { os: windows-latest, name: windows, bundles: "nsis,msi" }
+          - { os: macos-latest,   name: macos,   bundles: "app,dmg" }
+          - { os: ubuntu-latest,  name: linux,   bundles: "appimage,deb" }
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -159,7 +159,7 @@ jobs:
         run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
       - name: tauri build
         working-directory: app
-        run: npm run tauri -- build
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }}
       - name: Upload app bundles
         uses: actions/upload-artifact@v4
         with:
@@ -206,10 +206,15 @@ jobs:
           assert public.startswith(b"untrusted comment: minisign public key")
           open("updater.pub", "wb").write(public)
           PYEOF
-          for artifact in \
-            artifacts/app-windows/nsis/*.exe \
-            artifacts/app-macos/macos/*.tar.gz \
-            artifacts/app-linux/appimage/*.AppImage; do
+          shopt -s nullglob
+          windows_artifacts=(artifacts/app-windows/nsis/*.exe)
+          macos_artifacts=(artifacts/app-macos/macos/*.tar.gz)
+          linux_artifacts=(artifacts/app-linux/appimage/*.AppImage)
+          test "${#windows_artifacts[@]}" -eq 1
+          test "${#macos_artifacts[@]}" -eq 1
+          test "${#linux_artifacts[@]}" -eq 1
+          artifacts=("${windows_artifacts[@]}" "${macos_artifacts[@]}" "${linux_artifacts[@]}")
+          for artifact in "${artifacts[@]}"; do
             test -s "$artifact.sig"
             decoded_signature="$artifact.minisign-decoded"
             base64 --decode "$artifact.sig" > "$decoded_signature"
