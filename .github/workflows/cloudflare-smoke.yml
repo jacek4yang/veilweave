@@ -32,7 +32,6 @@ jobs:
       CF_TEST_ZONE_NAME: ${{ secrets.CLOUDFLARE_TEST_ZONE_NAME }}
       VW_PREFIX: ${{ inputs.resource_prefix }}
       VW_CUSTOM_HOSTNAME: ${{ inputs.custom_hostname }}
-      XDG_CONFIG_HOME: ${{ runner.temp }}/veilweave-config
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,6 +51,8 @@ jobs:
           cargo build --locked --release --manifest-path tools/Cargo.toml
       - name: Deploy, update, rollback, and remove the dedicated topology
         shell: bash
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/veilweave-config
         run: |
           dbus-run-session -- bash -euo pipefail <<'SCRIPT'
           eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
