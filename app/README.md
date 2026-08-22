@@ -14,10 +14,15 @@ relay / sub worker 直接嵌在二进制里，部署和更新完全离线可用�
 - **账号**：用一个或多个 Cloudflare API token 管理账号；「**扫描已有
   部署**」通过 API 读取 worker 配置，重装系统后一键重建本地部署清单；
 - **部署**：拓扑向导（sub 放哪个账号、几个 relay、分别放哪些账号，每个
-  relay 独立密钥），所有名称可自定义，也有一键「随机」；
+  relay 独立密钥），每个 Worker 可选 workers.dev、自定义域名或两者并存，
+  并提供 Sub 高级设置；
 - **管理**：复制订阅地址、**更新部署**（重新上传内嵌的最新 worker 代码，
-  密钥保持不变）、删除 worker（连带 KV）；
-- **设置**：界面语言（中文 / English）、检查更新（应用内自动更新）。
+  密钥保持不变）、回滚、轮换订阅令牌、删除 Worker/KV/托管域名；
+- **设置**：界面语言、应用内签名更新，以及 Direct/System/SOCKS5/HTTP(S)
+  全局网络策略。Cloudflare 与更新下载使用同一代理且显式代理失败关闭。
+
+API token、Worker 密钥和代理密码存入操作系统凭据库；普通配置与前端状态
+只有脱敏元数据。订阅 URL 仅在用户点击复制时由专用后端命令短暂返回。
 
 Windows 发布版是纯图形窗口（`windows_subsystem = "windows"`），没有控制台
 黑框。
@@ -28,10 +33,10 @@ Windows 发布版是纯图形窗口（`windows_subsystem = "windows"`），没�
 # 前置：Rust toolchain + Node.js
 cd app
 
-# 1. 放入预编译 worker（build.rs 缺了会直接报错）
+# 1. 构建并准备严格校验的 canonical Worker bundle
 #    先在 relay/ 和 sub/ 里跑 worker-build --release，然后：
-cp -r ../relay/build src-tauri/bundle/relay/build
-cp -r ../sub/build   src-tauri/bundle/sub/build
+cargo run --manifest-path ../tools/Cargo.toml -- worker-bundle prepare --role relay --source ../relay/build --out src-tauri/bundle/relay
+cargo run --manifest-path ../tools/Cargo.toml -- worker-bundle prepare --role sub --source ../sub/build --out src-tauri/bundle/sub
 #    详见 src-tauri/bundle/README.md（该目录被 gitignore，是构建产物）
 
 # 2. 构建

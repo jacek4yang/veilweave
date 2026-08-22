@@ -4,15 +4,22 @@
 
 use anyhow::{bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use veilweave_core::cfapi::SubSettings;
 use veilweave_core::config::{Config, Role};
-use veilweave_core::deploy::{self, BundleSource, DeployPlan, LogKind, RelaySpec, SubSpec};
+use veilweave_core::credentials::CredentialManager;
+use veilweave_core::deploy::{
+    self, BundleSource, DeployPlan, EndpointSpec, LogKind, RelaySpec, SubSpec,
+};
+use veilweave_core::network::NetworkManager;
 
 pub const TOKEN_URL: &str = "https://dash.cloudflare.com/profile/api-tokens";
 pub const TOKEN_PERMISSIONS: &str = "\
   · Account → Workers Scripts → Edit
   · Account → Workers KV Storage → Edit
   · Account → Account Settings → Read   (for the workers.dev subdomain)
-  · Account → Analytics → Read          (可选 / optional — for usage stats)";
+  · Account → Analytics → Read          (可选 / optional — for usage stats)
+  · Zone → Zone → Read                  (for the Custom Domain zone picker)
+  · Zone → DNS → Read                   (optional conflict check; DNS Write is not needed)";
 
 pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
     let theme = ColorfulTheme::default();
@@ -74,6 +81,7 @@ pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
         relays.push(RelaySpec {
             account,
             worker_name: name,
+            endpoint: EndpointSpec::default(),
         });
     }
 
@@ -133,6 +141,8 @@ pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
             worker_name: sub_name,
             kv_title: format!("{}-kv", veilweave_core::util::random_worker_name()),
             kv_binding,
+            endpoint: EndpointSpec::default(),
+            settings: SubSettings::default(),
         },
         relays,
         encryption,
@@ -149,7 +159,8 @@ pub async fn run_deploy(bundle_dir: Option<String>) -> Result<()> {
     .await?;
 
     println!();
-    if let Some(url) = outcome.subscription_url() {
+    let credentials = CredentialManager::system();
+    if let Some(url) = outcome.subscription_url(&cfg, &credentials)? {
         println!("Deployment complete. Subscription URL (import into your client):");
         println!();
         println!("  {url}");
@@ -176,7 +187,10 @@ pub async fn run_manage() -> Result<()> {
             .map(|d| {
                 format!(
                     "[{}] {}  →  https://{}  ({})",
-                    d.role, d.name, d.domain, d.account
+                    d.role,
+                    d.name,
+                    d.primary_domain().unwrap_or("endpoint unavailable"),
+                    d.account_id
                 )
             })
             .collect();
@@ -206,7 +220,9 @@ pub async fn run_manage() -> Result<()> {
 
         match actions[action] {
             "Show subscription URL" => {
-                if let Some(url) = cfg.deployments[sel].subscription_url() {
+                if let Some(url) =
+                    cfg.deployments[sel].subscription_url(&CredentialManager::system())?
+                {
                     println!();
                     println!("  {url}");
                 }
@@ -236,10 +252,19 @@ async fn delete_deployment(theme: &ColorfulTheme, cfg: &mut Config, idx: usize) 
     }
 
     let account = cfg
-        .account(&d.account)
-        .with_context(|| format!("account {:?} no longer in config", d.account))?
+        .account(&d.account_id)
+        .with_context(|| format!("account {:?} no longer in config", d.account_id))?
         .clone();
-    let client = veilweave_core::cfapi::CfClient::new(&account.token)?;
+    let credentials = CredentialManager::system();
+    let token = credentials.resolve(&account.credential_ref)?;
+    let network = NetworkManager::new(cfg.network.clone(), credentials.clone())?;
+    let client = veilweave_core::cfapi::CfClient::with_network(token.expose(), network)?;
+    for domain in &d.endpoint.custom_domains {
+        client
+            .detach_domain(&account.account_id, &domain.domain_id)
+            .await?;
+        println!("  ✔ detached Custom Domain {}", domain.hostname);
+    }
     client.delete_worker(&account.account_id, &d.name).await?;
     println!("  ✔ deleted worker {}", d.name);
     if let Some(sub) = &d.sub {
@@ -248,8 +273,19 @@ async fn delete_deployment(theme: &ColorfulTheme, cfg: &mut Config, idx: usize) 
             .await?;
         println!("  ✔ deleted KV namespace {}", sub.kv_title);
     }
-    cfg.deployments.remove(idx);
-    cfg.save()?;
+    let mut candidate = cfg.clone();
+    candidate.deployments.remove(idx);
+    candidate.save().context(
+        "remote resources were deleted, but local metadata could not be updated; run recover before another mutation",
+    )?;
+    *cfg = candidate;
+    credentials.delete(&d.secret_ref)?;
+    if let Some(reference) = &d.node_secret_ref {
+        credentials.delete(reference)?;
+    }
+    if let Some(sub) = &d.sub {
+        credentials.delete(&sub.subscription_token_ref)?;
+    }
     Ok(())
 }
 
@@ -266,7 +302,9 @@ async fn add_account(theme: &ColorfulTheme, cfg: &mut Config) -> Result<()> {
     let token = Password::with_theme(theme)
         .with_prompt("Paste the API token")
         .interact()?;
-    let client = veilweave_core::cfapi::CfClient::new(&token)?;
+    let credentials = CredentialManager::system();
+    let network = NetworkManager::new(cfg.network.clone(), credentials.clone())?;
+    let client = veilweave_core::cfapi::CfClient::with_network(&token, network)?;
     println!("Verifying token…");
     client.verify_token().await?;
 
@@ -302,13 +340,29 @@ async fn add_account(theme: &ColorfulTheme, cfg: &mut Config) -> Result<()> {
         })
         .interact_text()?;
 
-    cfg.accounts.push(veilweave_core::config::Account {
+    let credential_ref =
+        CredentialManager::keyring_reference(&format!("account/{}/api-token", account.id));
+    if cfg.account(&account.id).is_some() {
+        bail!("Cloudflare account {} is already configured", account.id);
+    }
+    credentials.store_verified(&credential_ref, &token)?;
+    let mut candidate = cfg.clone();
+    candidate.accounts.push(veilweave_core::config::Account {
         name: label.clone(),
-        token,
         account_id: account.id.clone(),
+        credential_ref: credential_ref.clone(),
         workers_dev_subdomain: Some(subdomain.clone()),
     });
-    cfg.save()?;
+    if let Err(error) = candidate.save() {
+        let rollback = credentials.delete(&credential_ref);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "API token credential rollback also failed: {rollback_error:#}"
+            ))),
+        };
+    }
+    *cfg = candidate;
     println!(
         "  ✔ saved account {label:?} ({}, workers.dev subdomain: {subdomain})",
         account.name
