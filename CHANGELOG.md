@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.2] — 2026-08-24
+
+### Fixed
+
+- Custom Domain TLS provisioning verification now polls DNS and HTTPS with
+  180s timeout instead of a single failed attempt. Multiple public DNS servers
+  (Cloudflare 1.1.1.1, Google 8.8.8.8, OpenDNS) are queried to detect
+  propagation before attempting HTTPS verification.
+
 ## [2.0.1] — 2026-08-23
 
 ### Fixed

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -1273,6 +1274,19 @@ fn domain_binding(
     }
 }
 
+/// DNS servers to poll for propagation verification.
+const DNS_SERVERS: &[&str] = &[
+    "1.1.1.1:53",     // Cloudflare
+    "8.8.8.8:53",     // Google
+    "208.67.222.222:53", // OpenDNS
+];
+
+/// Maximum time to wait for Custom Domain TLS provisioning.
+const CUSTOM_DOMAIN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Interval between DNS/HTTPS checks during provisioning.
+const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 async fn verify_endpoint(
     network: &NetworkManager,
     hostname: &str,
@@ -1285,11 +1299,99 @@ async fn verify_endpoint(
         DeployStage::Verifying,
         format!("verifying https://{hostname}"),
     ));
+
     let url = match subscription_token {
         Some(token) => format!("https://{hostname}/sub?token={token}"),
         None => format!("https://{hostname}/"),
     };
-    match network.snapshot().client().get(url).send().await {
+
+    // For Custom Domains with provisioning certificates, poll DNS and HTTPS
+    // until the endpoint is reachable or we time out.
+    if certificate_provisioning {
+        let deadline = Instant::now() + CUSTOM_DOMAIN_TIMEOUT;
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+
+            // Step 1: Check DNS resolution using multiple servers.
+            let dns_ok = check_dns_propagation(hostname, log).await;
+            if dns_ok {
+                log(LogLine::new(
+                    LogKind::Info,
+                    DeployStage::WaitingForEndpoint,
+                    format!("{hostname}: DNS propagated (attempt {attempt})"),
+                ));
+            } else if remaining.is_zero() {
+                log(LogLine::new(
+                    LogKind::Warn,
+                    DeployStage::WaitingForEndpoint,
+                    format!(
+                        "{hostname}: DNS not propagated after {}s; deployment retained",
+                        CUSTOM_DOMAIN_TIMEOUT.as_secs()
+                    ),
+                ));
+                return Ok(());
+            } else {
+                log(LogLine::new(
+                    LogKind::Step,
+                    DeployStage::WaitingForEndpoint,
+                    format!(
+                        "{hostname}: waiting for DNS propagation ({:.0}s remaining, attempt {attempt})",
+                        remaining.as_secs_f64()
+                    ),
+                ));
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                continue;
+            }
+
+            // Step 2: DNS is resolved, try HTTPS.
+            match network.snapshot().client().get(&url).send().await {
+                Ok(response) if response.status().is_server_error() => {
+                    bail!("endpoint {hostname} returned HTTP {}", response.status())
+                }
+                Ok(response) => {
+                    log(LogLine::new(
+                        LogKind::Info,
+                        DeployStage::Verifying,
+                        format!(
+                            "endpoint {hostname} reachable (HTTP {}) after {:.0}s",
+                            response.status(),
+                            (CUSTOM_DOMAIN_TIMEOUT - remaining).as_secs_f64()
+                        ),
+                    ));
+                    return Ok(());
+                }
+                Err(error) if remaining.is_zero() => {
+                    log(LogLine::new(
+                        LogKind::Warn,
+                        DeployStage::WaitingForEndpoint,
+                        format!(
+                            "Custom Domain {hostname} is attached but TLS still not ready after {}s: {}; deployment retained",
+                            CUSTOM_DOMAIN_TIMEOUT.as_secs(),
+                            error.without_url()
+                        ),
+                    ));
+                    return Ok(());
+                }
+                Err(_error) => {
+                    log(LogLine::new(
+                        LogKind::Step,
+                        DeployStage::WaitingForEndpoint,
+                        format!(
+                            "{hostname}: DNS ready but TLS still provisioning ({:.0}s remaining)",
+                            remaining.as_secs_f64()
+                        ),
+                    ));
+                    tokio::time::sleep(CHECK_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    // Non-provisioning path: single attempt.
+    match network.snapshot().client().get(&url).send().await {
         Ok(response) if response.status().is_server_error() => {
             bail!("endpoint {hostname} returned HTTP {}", response.status())
         }
@@ -1301,21 +1403,173 @@ async fn verify_endpoint(
             ));
             Ok(())
         }
-        Err(error) if certificate_provisioning => {
-            let error = error.without_url();
-            log(LogLine::new(
-                LogKind::Warn,
-                DeployStage::WaitingForEndpoint,
-                format!(
-                    "Custom Domain {hostname} is attached but TLS is still provisioning: {error}; deployment retained"
-                ),
-            ));
-            Ok(())
-        }
         Err(error) => {
             Err(error.without_url()).with_context(|| format!("endpoint {hostname} is unreachable"))
         }
     }
+}
+
+/// Check if the hostname resolves via multiple public DNS servers.
+/// Returns `true` if at least one server returns a valid address.
+async fn check_dns_propagation(hostname: &str, log: &mut (dyn FnMut(LogLine) + Send)) -> bool {
+    let mut resolved_count = 0u32;
+
+    for dns_server in DNS_SERVERS {
+        match resolve_via_dns(hostname, dns_server).await {
+            Ok(addrs) if !addrs.is_empty() => {
+                resolved_count += 1;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    if resolved_count == 0 {
+        log(LogLine::new(
+            LogKind::Step,
+            DeployStage::WaitingForEndpoint,
+            format!("{hostname}: not yet resolvable from any DNS server"),
+        ));
+    }
+
+    resolved_count > 0
+}
+
+/// Resolve a hostname using a specific DNS server via UDP.
+/// Falls back to system resolver if direct DNS fails.
+async fn resolve_via_dns(
+    hostname: &str,
+    dns_server: &str,
+) -> Result<Vec<std::net::IpAddr>> {
+    use std::net::SocketAddr;
+
+    // Try system resolver first (fastest, works in most environments).
+    if let Ok(addrs) = tokio::net::lookup_host((hostname, 443)).await {
+        let ips: Vec<_> = addrs.map(|a| a.ip()).collect();
+        if !ips.is_empty() {
+            return Ok(ips);
+        }
+    }
+
+    // Fallback: UDP DNS query to the specific server.
+    let server: SocketAddr = dns_server.parse().context("invalid DNS server address")?;
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("bind UDP socket")?;
+
+    // Build a minimal DNS A-record query.
+    let query = build_dns_query(hostname)?;
+    socket
+        .send_to(&query, server)
+        .await
+        .context("send DNS query")?;
+
+    let mut buf = vec![0u8; 512];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+        .await
+        .context("DNS response timeout")?
+        .context("receive DNS response")?;
+
+    buf.truncate(len);
+    parse_dns_response(&buf)
+}
+
+/// Build a minimal DNS A-record query packet.
+fn build_dns_query(hostname: &str) -> Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(64);
+
+    // Transaction ID
+    packet.extend_from_slice(&[0xAB, 0xCD]);
+    // Flags: standard query, recursion desired
+    packet.extend_from_slice(&[0x01, 0x00]);
+    // Questions: 1
+    packet.extend_from_slice(&[0x00, 0x01]);
+    // Answer/Authority/Additional: 0
+    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    // QNAME
+    for label in hostname.split('.') {
+        if label.len() > 63 {
+            bail!("DNS label too long: {label:?}");
+        }
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0); // root label
+
+    // QTYPE: A (1)
+    packet.extend_from_slice(&[0x00, 0x01]);
+    // QCLASS: IN (1)
+    packet.extend_from_slice(&[0x00, 0x01]);
+
+    Ok(packet)
+}
+
+/// Parse A-record IP addresses from a DNS response packet.
+fn parse_dns_response(packet: &[u8]) -> Result<Vec<std::net::IpAddr>> {
+    if packet.len() < 12 {
+        bail!("DNS response too short");
+    }
+
+    let answer_count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let mut offset = 12usize;
+
+    // Skip questions.
+    for _ in 0..u16::from_be_bytes([packet[4], packet[5]]) {
+        while offset < packet.len() && packet[offset] != 0 {
+            if packet[offset] & 0xC0 == 0xC0 {
+                offset += 2;
+                break;
+            }
+            offset += 1 + packet[offset] as usize;
+        }
+        if offset < packet.len() && packet[offset] == 0 {
+            offset += 1;
+        }
+        offset += 4; // QTYPE + QCLASS
+    }
+
+    // Parse answers.
+    let mut addresses = Vec::new();
+    for _ in 0..answer_count {
+        if offset >= packet.len() {
+            break;
+        }
+
+        // Skip name (handle compression).
+        if packet[offset] & 0xC0 == 0xC0 {
+            offset += 2;
+        } else {
+            while offset < packet.len() && packet[offset] != 0 {
+                offset += 1 + packet[offset] as usize;
+            }
+            if offset < packet.len() {
+                offset += 1;
+            }
+        }
+
+        if offset + 10 > packet.len() {
+            break;
+        }
+
+        let rtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        offset += 10;
+
+        if rtype == 1 && rdlength == 4 && offset + 4 <= packet.len() {
+            let ip = std::net::Ipv4Addr::new(
+                packet[offset],
+                packet[offset + 1],
+                packet[offset + 2],
+                packet[offset + 3],
+            );
+            addresses.push(ip.into());
+        }
+
+        offset += rdlength;
+    }
+
+    Ok(addresses)
 }
 
 async fn preflight_ownership(
