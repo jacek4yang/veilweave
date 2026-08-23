@@ -669,11 +669,6 @@ async fn apply_relay(
     } else {
         None
     };
-    log(LogLine::new(
-        LogKind::Step,
-        DeployStage::UploadingVersion,
-        format!("relay {}: uploading inert Worker version", spec.worker_name),
-    ));
     let metadata = cfapi::relay_metadata_for(
         if is_update {
             VersionKind::Update
@@ -683,9 +678,28 @@ async fn apply_relay(
         relay_secret.as_ref().map(SecretValue::expose),
         &bundle.manifest().bundle_sha256,
     )?;
-    let version = client
-        .upload_version(&account.account_id, &spec.worker_name, bundle, metadata)
-        .await?;
+    let version = if is_update {
+        log(LogLine::new(
+            LogKind::Step,
+            DeployStage::UploadingVersion,
+            format!("relay {}: uploading inert Worker version", spec.worker_name),
+        ));
+        client
+            .upload_version(&account.account_id, &spec.worker_name, bundle, metadata)
+            .await?
+    } else {
+        log(LogLine::new(
+            LogKind::Step,
+            DeployStage::UploadingVersion,
+            format!(
+                "relay {}: creating Worker and uploading initial version",
+                spec.worker_name
+            ),
+        ));
+        client
+            .create_worker_initial(&account.account_id, &spec.worker_name, bundle, metadata)
+            .await?
+    };
     if !is_update {
         transaction.record(
             format!("Worker {}", spec.worker_name),
@@ -929,11 +943,6 @@ async fn apply_sub(
     } else {
         None
     };
-    log(LogLine::new(
-        LogKind::Step,
-        DeployStage::UploadingVersion,
-        format!("sub {}: uploading inert Worker version", spec.worker_name),
-    ));
     let metadata = cfapi::sub_metadata_for(
         if is_update {
             VersionKind::Update
@@ -951,9 +960,28 @@ async fn apply_sub(
         &spec.settings,
         &bundle.manifest().bundle_sha256,
     )?;
-    let version = client
-        .upload_version(&account.account_id, &spec.worker_name, bundle, metadata)
-        .await?;
+    let version = if is_update {
+        log(LogLine::new(
+            LogKind::Step,
+            DeployStage::UploadingVersion,
+            format!("sub {}: uploading inert Worker version", spec.worker_name),
+        ));
+        client
+            .upload_version(&account.account_id, &spec.worker_name, bundle, metadata)
+            .await?
+    } else {
+        log(LogLine::new(
+            LogKind::Step,
+            DeployStage::UploadingVersion,
+            format!(
+                "sub {}: creating Worker and uploading initial version",
+                spec.worker_name
+            ),
+        ));
+        client
+            .create_worker_initial(&account.account_id, &spec.worker_name, bundle, metadata)
+            .await?
+    };
     if !is_update {
         transaction.record(
             format!("Worker {}", spec.worker_name),
