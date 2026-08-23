@@ -556,7 +556,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "veilweave-sub"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "base64",
  "js-sys",

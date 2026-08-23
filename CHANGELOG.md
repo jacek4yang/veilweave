@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-08-23
+
+### Fixed
+
+- New Worker deployment fails with HTTP 404 "This Worker does not exist on
+  your account" because the Versions API requires the Worker to already exist.
+  New Workers are now created via the legacy PUT endpoint first.
+- `list_versions` and `list_deployments` API responses use wrapped format
+  (`{ "result": { "items": [...] } }`) that was incorrectly deserialized.
+- Cloudflare API returns `"errors": null` instead of `"errors": []` in some
+  responses, causing deserialization failure.
+- Deployment annotation `workers/triggered_by` is no longer supported by
+  Cloudflare API and has been removed.
+
 ## [2.0.0] — 2026-08-22
 
 ### Added
