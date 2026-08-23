@@ -22,6 +22,17 @@ pub const OWNERSHIP_RELAY: &str = "veilweave:v2:relay";
 pub const OWNERSHIP_SUB: &str = "veilweave:v2:sub";
 pub const FREE_TIER_DAILY_REQUESTS: u64 = 100_000;
 
+/// Deserialize `null` as `Default::default()` instead of failing.
+fn deserialize_null_default<'de, D, T: Default + Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
 #[derive(Clone)]
 pub struct CfClient {
     network: NetworkManager,
@@ -407,6 +418,60 @@ impl CfClient {
         .await
     }
 
+    /// Create a brand-new Worker via the legacy PUT endpoint. The Versions
+    /// API (`POST …/versions`) requires the script to already exist, so the
+    /// very first deployment must go through PUT which creates the Worker and
+    /// its initial version in a single request. After this call the Worker is
+    /// live; the caller should then promote (or track) the returned version.
+    pub async fn create_worker_initial(
+        &self,
+        account_id: &str,
+        script: &str,
+        bundle: &WorkerBundle,
+        metadata: serde_json::Value,
+    ) -> Result<WorkerVersion> {
+        let operation_tag = metadata["annotations"]["workers/tag"]
+            .as_str()
+            .unwrap_or("veilweave-v2")
+            .to_string();
+        let mut form = reqwest::multipart::Form::new().part(
+            "metadata",
+            reqwest::multipart::Part::text(metadata.to_string()).mime_str("application/json")?,
+        );
+        for module in bundle.modules() {
+            let part = reqwest::multipart::Part::bytes(module.contents.clone())
+                .file_name(module.path.clone())
+                .mime_str(module.kind.content_type())
+                .with_context(|| format!("model MIME type for {}", module.path))?;
+            form = form.part(module.path.clone(), part);
+        }
+        self.send_ok(
+            self.request(
+                Method::PUT,
+                &format!("/accounts/{account_id}/workers/scripts/{script}"),
+            )
+            .multipart(form),
+            &format!("create Worker {script:?}"),
+            false,
+        )
+        .await?;
+        let versions = self.list_versions(account_id, script).await?;
+        versions
+            .into_iter()
+            .find(|v| {
+                v.annotations
+                    .get("workers/tag")
+                    .map(|s| s.as_str())
+                    == Some(&operation_tag)
+            })
+            .with_context(|| {
+                format!(
+                    "Worker {script:?} was created but the initial version \
+                     carrying tag {operation_tag:?} could not be located"
+                )
+            })
+    }
+
     /// Upload an inert Worker version. This operation is intentionally not
     /// retried because a timed-out creation can be reconciled by listing
     /// versions and matching the deterministic bundle annotation.
@@ -485,8 +550,7 @@ impl CfClient {
             "strategy": "percentage",
             "versions": [{ "version_id": version_id, "percentage": 100 }],
             "annotations": {
-                "workers/message": operation_message,
-                "workers/triggered_by": "veilweave"
+                "workers/message": operation_message
             }
         });
         let result = self
@@ -549,14 +613,32 @@ impl CfClient {
         account_id: &str,
         script: &str,
     ) -> Result<Vec<WorkerVersion>> {
-        self.send(
-            self.get(&format!(
-                "/accounts/{account_id}/workers/scripts/{script}/versions"
-            )),
-            "list Worker versions",
-            true,
-        )
-        .await
+        let raw: serde_json::Value = self
+            .send(
+                self.get(&format!(
+                    "/accounts/{account_id}/workers/scripts/{script}/versions"
+                )),
+                "list Worker versions",
+                true,
+            )
+            .await?;
+        let items = raw
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut versions = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            match serde_json::from_value::<WorkerVersion>(item.clone()) {
+                Ok(version) => versions.push(version),
+                Err(e) => {
+                    eprintln!("DEBUG: failed to deserialize version[{i}]: {e}");
+                    eprintln!("DEBUG: raw version[{i}] = {}", serde_json::to_string_pretty(item).unwrap_or_default());
+                    return Err(e).context(format!("deserialize WorkerVersion from versions list at index {i}"));
+                }
+            }
+        }
+        Ok(versions)
     }
 
     pub async fn list_deployments(
@@ -564,14 +646,27 @@ impl CfClient {
         account_id: &str,
         script: &str,
     ) -> Result<Vec<WorkerDeployment>> {
-        self.send(
-            self.get(&format!(
-                "/accounts/{account_id}/workers/scripts/{script}/deployments"
-            )),
-            "list Worker deployments",
-            true,
-        )
-        .await
+        let raw: serde_json::Value = self
+            .send(
+                self.get(&format!(
+                    "/accounts/{account_id}/workers/scripts/{script}/deployments"
+                )),
+                "list Worker deployments",
+                true,
+            )
+            .await?;
+        let items = raw
+            .get("deployments")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut deployments = Vec::with_capacity(items.len());
+        for item in items {
+            let deployment: WorkerDeployment = serde_json::from_value(item)
+                .context("deserialize WorkerDeployment from deployments list")?;
+            deployments.push(deployment);
+        }
+        Ok(deployments)
     }
 
     pub async fn delete_worker(&self, account_id: &str, script: &str) -> Result<()> {
@@ -818,7 +913,7 @@ fn safe_body_preview(bytes: &[u8]) -> String {
 #[derive(Deserialize)]
 struct Envelope<T> {
     success: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     errors: Vec<ApiError>,
     result: Option<T>,
 }
@@ -874,18 +969,19 @@ pub struct WorkerVersion {
     pub number: Option<u64>,
     #[serde(default)]
     pub created_on: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub annotations: std::collections::BTreeMap<String, String>,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerDeployment {
     pub id: String,
     #[serde(default)]
     pub created_on: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub versions: Vec<DeploymentVersion>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub annotations: std::collections::BTreeMap<String, String>,
 }
 
@@ -1442,7 +1538,7 @@ mod tests {
             MockResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: r#"{"success":true,"errors":[],"result":[{"id":"version-reconciled","annotations":{"workers/tag":"test-operation"}}]}"#.into(),
+                body: r#"{"success":true,"errors":[],"result":{"items":[{"id":"version-reconciled","annotations":{"workers/tag":"test-operation"}}]}}"#.into(),
             },
         ])
         .await;
@@ -1471,7 +1567,7 @@ mod tests {
             MockResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: r#"{"success":true,"errors":[],"result":[{"id":"deployment-reconciled","versions":[{"version_id":"version-1","percentage":100}],"annotations":{"workers/message":"promote [vw-op:test-operation]"}}]}"#.into(),
+                body: r#"{"success":true,"errors":[],"result":{"deployments":[{"id":"deployment-reconciled","versions":[{"version_id":"version-1","percentage":100}],"annotations":{"workers/message":"promote [vw-op:test-operation]"}}]}}"#.into(),
             },
         ])
         .await;
@@ -1568,7 +1664,7 @@ mod tests {
             MockResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: r#"{"success":true,"errors":[],"result":{"id":"deployment-2","versions":[{"version_id":"version-2","percentage":100}]}}"#.into(),
+                body: r#"{"success":true,"errors":[],"result":{"id":"deployment-2","versions":[{"version_id":"version-2","percentage":100}],"annotations":{}}}"#.into(),
             },
         ])
         .await;
@@ -1600,7 +1696,6 @@ mod tests {
         assert!(second.starts_with("POST /accounts/account/workers/scripts/sub-worker/deployments"));
         assert!(second.contains(r#""version_id":"version-2""#));
         assert!(second.contains(r#""percentage":100"#));
-        assert!(second.contains(r#""workers/triggered_by":"veilweave""#));
         task.abort();
     }
 
