@@ -200,6 +200,12 @@ starts checksum-pinned Xray, and performs HTTPS through SOCKS to both an
 ordinary domain and a Cloudflare-hosted target (the proxyIP fallback case).
 Cleanup verifies Workers, KV, and Durable Object namespace removal.
 
+The Environment must define `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_WORKERS_SUBDOMAIN`. Custom-hostname
+runs also require `CLOUDFLARE_TEST_ZONE_ID` and `CLOUDFLARE_TEST_ZONE_NAME`.
+The workflow fails before installing build dependencies when any required name
+is absent.
+
 The Release workflow calls this E2E first. It packages the exact canonical
 Worker bundles uploaded by the passing E2E job, then builds CLI/desktop assets,
 signed updater metadata, SHA-256 sums, and an SBOM. Compile-only artifacts cannot

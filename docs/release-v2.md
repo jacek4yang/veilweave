@@ -14,6 +14,19 @@ by the Release workflow. Its credentials exist only in the protected
 them. Names include the Actions run ID/attempt and are confined to the dedicated
 test account. Cleanup is trapped for every exit.
 
+Configure these Environment secrets before approving a run:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_WORKERS_SUBDOMAIN`
+
+`CLOUDFLARE_TEST_ZONE_ID` and `CLOUDFLARE_TEST_ZONE_NAME` are additionally
+required only when the `custom_hostname` input is non-empty. Keep the token
+scoped to the disposable test account and only the Worker, KV, Durable Object,
+Workers Custom Domain, and DNS permissions required by the selected endpoint
+mode. The workflow performs this presence check before installing or compiling
+anything and reports missing names without printing values.
+
 The job:
 
 1. builds and validates the exact canonical relay/Sub bundles;

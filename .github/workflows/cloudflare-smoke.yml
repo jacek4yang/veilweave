@@ -57,6 +57,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate protected environment configuration
+        shell: bash
+        run: |
+          missing=()
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing+=(CLOUDFLARE_API_TOKEN)
+          [ -n "$CF_ACCOUNT_ID" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
+          [ -n "$CF_WORKERS_SUBDOMAIN" ] || missing+=(CLOUDFLARE_WORKERS_SUBDOMAIN)
+          if [ -n "$VW_CUSTOM_HOSTNAME" ]; then
+            [ -n "$CF_TEST_ZONE_ID" ] || missing+=(CLOUDFLARE_TEST_ZONE_ID)
+            [ -n "$CF_TEST_ZONE_NAME" ] || missing+=(CLOUDFLARE_TEST_ZONE_NAME)
+          fi
+          if [ "${#missing[@]}" -ne 0 ]; then
+            for name in "${missing[@]}"; do
+              echo "::error::Protected environment cloudflare-smoke is missing secret $name"
+            done
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
