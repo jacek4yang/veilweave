@@ -88,13 +88,11 @@ impl FromStr for Uuid {
                 hi = Some(n);
             }
         }
-        if hi.is_some() || idx != 32 {
+        if hi.is_some() || idx != 16 {
             return Err(Error::InvalidFormat);
         }
         let mut bytes = [0u8; 16];
-        for i in 0..16 {
-            bytes[i] = hex[i * 2] << 4 | hex[i * 2 + 1];
-        }
+        bytes.copy_from_slice(&hex[..16]);
         Ok(Self(bytes))
     }
 }
@@ -201,5 +199,46 @@ impl core::fmt::Debug for UuidCodec {
             .field("k_enc", &"[REDACTED]")
             .field("k_mac", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GOLDEN: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0xa4, 0xcb, 0x66, 0x0a, 0x88, 0x1b, 0xb2, 0x75, 0xd3, 0x97, 0x06,
+        0x5b,
+    ];
+
+    #[test]
+    fn sub_v1_golden_uuid_decodes_proxyip_payload() {
+        let payload = UuidCodec::new(b"veilweave-golden-v1")
+            .decode(&Uuid::from_bytes(GOLDEN))
+            .unwrap();
+        assert_eq!(payload.type_byte, 0x01);
+        assert_eq!(payload.ipv4, [203, 0, 113, 9]);
+        assert_eq!(payload.port, 443);
+    }
+
+    #[test]
+    fn wrong_secret_and_modified_mac_are_rejected() {
+        assert_eq!(
+            UuidCodec::new(b"wrong-relay-secret").decode(&Uuid::from_bytes(GOLDEN)),
+            Err(Error::InvalidMac)
+        );
+        let mut modified = GOLDEN;
+        modified[15] ^= 1;
+        assert_eq!(
+            UuidCodec::new(b"veilweave-golden-v1").decode(&Uuid::from_bytes(modified)),
+            Err(Error::InvalidMac)
+        );
+    }
+
+    #[test]
+    fn uuid_text_parser_accepts_canonical_golden_value() {
+        let uuid: Uuid = "01234567-a4cb-660a-881b-b275d397065b".parse().unwrap();
+        assert_eq!(uuid.as_bytes(), &GOLDEN);
+        assert_eq!(uuid.to_string(), "01234567-a4cb-660a-881b-b275d397065b");
     }
 }

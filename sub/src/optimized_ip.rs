@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use worker::*;
 
 const OPTIMIZED_IP_CACHE_KEY: &str = "optimized_ips_v4";
-const OPTIMIZED_IP_CACHE_TTL: u64 = 86400; // 24 hours
 const UOUIN_URL: &str = "https://api.uouin.com/cloudflare.html";
 const ENDPOINTS: [(&str, &str); 3] = [
     ("ct", "https://cf.090227.xyz/ct"),
@@ -36,8 +35,9 @@ impl OptimizedIPs {
     }
 }
 
-/// Fetch the carrier entry-IP lists, cached 24h in KV.
-pub async fn fetch_optimized_ips(kv: Option<&KvStore>) -> Result<OptimizedIPs, String> {
+/// Read the last prepared carrier entry-IP list. A miss is intentionally cheap:
+/// callers fall back to the relay hostname rather than fetching on `/sub`.
+pub async fn load_cached_optimized_ips(kv: Option<&KvStore>) -> Result<OptimizedIPs, String> {
     if let Some(kv_ref) = kv {
         if let Ok(Some(cached)) = kv_ref.get(OPTIMIZED_IP_CACHE_KEY).text().await {
             if let Ok(parsed) = serde_json::from_str::<OptimizedIPs>(&cached) {
@@ -48,6 +48,12 @@ pub async fn fetch_optimized_ips(kv: Option<&KvStore>) -> Result<OptimizedIPs, S
         }
     }
 
+    Err("optimized IP cache is unavailable".to_string())
+}
+
+/// Refresh optional carrier entry IPs from their external sources. This runs
+/// only on the scheduled path and never gates proxyIP promotion.
+pub async fn refresh_optimized_ips(kv: Option<&KvStore>) -> Result<OptimizedIPs, String> {
     let mut result = OptimizedIPs::default();
 
     // Source 1 (richer, latency-sorted): uouin HTML table.
@@ -78,7 +84,7 @@ pub async fn fetch_optimized_ips(kv: Option<&KvStore>) -> Result<OptimizedIPs, S
     if let Some(kv_ref) = kv {
         if let Ok(serialized) = serde_json::to_string(&result) {
             if let Ok(put) = kv_ref.put(OPTIMIZED_IP_CACHE_KEY, &serialized) {
-                let _ = put.expiration_ttl(OPTIMIZED_IP_CACHE_TTL).execute().await;
+                let _ = put.execute().await;
             }
         }
     }

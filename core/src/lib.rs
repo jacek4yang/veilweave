@@ -15,4 +15,5 @@ pub mod deploy;
 pub mod network;
 pub mod recover;
 pub mod spec;
+pub mod subscription;
 pub mod util;

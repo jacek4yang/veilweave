@@ -13,13 +13,18 @@ use crate::config::{
 };
 use crate::credentials::{CredentialManager, SecretValue};
 use crate::network::NetworkManager;
+use crate::subscription;
 use anyhow::{bail, Context, Result};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+const PROXYIP_REFRESH_CRON: &str = "17 */6 * * *";
 
 #[derive(Debug, Clone)]
 pub enum BundleSource {
@@ -274,6 +279,7 @@ enum Compensation {
     Worker {
         account_id: String,
         script: String,
+        ownership: crate::cfapi::WorkerOwnership,
     },
     Deployment {
         account_id: String,
@@ -284,6 +290,11 @@ enum Compensation {
         account_id: String,
         script: String,
         previous: bool,
+    },
+    CronSchedules {
+        account_id: String,
+        script: String,
+        previous: Vec<String>,
     },
     Domain {
         account_id: String,
@@ -352,9 +363,13 @@ impl Transaction {
                         .await;
                     (format!("KV namespace {namespace_id}"), result)
                 }
-                Compensation::Worker { account_id, script } => {
+                Compensation::Worker {
+                    account_id,
+                    script,
+                    ownership,
+                } => {
                     let result = clients[&account_id]
-                        .delete_worker(&account_id, &script)
+                        .delete_managed_worker(&account_id, &script, ownership)
                         .await;
                     (format!("Worker {script}"), result)
                 }
@@ -386,6 +401,17 @@ impl Transaction {
                         .set_workers_dev(&account_id, &script, previous)
                         .await;
                     (format!("workers.dev state for {script}"), result)
+                }
+                Compensation::CronSchedules {
+                    account_id,
+                    script,
+                    previous,
+                } => {
+                    let result = clients[&account_id]
+                        .set_cron_schedules(&account_id, &script, &previous)
+                        .await
+                        .map(|_| ());
+                    (format!("Cron Triggers for {script}"), result)
                 }
                 Compensation::Domain {
                     account_id,
@@ -709,6 +735,7 @@ async fn apply_relay(
             Some(Compensation::Worker {
                 account_id: account.account_id.clone(),
                 script: spec.worker_name.clone(),
+                ownership: crate::cfapi::WorkerOwnership::VeilweaveRelay,
             }),
         );
     } else {
@@ -764,7 +791,7 @@ async fn apply_relay(
         endpoint
             .primary_hostname()
             .context("relay has no primary endpoint")?,
-        None,
+        EndpointRole::Relay,
         endpoint.primary == PrimaryEndpoint::CustomDomain
             && endpoint
                 .custom_domains
@@ -991,6 +1018,7 @@ async fn apply_sub(
             Some(Compensation::Worker {
                 account_id: account.account_id.clone(),
                 script: spec.worker_name.clone(),
+                ownership: crate::cfapi::WorkerOwnership::VeilweaveSub,
             }),
         );
     } else {
@@ -1028,6 +1056,25 @@ async fn apply_sub(
             previous_version_id: previous.as_ref().map(|state| state.0.clone()),
         }),
     );
+    let previous_schedules = client
+        .get_cron_schedules(&account.account_id, &spec.worker_name)
+        .await?;
+    let refresh_schedules = vec![PROXYIP_REFRESH_CRON.to_string()];
+    if previous_schedules != refresh_schedules {
+        client
+            .set_cron_schedules(&account.account_id, &spec.worker_name, &refresh_schedules)
+            .await?;
+        transaction.record(
+            format!("Cron Triggers for {}", spec.worker_name),
+            ResourceDisposition::Updated,
+            format!("automatic proxyIP refresh: {PROXYIP_REFRESH_CRON}"),
+            Some(Compensation::CronSchedules {
+                account_id: account.account_id.clone(),
+                script: spec.worker_name.clone(),
+                previous: previous_schedules,
+            }),
+        );
+    }
     let endpoint = apply_endpoint(
         client,
         account,
@@ -1042,7 +1089,9 @@ async fn apply_sub(
         endpoint
             .primary_hostname()
             .context("sub has no primary endpoint")?,
-        Some(token.expose()),
+        EndpointRole::Subscription {
+            token: token.expose(),
+        },
         endpoint.primary == PrimaryEndpoint::CustomDomain
             && endpoint
                 .custom_domains
@@ -1095,8 +1144,7 @@ async fn apply_sub(
             subscription_token_ref: token_ref,
             max_nodes: spec.settings.max_nodes,
             fingerprint: spec.settings.fingerprint.clone(),
-            disable_builtin_proxyip: spec.settings.disable_builtin_proxyip,
-            proxyip_list: spec.settings.proxyip_list.clone(),
+            ech: spec.settings.ech.clone(),
         }),
     };
     Ok((
@@ -1274,23 +1322,70 @@ fn domain_binding(
     }
 }
 
-/// DNS servers to poll for propagation verification.
-const DNS_SERVERS: &[&str] = &[
-    "1.1.1.1:53",     // Cloudflare
-    "8.8.8.8:53",     // Google
-    "208.67.222.222:53", // OpenDNS
-];
-
 /// Maximum time to wait for Custom Domain TLS provisioning.
 const CUSTOM_DOMAIN_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Interval between DNS/HTTPS checks during provisioning.
+/// Interval between policy-aware HTTPS checks during provisioning.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+const MAX_MANAGEMENT_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_RELAY_READINESS_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy)]
+enum EndpointRole<'a> {
+    Relay,
+    Subscription { token: &'a str },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProxyIpCacheStatus {
+    pub source: String,
+    pub validation: String,
+    pub revision: Option<String>,
+    pub last_success_ms: Option<u64>,
+    pub age_ms: Option<u64>,
+    pub stale: bool,
+    pub accepted_count: Option<usize>,
+    pub rejected_count: Option<usize>,
+    pub stored_count: Option<usize>,
+    pub country_count: Option<usize>,
+    pub last_failure: Option<ProxyIpRefreshFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProxyIpRefreshFailure {
+    pub at_ms: u64,
+    pub code: String,
+    pub message: String,
+}
+
+impl ProxyIpCacheStatus {
+    fn is_usable(&self) -> bool {
+        self.source == "https://zip.cm.edu.kg/all.json"
+            && self.validation == "valid"
+            && self
+                .revision
+                .as_deref()
+                .is_some_and(|revision| !revision.is_empty())
+            && self.accepted_count.is_some_and(|count| count > 0)
+            && self.stored_count.is_some_and(|count| count > 0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProxyIpRefreshReport {
+    pub source: String,
+    pub revision: String,
+    pub accepted_count: usize,
+    pub rejected_count: usize,
+    pub stored_count: usize,
+    pub country_count: usize,
+}
 
 async fn verify_endpoint(
     network: &NetworkManager,
     hostname: &str,
-    subscription_token: Option<&str>,
+    role: EndpointRole<'_>,
     certificate_provisioning: bool,
     log: &mut (dyn FnMut(LogLine) + Send),
 ) -> Result<()> {
@@ -1300,276 +1395,290 @@ async fn verify_endpoint(
         format!("verifying https://{hostname}"),
     ));
 
-    let url = match subscription_token {
-        Some(token) => format!("https://{hostname}/sub?token={token}"),
-        None => format!("https://{hostname}/"),
-    };
-
-    // For Custom Domains with provisioning certificates, poll DNS and HTTPS
-    // until the endpoint is reachable or we time out.
+    // Custom DNS sockets would bypass explicit SOCKS/HTTP proxy policy. Poll
+    // the HTTPS endpoint through the configured transport instead; a valid
+    // response proves DNS, TLS, and Worker routing are all ready on that path.
     if certificate_provisioning {
         let deadline = Instant::now() + CUSTOM_DOMAIN_TIMEOUT;
         let mut attempt = 0u32;
 
         loop {
             attempt += 1;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-
-            // Step 1: Check DNS resolution using multiple servers.
-            let dns_ok = check_dns_propagation(hostname, log).await;
-            if dns_ok {
-                log(LogLine::new(
-                    LogKind::Info,
-                    DeployStage::WaitingForEndpoint,
-                    format!("{hostname}: DNS propagated (attempt {attempt})"),
-                ));
-            } else if remaining.is_zero() {
-                log(LogLine::new(
-                    LogKind::Warn,
-                    DeployStage::WaitingForEndpoint,
-                    format!(
-                        "{hostname}: DNS not propagated after {}s; deployment retained",
-                        CUSTOM_DOMAIN_TIMEOUT.as_secs()
-                    ),
-                ));
-                return Ok(());
-            } else {
-                log(LogLine::new(
-                    LogKind::Step,
-                    DeployStage::WaitingForEndpoint,
-                    format!(
-                        "{hostname}: waiting for DNS propagation ({:.0}s remaining, attempt {attempt})",
-                        remaining.as_secs_f64()
-                    ),
-                ));
-                tokio::time::sleep(CHECK_INTERVAL).await;
-                continue;
-            }
-
-            // Step 2: DNS is resolved, try HTTPS.
-            match network.snapshot().client().get(&url).send().await {
-                Ok(response) if response.status().is_server_error() => {
-                    bail!("endpoint {hostname} returned HTTP {}", response.status())
-                }
-                Ok(response) => {
+            match probe_endpoint(network, hostname, role).await {
+                Ok(()) => {
                     log(LogLine::new(
                         LogKind::Info,
                         DeployStage::Verifying,
                         format!(
-                            "endpoint {hostname} reachable (HTTP {}) after {:.0}s",
-                            response.status(),
-                            (CUSTOM_DOMAIN_TIMEOUT - remaining).as_secs_f64()
+                            "endpoint {hostname} became ready after {}s (attempt {attempt})",
+                            CUSTOM_DOMAIN_TIMEOUT
+                                .saturating_sub(deadline.saturating_duration_since(Instant::now()))
+                                .as_secs()
                         ),
                     ));
-                    return Ok(());
+                    break;
                 }
-                Err(error) if remaining.is_zero() => {
-                    log(LogLine::new(
-                        LogKind::Warn,
-                        DeployStage::WaitingForEndpoint,
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(error).with_context(|| {
                         format!(
-                            "Custom Domain {hostname} is attached but TLS still not ready after {}s: {}; deployment retained",
-                            CUSTOM_DOMAIN_TIMEOUT.as_secs(),
-                            error.without_url()
-                        ),
-                    ));
-                    return Ok(());
+                            "Custom Domain {hostname} did not become healthy within {} seconds",
+                            CUSTOM_DOMAIN_TIMEOUT.as_secs()
+                        )
+                    });
                 }
-                Err(_error) => {
+                Err(_) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     log(LogLine::new(
                         LogKind::Step,
                         DeployStage::WaitingForEndpoint,
                         format!(
-                            "{hostname}: DNS ready but TLS still provisioning ({:.0}s remaining)",
-                            remaining.as_secs_f64()
+                            "{hostname}: waiting for DNS/TLS/Worker readiness ({}s remaining, attempt {attempt})",
+                            remaining.as_secs()
                         ),
                     ));
-                    tokio::time::sleep(CHECK_INTERVAL).await;
+                    tokio::time::sleep(CHECK_INTERVAL.min(remaining)).await;
                 }
             }
         }
+    } else {
+        probe_endpoint(network, hostname, role)
+            .await
+            .with_context(|| {
+                format!("endpoint {hostname} failed role-aware readiness verification")
+            })?;
     }
 
-    // Non-provisioning path: single attempt.
-    match network.snapshot().client().get(&url).send().await {
-        Ok(response) if response.status().is_server_error() => {
-            bail!("endpoint {hostname} returned HTTP {}", response.status())
-        }
-        Ok(response) => {
+    match role {
+        EndpointRole::Relay => {
             log(LogLine::new(
                 LogKind::Info,
                 DeployStage::Verifying,
-                format!("endpoint {hostname} reachable (HTTP {})", response.status()),
+                format!(
+                    "relay {hostname}: camouflage route is ready; VLESS transport requires the protected live E2E gate"
+                ),
             ));
             Ok(())
         }
-        Err(error) => {
-            Err(error.without_url()).with_context(|| format!("endpoint {hostname} is unreachable"))
+        EndpointRole::Subscription { token } => {
+            ensure_proxyip_dataset(network, hostname, token, log).await?;
+            verify_subscription_endpoint(network, hostname, token, log).await
         }
     }
 }
 
-/// Check if the hostname resolves via multiple public DNS servers.
-/// Returns `true` if at least one server returns a valid address.
-async fn check_dns_propagation(hostname: &str, log: &mut (dyn FnMut(LogLine) + Send)) -> bool {
-    let mut resolved_count = 0u32;
-
-    for dns_server in DNS_SERVERS {
-        match resolve_via_dns(hostname, dns_server).await {
-            Ok(addrs) if !addrs.is_empty() => {
-                resolved_count += 1;
-            }
-            Ok(_) => {}
-            Err(_) => {}
-        }
-    }
-
-    if resolved_count == 0 {
-        log(LogLine::new(
-            LogKind::Step,
-            DeployStage::WaitingForEndpoint,
-            format!("{hostname}: not yet resolvable from any DNS server"),
-        ));
-    }
-
-    resolved_count > 0
-}
-
-/// Resolve a hostname using a specific DNS server via UDP.
-/// Falls back to system resolver if direct DNS fails.
-async fn resolve_via_dns(
+async fn probe_endpoint(
+    network: &NetworkManager,
     hostname: &str,
-    dns_server: &str,
-) -> Result<Vec<std::net::IpAddr>> {
-    use std::net::SocketAddr;
-
-    // Try system resolver first (fastest, works in most environments).
-    if let Ok(addrs) = tokio::net::lookup_host((hostname, 443)).await {
-        let ips: Vec<_> = addrs.map(|a| a.ip()).collect();
-        if !ips.is_empty() {
-            return Ok(ips);
+    role: EndpointRole<'_>,
+) -> Result<()> {
+    match role {
+        EndpointRole::Relay => verify_relay_readiness(network, hostname).await,
+        EndpointRole::Subscription { token } => {
+            proxyip_status(network, hostname, token).await.map(|_| ())
         }
     }
-
-    // Fallback: UDP DNS query to the specific server.
-    let server: SocketAddr = dns_server.parse().context("invalid DNS server address")?;
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .context("bind UDP socket")?;
-
-    // Build a minimal DNS A-record query.
-    let query = build_dns_query(hostname)?;
-    socket
-        .send_to(&query, server)
-        .await
-        .context("send DNS query")?;
-
-    let mut buf = vec![0u8; 512];
-    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
-        .await
-        .context("DNS response timeout")?
-        .context("receive DNS response")?;
-
-    buf.truncate(len);
-    parse_dns_response(&buf)
 }
 
-/// Build a minimal DNS A-record query packet.
-fn build_dns_query(hostname: &str) -> Result<Vec<u8>> {
-    let mut packet = Vec::with_capacity(64);
-
-    // Transaction ID
-    packet.extend_from_slice(&[0xAB, 0xCD]);
-    // Flags: standard query, recursion desired
-    packet.extend_from_slice(&[0x01, 0x00]);
-    // Questions: 1
-    packet.extend_from_slice(&[0x00, 0x01]);
-    // Answer/Authority/Additional: 0
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-
-    // QNAME
-    for label in hostname.split('.') {
-        if label.len() > 63 {
-            bail!("DNS label too long: {label:?}");
-        }
-        packet.push(label.len() as u8);
-        packet.extend_from_slice(label.as_bytes());
+async fn verify_relay_readiness(network: &NetworkManager, hostname: &str) -> Result<()> {
+    let response = network
+        .snapshot()
+        .client()
+        .get(format!("https://{hostname}/"))
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("relay {hostname} is unreachable"))?;
+    if response.status() != StatusCode::OK {
+        bail!(
+            "relay {hostname} returned HTTP {}; expected HTTP 200",
+            response.status()
+        );
     }
-    packet.push(0); // root label
-
-    // QTYPE: A (1)
-    packet.extend_from_slice(&[0x00, 0x01]);
-    // QCLASS: IN (1)
-    packet.extend_from_slice(&[0x00, 0x01]);
-
-    Ok(packet)
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .context("relay readiness response is missing a valid Content-Type")?;
+    if !content_type.to_ascii_lowercase().starts_with("text/html") {
+        bail!("relay readiness response is not HTML");
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("read relay readiness response")?;
+    if body.len() > MAX_RELAY_READINESS_BYTES {
+        bail!("relay readiness response is unexpectedly large");
+    }
+    let body = std::str::from_utf8(&body).context("relay readiness response is not UTF-8")?;
+    if !body.contains("Apache2 Debian Default Page") {
+        bail!("relay readiness response is not the expected Veilweave camouflage page");
+    }
+    Ok(())
 }
 
-/// Parse A-record IP addresses from a DNS response packet.
-fn parse_dns_response(packet: &[u8]) -> Result<Vec<std::net::IpAddr>> {
-    if packet.len() < 12 {
-        bail!("DNS response too short");
+async fn proxyip_status(
+    network: &NetworkManager,
+    hostname: &str,
+    token: &str,
+) -> Result<ProxyIpCacheStatus> {
+    let response = network
+        .snapshot()
+        .client()
+        .get(format!("https://{hostname}/_veilweave/proxyip/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("subscription management endpoint {hostname} is unreachable"))?;
+    parse_management_response(response, "proxyIP status").await
+}
+
+async fn ensure_proxyip_dataset(
+    network: &NetworkManager,
+    hostname: &str,
+    token: &str,
+    log: &mut (dyn FnMut(LogLine) + Send),
+) -> Result<()> {
+    let status = proxyip_status(network, hostname, token).await?;
+    if status.source != "https://zip.cm.edu.kg/all.json" {
+        bail!("subscription Worker reported an unexpected proxyIP source");
+    }
+    if status.is_usable() {
+        log(LogLine::new(
+            if status.stale {
+                LogKind::Warn
+            } else {
+                LogKind::Info
+            },
+            DeployStage::Verifying,
+            format!(
+                "proxyIP cache ready: revision {}, {} stored endpoints{}",
+                status.revision.as_deref().unwrap_or("unknown"),
+                status.stored_count.unwrap_or(0),
+                if status.stale {
+                    " (stale known-good)"
+                } else {
+                    ""
+                }
+            ),
+        ));
+        return Ok(());
     }
 
-    let answer_count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
-    let mut offset = 12usize;
+    log(LogLine::new(
+        LogKind::Step,
+        DeployStage::Verifying,
+        "proxyIP cache is empty; initializing it from zip.cm.edu.kg/all.json",
+    ));
+    let refreshed = refresh_proxyip_dataset(network, hostname, token).await?;
+    log(LogLine::new(
+        LogKind::Info,
+        DeployStage::Verifying,
+        format!(
+            "proxyIP cache initialized: revision {}, {} stored endpoints",
+            refreshed.revision, refreshed.stored_count
+        ),
+    ));
+    Ok(())
+}
 
-    // Skip questions.
-    for _ in 0..u16::from_be_bytes([packet[4], packet[5]]) {
-        while offset < packet.len() && packet[offset] != 0 {
-            if packet[offset] & 0xC0 == 0xC0 {
-                offset += 2;
-                break;
-            }
-            offset += 1 + packet[offset] as usize;
-        }
-        if offset < packet.len() && packet[offset] == 0 {
-            offset += 1;
-        }
-        offset += 4; // QTYPE + QCLASS
+async fn refresh_proxyip_dataset(
+    network: &NetworkManager,
+    hostname: &str,
+    token: &str,
+) -> Result<ProxyIpRefreshReport> {
+    let response = network
+        .snapshot()
+        .client()
+        .post(format!("https://{hostname}/_veilweave/proxyip/refresh"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("proxyIP dataset refresh failed for {hostname}"))?;
+    let refreshed: ProxyIpRefreshReport =
+        parse_management_response(response, "proxyIP refresh").await?;
+    if refreshed.source != "https://zip.cm.edu.kg/all.json"
+        || refreshed.revision.is_empty()
+        || refreshed.accepted_count == 0
+        || refreshed.stored_count == 0
+        || refreshed.country_count == 0
+    {
+        bail!("proxyIP refresh returned an unusable dataset summary");
     }
-
-    // Parse answers.
-    let mut addresses = Vec::new();
-    for _ in 0..answer_count {
-        if offset >= packet.len() {
-            break;
-        }
-
-        // Skip name (handle compression).
-        if packet[offset] & 0xC0 == 0xC0 {
-            offset += 2;
-        } else {
-            while offset < packet.len() && packet[offset] != 0 {
-                offset += 1 + packet[offset] as usize;
-            }
-            if offset < packet.len() {
-                offset += 1;
-            }
-        }
-
-        if offset + 10 > packet.len() {
-            break;
-        }
-
-        let rtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
-        offset += 10;
-
-        if rtype == 1 && rdlength == 4 && offset + 4 <= packet.len() {
-            let ip = std::net::Ipv4Addr::new(
-                packet[offset],
-                packet[offset + 1],
-                packet[offset + 2],
-                packet[offset + 3],
-            );
-            addresses.push(ip.into());
-        }
-
-        offset += rdlength;
+    let confirmed = proxyip_status(network, hostname, token).await?;
+    if !confirmed.is_usable() || confirmed.revision.as_deref() != Some(&refreshed.revision) {
+        bail!("proxyIP refresh completed but the promoted known-good cache could not be verified");
     }
+    Ok(refreshed)
+}
 
-    Ok(addresses)
+async fn parse_management_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T> {
+    if response.status() != StatusCode::OK {
+        bail!(
+            "{operation} endpoint returned HTTP {}; expected HTTP 200",
+            response.status()
+        );
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .context("management response is missing a valid Content-Type")?;
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
+        bail!("{operation} endpoint did not return JSON");
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("read {operation} response"))?;
+    if body.is_empty() || body.len() > MAX_MANAGEMENT_RESPONSE_BYTES {
+        bail!("{operation} response has an invalid size");
+    }
+    serde_json::from_slice(&body).with_context(|| format!("parse {operation} response"))
+}
+
+async fn verify_subscription_endpoint(
+    network: &NetworkManager,
+    hostname: &str,
+    token: &str,
+    log: &mut (dyn FnMut(LogLine) + Send),
+) -> Result<()> {
+    let response = network
+        .snapshot()
+        .client()
+        .get(format!("https://{hostname}/sub"))
+        .query(&[("token", token), ("format", "raw")])
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("subscription endpoint {hostname} is unreachable"))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("read subscription verification response")?;
+    let verified = subscription::verify_response(status, &headers, &body)
+        .with_context(|| format!("subscription endpoint {hostname} is not usable"))?;
+    log(LogLine::new(
+        LogKind::Info,
+        DeployStage::Verifying,
+        format!(
+            "subscription {hostname}: HTTP 200, {} structurally valid VLESS nodes",
+            verified.node_count
+        ),
+    ));
+    Ok(())
 }
 
 async fn preflight_ownership(
@@ -1769,6 +1878,62 @@ pub async fn rollback(
     Ok(promoted.id)
 }
 
+/// Read the authenticated, non-secret proxyIP cache summary for a managed Sub.
+pub async fn proxyip_cache_status(
+    deployment_id: Uuid,
+    config: &Config,
+    credentials: &CredentialManager,
+    network: NetworkManager,
+) -> Result<ProxyIpCacheStatus> {
+    let deployment = config
+        .deployments
+        .iter()
+        .find(|deployment| deployment.id == deployment_id)
+        .context("deployment UUID not found")?;
+    if deployment.role != Role::Sub {
+        bail!("proxyIP cache management is available only for a Sub Worker");
+    }
+    let sub = deployment
+        .sub
+        .as_ref()
+        .context("sub deployment has no settings")?;
+    let token = credentials.resolve(&sub.subscription_token_ref)?;
+    let hostname = deployment
+        .primary_domain()
+        .context("Sub primary endpoint is missing")?;
+    let status = proxyip_status(&network, hostname, token.expose()).await?;
+    if status.source != "https://zip.cm.edu.kg/all.json" {
+        bail!("subscription Worker reported an unexpected proxyIP source");
+    }
+    Ok(status)
+}
+
+/// Force one serialized refresh and verify the promoted KV generation.
+pub async fn refresh_proxyip_cache(
+    deployment_id: Uuid,
+    config: &Config,
+    credentials: &CredentialManager,
+    network: NetworkManager,
+) -> Result<ProxyIpRefreshReport> {
+    let deployment = config
+        .deployments
+        .iter()
+        .find(|deployment| deployment.id == deployment_id)
+        .context("deployment UUID not found")?;
+    if deployment.role != Role::Sub {
+        bail!("proxyIP cache management is available only for a Sub Worker");
+    }
+    let sub = deployment
+        .sub
+        .as_ref()
+        .context("sub deployment has no settings")?;
+    let token = credentials.resolve(&sub.subscription_token_ref)?;
+    let hostname = deployment
+        .primary_domain()
+        .context("Sub primary endpoint is missing")?;
+    refresh_proxyip_dataset(&network, hostname, token.expose()).await
+}
+
 /// Code-only update for one managed Worker. Secrets are inherited by binding
 /// name; this path never reads or regenerates Worker secret values.
 pub async fn update_code(
@@ -1828,8 +1993,7 @@ pub async fn update_code(
                 &SubSettings {
                     max_nodes: sub.max_nodes,
                     fingerprint: sub.fingerprint.clone(),
-                    disable_builtin_proxyip: sub.disable_builtin_proxyip,
-                    proxyip_list: sub.proxyip_list.clone(),
+                    ech: sub.ech.clone(),
                 },
                 &bundle.manifest().bundle_sha256,
             )?
@@ -1844,6 +2008,15 @@ pub async fn update_code(
                 .zip(existing.stable_deployment_id.clone())
         })
         .context("no current stable deployment is available for safe rollback")?;
+    let previous_schedules = if existing.role == Role::Sub {
+        Some(
+            client
+                .get_cron_schedules(&account.account_id, &existing.name)
+                .await?,
+        )
+    } else {
+        None
+    };
     log(LogLine::new(
         LogKind::Step,
         DeployStage::UploadingVersion,
@@ -1865,6 +2038,31 @@ pub async fn update_code(
             "Veilweave v2 code-only update",
         )
         .await?;
+    let schedule_changed = previous_schedules
+        .as_ref()
+        .is_some_and(|schedules| schedules.as_slice() != [PROXYIP_REFRESH_CRON]);
+    if schedule_changed {
+        if let Err(schedule_error) = client
+            .set_cron_schedules(
+                &account.account_id,
+                &existing.name,
+                &[PROXYIP_REFRESH_CRON.to_string()],
+            )
+            .await
+        {
+            client
+                .create_deployment(
+                    &account.account_id,
+                    &existing.name,
+                    &previous.0,
+                    "Veilweave rollback after Cron Trigger update failure",
+                )
+                .await
+                .context("Cron Trigger update failed and the Worker rollback also failed")?;
+            return Err(schedule_error)
+                .context("automatic proxyIP Cron Trigger update failed; previous Worker restored");
+        }
+    }
     let subscription_token = match &existing.sub {
         Some(sub) => Some(credentials.resolve(&sub.subscription_token_ref)?),
         None => None,
@@ -1875,28 +2073,52 @@ pub async fn update_code(
             .custom_domains
             .iter()
             .any(|domain| domain.status == DomainStatus::Provisioning);
+    let endpoint_role = match (&existing.role, &subscription_token) {
+        (Role::Relay, None) => EndpointRole::Relay,
+        (Role::Sub, Some(token)) => EndpointRole::Subscription {
+            token: token.expose(),
+        },
+        _ => bail!("deployment role and subscription credentials are inconsistent"),
+    };
     if let Err(health_error) = verify_endpoint(
         &network,
         existing
             .primary_domain()
             .context("deployment has no primary endpoint")?,
-        subscription_token.as_ref().map(SecretValue::expose),
+        endpoint_role,
         provisioning,
         log,
     )
     .await
     {
-        client
+        let deployment_rollback = client
             .create_deployment(
                 &account.account_id,
                 &existing.name,
                 &previous.0,
                 "Veilweave automatic rollback after failed update health check",
             )
-            .await
+            .await;
+        let schedule_rollback = if schedule_changed {
+            client
+                .set_cron_schedules(
+                    &account.account_id,
+                    &existing.name,
+                    previous_schedules.as_deref().unwrap_or(&[]),
+                )
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        deployment_rollback
             .context("new version failed health check and automatic rollback also failed")?;
-        return Err(health_error)
-            .context("new version failed health check; previous stable version restored");
+        schedule_rollback.context(
+            "new version failed health check; Worker restored but Cron Triggers could not be restored",
+        )?;
+        return Err(health_error).context(
+            "new version failed health check; previous Worker and Cron Triggers restored",
+        );
     }
     config.deployments[index].previous_version_id = Some(previous.0);
     config.deployments[index].previous_deployment_id = Some(previous.1);
@@ -1970,8 +2192,7 @@ pub async fn rotate_subscription_token(
         &SubSettings {
             max_nodes: sub.max_nodes,
             fingerprint: sub.fingerprint.clone(),
-            disable_builtin_proxyip: sub.disable_builtin_proxyip,
-            proxyip_list: sub.proxyip_list.clone(),
+            ech: sub.ech.clone(),
         },
         &bundle.manifest().bundle_sha256,
     )?;
@@ -1992,7 +2213,9 @@ pub async fn rotate_subscription_token(
             .endpoint
             .primary_hostname()
             .context("Sub primary endpoint is missing")?,
-        Some(new_token.expose()),
+        EndpointRole::Subscription {
+            token: new_token.expose(),
+        },
         false,
         &mut |_| {},
     )
@@ -2172,7 +2395,9 @@ mod tests {
         let error = verify_endpoint(
             &network,
             "does-not-resolve.invalid",
-            Some("subscription-token-must-not-leak"),
+            EndpointRole::Subscription {
+                token: "subscription-token-must-not-leak",
+            },
             false,
             &mut |line| logs.push(line),
         )

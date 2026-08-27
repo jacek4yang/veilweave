@@ -15,7 +15,6 @@ pub enum Carrier {
 #[derive(Clone, Copy, Debug)]
 pub struct UserGeo {
     pub carrier: Carrier,
-    pub is_domestic: bool,
 }
 
 /// Detect the user's carrier from CF-IPCountry + CF-ASN.
@@ -26,10 +25,7 @@ pub fn detect_user_geo(country: &str, asn: Option<u32>) -> UserGeo {
     } else {
         Carrier::Other
     };
-    UserGeo {
-        carrier,
-        is_domestic,
-    }
+    UserGeo { carrier }
 }
 
 /// Map a Chinese ASN to its carrier.

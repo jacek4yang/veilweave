@@ -21,7 +21,7 @@
       sub: {
         account: "", worker_name: "", kv_title: "", kv_binding: "",
         endpoint: { mode: "workers-dev", primary: "workers-dev", custom_domain: null },
-        settings: { max_nodes: 100, fingerprint: "chrome", disable_builtin_proxyip: false, proxyip_list: [] },
+        settings: { max_nodes: 100, fingerprint: "chrome", ech: null },
       },
       relays: [],
       encryption: false,
@@ -440,8 +440,7 @@
     d.sub.settings = {
       max_nodes: Number(el.querySelector("#dp-max-nodes")?.value || d.sub.settings?.max_nodes || 100),
       fingerprint: el.querySelector("#dp-fingerprint")?.value || d.sub.settings?.fingerprint || "chrome",
-      disable_builtin_proxyip: el.querySelector("#dp-disable-proxyip")?.checked || false,
-      proxyip_list: (el.querySelector("#dp-proxyip-list")?.value || "").split(/[\s,]+/).filter(Boolean),
+      ech: el.querySelector("#dp-ech")?.value.trim() || null,
     };
     d.encryption = el.querySelector("#dp-encryption")?.checked ?? d.encryption;
     el.querySelectorAll(".relay-row").forEach((row) => {
@@ -536,8 +535,7 @@
         <div class="grid-2">
           <div class="field"><label class="field-label">MAX_NODES</label><input id="dp-max-nodes" type="number" min="1" max="1000" value="${esc(d.sub.settings?.max_nodes || 100)}" /></div>
           <div class="field"><label class="field-label">FP</label><select id="dp-fingerprint">${["chrome", "firefox", "safari", "ios", "android", "edge", "random", "randomized"].map((fp) => `<option value="${fp}" ${fp === (d.sub.settings?.fingerprint || "chrome") ? "selected" : ""}>${fp}</option>`).join("")}</select></div>
-          <div class="field"><label class="field-label">PROXYIP_LIST</label><input id="dp-proxyip-list" value="${esc((d.sub.settings?.proxyip_list || []).join(","))}" placeholder="host.example:443" /></div>
-          <label class="check-row"><input id="dp-disable-proxyip" type="checkbox" ${d.sub.settings?.disable_builtin_proxyip ? "checked" : ""} /><span>${t("dp.disableBuiltinProxyip")}</span></label>
+          <div class="field"><label class="field-label">ECH</label><input id="dp-ech" value="${esc(d.sub.settings?.ech || "")}" placeholder="${t("dp.echPlaceholder")}" /></div>
         </div>
       </div>
 
@@ -585,7 +583,7 @@
       el.querySelector("#err-sub-name").textContent = ok ? "" : t("dp.invalidName");
       readDeployForm(el); updateDeployStartBtn(el);
     });
-    ["#dp-sub-account", "#dp-kv-title", "#dp-kv-binding", "#dp-max-nodes", "#dp-fingerprint", "#dp-proxyip-list", "#dp-disable-proxyip"].forEach((sel) =>
+    ["#dp-sub-account", "#dp-kv-title", "#dp-kv-binding", "#dp-max-nodes", "#dp-fingerprint", "#dp-ech"].forEach((sel) =>
       el.querySelector(sel).addEventListener("input", () => { readDeployForm(el); updateSummary(el); }));
     el.querySelector("#dp-encryption").addEventListener("change", (e) => {
       readDeployForm(el);
@@ -758,6 +756,8 @@
                 <td><div class="deploy-row-actions">
                   ${d.sub ? `<button class="btn btn-ghost btn-sm" data-fetch-sub="${esc(d.id)}">${t("mg.copySub")}</button>` : ""}
                   ${d.sub ? `<button class="btn btn-ghost btn-sm" data-rotate-token="${esc(d.id)}">${t("mg.rotateToken")}</button>` : ""}
+                  ${d.sub ? `<button class="btn btn-ghost btn-sm" data-proxyip-status="${esc(d.id)}">${t("mg.proxyip.status")}</button>` : ""}
+                  ${d.sub ? `<button class="btn btn-ghost btn-sm" data-proxyip-refresh="${esc(d.id)}">${t("mg.proxyip.refresh")}</button>` : ""}
                   ${d.previous_version_id ? `<button class="btn btn-ghost btn-sm" data-rollback="${esc(d.id)}">${t("mg.rollback")}</button>` : ""}
                   <button class="btn btn-ghost btn-sm" data-update="${esc(d.account)}|${esc(d.name)}">${t("mg.update")}</button>
                   <button class="btn btn-danger btn-sm" data-del-dep="${esc(d.account)}|${esc(d.name)}">${t("common.delete")}</button>
@@ -807,6 +807,33 @@
         toast(t("mg.tokenRotated"), "success");
         await refresh();
       } catch (err) { toast(String(err), "error", 7000); b.disabled = false; }
+    }));
+
+    el.querySelectorAll("[data-proxyip-status]").forEach((b) => (b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const status = await invoke("get_proxyip_cache_status", { deploymentId: b.dataset.proxyipStatus });
+        const ageMinutes = status.age_ms == null ? "?" : Math.floor(status.age_ms / 60000);
+        toast(t("mg.proxyip.summary", {
+          state: status.stale ? t("mg.proxyip.stale") : status.validation,
+          age: ageMinutes,
+          count: status.stored_count || 0,
+          countries: status.country_count || 0,
+        }), status.validation === "valid" ? "success" : "error", 7000);
+      } catch (err) { toast(String(err), "error", 7000); }
+      finally { b.disabled = false; }
+    }));
+
+    el.querySelectorAll("[data-proxyip-refresh]").forEach((b) => (b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const report = await invoke("refresh_proxyip_cache", { deploymentId: b.dataset.proxyipRefresh });
+        toast(t("mg.proxyip.refreshed", {
+          count: report.stored_count,
+          countries: report.country_count,
+        }), "success", 7000);
+      } catch (err) { toast(String(err), "error", 7000); }
+      finally { b.disabled = false; }
     }));
 
     el.querySelectorAll("[data-update]").forEach((b) => (b.onclick = async () => {

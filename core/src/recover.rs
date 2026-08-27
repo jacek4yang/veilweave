@@ -329,8 +329,7 @@ pub fn adopt_candidate(
                 .context("sub adoption requires a subscription-token credential reference")?,
             max_nodes: 100,
             fingerprint: "chrome".into(),
-            disable_builtin_proxyip: false,
-            proxyip_list: Vec::new(),
+            ech: None,
         })
     } else {
         None

@@ -46,6 +46,9 @@ enum Commands {
         /// TLS SNI (defaults to address)
         #[arg(long)]
         sni: Option<String>,
+        /// Optional client-compatible ECH value (disabled by default)
+        #[arg(long)]
+        ech: Option<String>,
         /// Node display name (defaults to address)
         #[arg(long)]
         name: Option<String>,
@@ -135,6 +138,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Delete one recorded Veilweave deployment and retire its Durable Object.
+    Delete {
+        #[arg(long)]
+        deployment: String,
+        #[arg(long)]
+        proxy: Option<String>,
+    },
     /// Upload and promote embedded code while inheriting existing secrets.
     Update {
         #[arg(long)]
@@ -216,6 +226,12 @@ enum Commands {
         #[command(subcommand)]
         command: ProxyCommand,
     },
+    /// Inspect or refresh the automatic authoritative proxyIP cache.
+    #[command(name = "proxyip", alias = "proxy-ip")]
+    ProxyIp {
+        #[command(subcommand)]
+        command: ProxyIpCommand,
+    },
     /// Manage existing deployments: list them, re-show a subscription URL, or
     /// delete a worker (and its KV namespace) from Cloudflare.
     Manage,
@@ -248,6 +264,28 @@ enum ConfigCommand {
 #[derive(Subcommand)]
 enum ProxyCommand {
     Test {
+        #[arg(long)]
+        proxy: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyIpCommand {
+    /// Show the authenticated compact-cache status for a Sub deployment.
+    Status {
+        #[arg(long)]
+        deployment: String,
+        #[arg(long)]
+        proxy: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force a serialized refresh from https://zip.cm.edu.kg/all.json.
+    Refresh {
+        #[arg(long)]
+        deployment: String,
         #[arg(long)]
         proxy: Option<String>,
         #[arg(long)]
@@ -362,6 +400,7 @@ fn run(command: Commands) -> anyhow::Result<()> {
             proxy_ip,
             proxy_port,
             sni,
+            ech,
             name,
             secret_key,
         } => {
@@ -416,8 +455,17 @@ fn run(command: Commands) -> anyhow::Result<()> {
                 None => "none".to_string(),
             };
 
+            if ech.as_deref().is_some_and(|value| {
+                value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+            }) {
+                bail!("--ech must be non-empty, contain no control characters, and be at most 512 bytes");
+            }
+            let ech_query = ech
+                .as_deref()
+                .map(|value| format!("&ech={}", percent_encode(value)))
+                .unwrap_or_default();
             let url = format!(
-                "vless://{uuid}@{address}:{port}?encryption={encryption}&security=tls&sni={sni}&fp=chrome&alpn=http%2F1.1&type=ws&host={sni}&path={encoded_path}&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query&insecure=0&allowInsecure=0#{encoded_name}"
+                "vless://{uuid}@{address}:{port}?encryption={encryption}&security=tls&sni={sni}&fp=chrome&alpn=http%2F1.1&type=ws&host={sni}&path={encoded_path}{ech_query}&insecure=0&allowInsecure=0#{encoded_name}"
             );
 
             println!("{}", url);
@@ -486,6 +534,7 @@ fn run(command: Commands) -> anyhow::Result<()> {
             yes,
         } => run_async(run_apply(config, bundle_dir, proxy, dry_run, json, yes)),
         Commands::Status { json } => run_async(run_status(json)),
+        Commands::Delete { deployment, proxy } => run_async(run_delete(deployment, proxy)),
         Commands::Update {
             deployment,
             bundle_dir,
@@ -530,6 +579,7 @@ fn run(command: Commands) -> anyhow::Result<()> {
         } => run_async(run_domains(account, proxy, json)),
         Commands::Config { command } => run_async(run_config(command)),
         Commands::Proxy { command } => run_async(run_proxy(command)),
+        Commands::ProxyIp { command } => run_async(run_proxyip(command)),
         Commands::Manage => run_async(wizard::run_manage()),
         Commands::WorkerBundle { command } => run_worker_bundle(command)?,
     }
@@ -695,7 +745,6 @@ async fn run_apply(
         },
     )
     .await?;
-    let subscription_url = outcome.subscription_url(&state, &credentials)?;
     if json {
         println!(
             "{}",
@@ -707,12 +756,15 @@ async fn run_apply(
                 "sub": outcome.sub,
                 "journal": outcome.journal,
                 "events": events,
-                "subscription_url": subscription_url,
             }))?
         );
-    } else if let Some(url) = subscription_url {
+    } else {
         println!("Deployment complete.");
-        println!("Subscription URL: {url}");
+        if outcome.sub.is_some() {
+            println!(
+                "Subscription credentials are stored in the OS credential manager; use `veilweave-tools manage` to reveal the URL interactively."
+            );
+        }
     }
     Ok(())
 }
@@ -753,6 +805,70 @@ async fn run_status(json: bool) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+async fn run_delete(deployment: String, proxy: Option<String>) -> anyhow::Result<()> {
+    let deployment_id = uuid::Uuid::parse_str(&deployment).context("invalid deployment UUID")?;
+    let state = veilweave_core::config::Config::load()?;
+    let index = state
+        .deployments
+        .iter()
+        .position(|candidate| candidate.id == deployment_id)
+        .context("deployment is not present in local metadata")?;
+    let existing = state.deployments[index].clone();
+    let account = state
+        .account(&existing.account_id)
+        .with_context(|| {
+            format!(
+                "account {:?} is not present in local metadata",
+                existing.account_id
+            )
+        })?
+        .clone();
+    let (credentials, network, _) = effective_network(&state.network, proxy.as_deref())?;
+    let token = credentials.resolve(&account.credential_ref)?;
+    let client = veilweave_core::cfapi::CfClient::with_network(token.expose(), network)?;
+
+    for domain in &existing.endpoint.custom_domains {
+        client
+            .detach_domain(&account.account_id, &domain.domain_id)
+            .await
+            .with_context(|| format!("detach Custom Domain {:?}", domain.hostname))?;
+    }
+    let ownership = match existing.role {
+        veilweave_core::config::Role::Relay => {
+            veilweave_core::cfapi::WorkerOwnership::VeilweaveRelay
+        }
+        veilweave_core::config::Role::Sub => veilweave_core::cfapi::WorkerOwnership::VeilweaveSub,
+    };
+    client
+        .delete_managed_worker(&account.account_id, &existing.name, ownership)
+        .await
+        .with_context(|| format!("retire and delete Worker {:?}", existing.name))?;
+    if let Some(sub) = &existing.sub {
+        client
+            .delete_kv_namespace(&account.account_id, &sub.kv_namespace_id)
+            .await
+            .with_context(|| format!("delete KV namespace {:?}", sub.kv_title))?;
+    }
+
+    let mut candidate = state.clone();
+    candidate.deployments.remove(index);
+    candidate.save().context(
+        "remote resources were deleted, but local metadata could not be updated; run recover before another mutation",
+    )?;
+    credentials.delete(&existing.secret_ref)?;
+    if let Some(reference) = &existing.node_secret_ref {
+        credentials.delete(reference)?;
+    }
+    if let Some(sub) = &existing.sub {
+        credentials.delete(&sub.subscription_token_ref)?;
+    }
+    println!(
+        "Deleted deployment {} and retired its Durable Object namespace.",
+        deployment_id
+    );
     Ok(())
 }
 
@@ -1158,6 +1274,91 @@ async fn run_proxy(command: ProxyCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_proxyip(command: ProxyIpCommand) -> anyhow::Result<()> {
+    match command {
+        ProxyIpCommand::Status {
+            deployment,
+            proxy,
+            json,
+        } => {
+            let deployment_id =
+                uuid::Uuid::parse_str(&deployment).context("invalid deployment UUID")?;
+            let state = veilweave_core::config::Config::load()?;
+            let (credentials, network, _) = effective_network(&state.network, proxy.as_deref())?;
+            let status = veilweave_core::deploy::proxyip_cache_status(
+                deployment_id,
+                &state,
+                &credentials,
+                network,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("ProxyIP cache: {}", status.validation);
+                println!("Source: {}", status.source);
+                println!(
+                    "Revision: {}",
+                    status.revision.as_deref().unwrap_or("unavailable")
+                );
+                println!(
+                    "Age: {}",
+                    status
+                        .age_ms
+                        .map(|age| format!("{} minutes", age / 60_000))
+                        .unwrap_or_else(|| "unavailable".into())
+                );
+                println!(
+                    "Accepted/stored/countries: {}/{}/{}{}",
+                    status.accepted_count.unwrap_or(0),
+                    status.stored_count.unwrap_or(0),
+                    status.country_count.unwrap_or(0),
+                    if status.stale {
+                        " (stale known-good)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(failure) = status.last_failure {
+                    println!(
+                        "Last refresh failure: {} — {}",
+                        failure.code, failure.message
+                    );
+                }
+            }
+        }
+        ProxyIpCommand::Refresh {
+            deployment,
+            proxy,
+            json,
+        } => {
+            let deployment_id =
+                uuid::Uuid::parse_str(&deployment).context("invalid deployment UUID")?;
+            let state = veilweave_core::config::Config::load()?;
+            let (credentials, network, _) = effective_network(&state.network, proxy.as_deref())?;
+            let report = veilweave_core::deploy::refresh_proxyip_cache(
+                deployment_id,
+                &state,
+                &credentials,
+                network,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ProxyIP refresh complete: revision {}, {} accepted, {} stored across {} countries.",
+                    report.revision,
+                    report.accepted_count,
+                    report.stored_count,
+                    report.country_count
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn effective_network(
     saved: &veilweave_core::network::NetworkConfig,
     cli_proxy: Option<&str>,
@@ -1412,6 +1613,9 @@ compatibility_date = "{}"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
+[triggers]
+crons = ["17 */6 * * *"]
+
 # Run:  wrangler kv:namespace create {kv_binding}   and paste the id below.
 # The binding name is randomized per bundle; feel free to pick your own —
 # the worker finds its namespace via the KV_BINDING var below, so just keep
@@ -1420,11 +1624,19 @@ workers_dev = true
 binding = "{kv_binding}"
 id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 
+[[durable_objects.bindings]]
+name = "PROXYIP_REFRESHER"
+class_name = "ProxyIpRefresher"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProxyIpRefresher"]
+
 [vars]
 KV_BINDING = "{kv_binding}"
 MAX_NODES = "100"
 FP = "chrome"
-DISABLE_BUILTIN_PROXYIP = "false"
+# ECH = "example-ech-config" # disabled unless explicitly configured
 
 # Set VEILWEAVE_NODES and SUBSCRIPTION_TOKEN with `wrangler secret put`.
 # Never add either value to [vars] or commit it to this file.

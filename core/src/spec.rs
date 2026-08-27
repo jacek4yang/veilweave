@@ -205,8 +205,7 @@ zone_name = "example.com"
 [sub.settings]
 max_nodes = 120
 fingerprint = "chrome"
-disable_builtin_proxyip = false
-proxyip_list = []
+ech = "example-ech-config"
 [[relay]]
 account = "account-id"
 worker = "edge-us"
@@ -226,6 +225,7 @@ zone_name = "example.com"
             PrimaryEndpoint::CustomDomain
         );
         assert_eq!(plan.sub.settings.max_nodes, 120);
+        assert_eq!(plan.sub.settings.ech.as_deref(), Some("example-ech-config"));
     }
 
     #[test]

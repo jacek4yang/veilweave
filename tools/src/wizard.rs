@@ -265,7 +265,13 @@ async fn delete_deployment(theme: &ColorfulTheme, cfg: &mut Config, idx: usize) 
             .await?;
         println!("  ✔ detached Custom Domain {}", domain.hostname);
     }
-    client.delete_worker(&account.account_id, &d.name).await?;
+    let ownership = match d.role {
+        Role::Relay => veilweave_core::cfapi::WorkerOwnership::VeilweaveRelay,
+        Role::Sub => veilweave_core::cfapi::WorkerOwnership::VeilweaveSub,
+    };
+    client
+        .delete_managed_worker(&account.account_id, &d.name, ownership)
+        .await?;
     println!("  ✔ deleted worker {}", d.name);
     if let Some(sub) = &d.sub {
         client
