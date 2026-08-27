@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Automatic six-hour proxyIP refresh from the sole authoritative source,
+  `https://zip.cm.edu.kg/all.json`, through a serialized SQLite Durable Object
+  and compact transactional KV generations with known-good fallback.
+- Strict raw/Base64 subscription contracts, real country/filter selection,
+  authenticated proxyIP status/refresh commands, role-aware health checks, and
+  a protected pinned-Xray Cloudflare E2E/release gate that transports HTTPS.
+- Explicit Durable Object retirement during managed deletion.
+
+### Changed
+
+- Removed the active `PROXYIP_LIST` path and manual proxyIP configuration. Old
+  schema-v2 fields are migration-tolerant but ignored and cleaned on save.
+- ECH is disabled by default, `MAX_NODES` is consistently capped at 200, final
+  subscriptions are rendered fresh, and security-sensitive UUID nonces use
+  WebCrypto.
+- Declarative `apply` output no longer prints bearer subscription URLs.
+
+### Fixed
+
+- Eliminated fake zero-UUID nodes and subscription health false positives.
+- Corrected canonical UUID text decoding, unknown egress-type fallback, and
+  fragmented VLESS header/initial-upload handling in the relay.
+- Removed direct UDP DNS from Custom Domain verification so explicit proxy
+  network policy is respected.
+
 ## [2.0.2] — 2026-08-24
 
 ### Fixed

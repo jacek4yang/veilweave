@@ -28,7 +28,8 @@ limited to the `mlkem768x25519plus.native.1rtt` profile.
 
 The VLESS UUID is the *only* user identity. There is no password or
 per-request HMAC — the UUID itself authenticates the user (because it
-is unforgeable without `SECRET_KEY`) AND carries the egress.
+requires a successful truncated-MAC forgery without `SECRET_KEY`) AND carries
+the egress. The exact security bounds are documented below.
 
 ### Layout
 
@@ -78,6 +79,33 @@ mac         = HMAC-SHA256(k_mac, nonce ‖ ciphertext)[:5]
 A non-blob string is treated as a raw secret (the default since v1.0.0): it
 seeds the codec directly (bytes-as-master) and disables VLESS Encryption
 (the relay needs a `kind=0` blob to have the X25519 private key).
+
+### Security bounds and versioning
+
+- The nonce is exactly 32 bits and must come from a CSPRNG. Collisions become
+  likely around 2^16 generated UUIDs under one key by the birthday bound. A
+  repeated nonce reuses the seven-byte stream and reveals relationships between
+  encrypted payloads, although it does not reveal the signing key.
+- The MAC is exactly 40 bits. An independent online forgery succeeds with
+  probability approximately 2^-40 per attempt. Compare it in constant time and
+  apply platform/rate-limit defenses; do not claim full-length-MAC strength.
+- Encryption hides the seven-byte egress payload from passive observers but
+  does not compensate for the authentication and nonce bounds above.
+- This is signed-capability protocol v1. The 16-byte format is deployed and
+  cannot gain a longer nonce/tag without incompatibility. A stronger format
+  must be introduced as an explicit protocol v2 with negotiation and migration,
+  never by silently changing these bytes.
+
+The fixed golden vector used by both Sub and relay tests is:
+
+```text
+secret: veilweave-golden-v1
+nonce:  01 23 45 67
+type:   proxyip
+IPv4:   203.0.113.9
+port:   443
+wire:   01234567a4cb660a881bb275d397065b
+```
 
 ## 2. VLESS Encryption handshake (server)
 

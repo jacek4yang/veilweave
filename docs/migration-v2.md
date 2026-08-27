@@ -34,3 +34,9 @@ For a Sub Worker, provide `--subscription-token-ref` instead of
 `--node-secret-ref`. Add `--primary custom-domain` when its recovered primary
 endpoint is a Custom Domain. Adoption refuses unrelated, legacy-plaintext, and
 broken bindings; repair or securely rotate those remotely first.
+
+Older schema-v2 files that contain `proxyip_list` or
+`disable_builtin_proxyip` still load so upgrades are not bricked. Those fields
+are ignored as runtime sources and disappear on the next serialization. The
+next explicit Sub update provisions the automatic refresher binding/Cron path;
+`https://zip.cm.edu.kg/all.json` is then the sole authoritative dataset.

@@ -10,9 +10,11 @@ separate Cloudflare orchestration. A deployment follows this sequence:
 3. Reuse exact pre-existing resources or create journalled KV/resources.
 4. Upload an inert Worker version with strict binding inheritance.
 5. Promote that version to 100% through the Deployment API.
-6. converge workers.dev and exact Custom Domain exposure.
-7. Verify the selected primary endpoint.
-8. Atomically persist stable and previous version/deployment IDs.
+6. Configure the Sub Worker six-hour Cron Trigger transactionally.
+7. Converge workers.dev and exact Custom Domain exposure.
+8. Run role-aware health: exact camouflage reachability for relay, and
+   authenticated dataset bootstrap plus strict subscription parsing for Sub.
+9. Atomically persist stable and previous version/deployment IDs.
 
 The transaction records resources as pre-existing, created, or updated. On an
 error, compensations run in reverse order and never delete pre-existing user
@@ -50,6 +52,17 @@ The relay's initial version declares `VeilweaveSession` as a SQLite Durable
 Object. Later code versions preserve the binding and omit class creation, so an
 initial migration is not replayed. Rollback promotes the stored previous stable
 version; the last known-good version is not deleted.
+
+The Sub Worker declares `ProxyIpRefresher` on initial and later versions. The
+declarative export safely creates the namespace when upgrading an older Sub
+Worker that lacks it and matches the existing namespace otherwise. Code-only
+updates snapshot the prior Cron schedules and restore both the prior Worker
+version and schedules if configuration or health fails.
+
+Deleting a managed Worker first promotes a minimal version with Cloudflare's
+explicit Durable Object `deleted` export tombstone, then removes the script.
+Sub deletion also removes KV. A raw script DELETE is insufficient because it
+can orphan a class namespace and stored data.
 
 ## Custom Domains
 
