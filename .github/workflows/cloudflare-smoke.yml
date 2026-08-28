@@ -308,10 +308,11 @@ jobs:
             if curl --fail --silent --show-error --socks5-hostname "127.0.0.1:$socks_port" \
                 --connect-timeout 10 --max-time 25 https://example.com/ -o example.html \
                 && grep -Fq "Example Domain" example.html; then
-              cf_status=$(curl --silent --show-error --socks5-hostname "127.0.0.1:$socks_port" \
-                --connect-timeout 10 --max-time 30 -o cf-target.txt -w '%{http_code}' \
-                "https://$SUB_HOST/veilweave-e2e-target")
-              if [ "$cf_status" = 404 ] && grep -Fq "404 Not Found" cf-target.txt; then
+              if curl --fail --silent --show-error --socks5-hostname "127.0.0.1:$socks_port" \
+                  --connect-timeout 10 --max-time 30 -D cf-target.headers -o cf-target.txt \
+                  "$SUB_URL&format=raw&secure=true" \
+                  && python3 scripts/verify_subscription.py --input cf-target.txt --format raw \
+                    --headers cf-target.headers --expect-security tls >/dev/null; then
                 proxy_passed=true
               fi
             fi
@@ -321,7 +322,7 @@ jobs:
             [ "$proxy_passed" = true ] && break
           done
           test "$proxy_passed" = true
-          echo "E2E proof: subscription parsed; Xray ${XRAY_VERSION}; external HTTPS PASS; Cloudflare-hosted proxyIP fallback PASS"
+          echo "E2E proof: subscription parsed; Xray ${XRAY_VERSION}; external HTTPS 200 PASS; Cloudflare-hosted proxyIP fallback HTTPS 200 PASS"
 
           cleanup
           trap - EXIT
