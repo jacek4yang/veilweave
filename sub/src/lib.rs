@@ -412,15 +412,16 @@ async fn fetch_proxyip_source_inner(
     etag: Option<&str>,
     signal: &AbortSignal,
 ) -> Result<SourceFetch, ProxyIpError> {
-    let headers = Headers::new();
+    // Use worker-rs's simple constructor: Cloudflare's runtime rejects the
+    // otherwise standards-valid custom redirect/cache RequestInit options on
+    // deployed Workers. Fetch applies its bounded default redirect policy; the
+    // final response still has to pass strict status, size, schema, and dataset
+    // validation before it can be promoted.
+    let mut request = Request::new(SOURCE_URL, Method::Get).map_err(fetch_error)?;
+    let headers = request.headers_mut().map_err(fetch_error)?;
     for (name, value) in source_request_headers(etag) {
         headers.set(name, &value).map_err(fetch_error)?;
     }
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get)
-        .with_headers(headers)
-        .with_redirect(RequestRedirect::Error);
-    let request = Request::new_with_init(SOURCE_URL, &init).map_err(fetch_error)?;
     let mut response = Fetch::Request(request)
         .send_with_signal(signal)
         .await
