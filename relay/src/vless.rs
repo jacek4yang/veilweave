@@ -190,14 +190,15 @@ fn decode_payload(env: &Env, uuid_bytes: &[u8; 16]) -> Result<Payload> {
 /// Map the decoded UUID payload to an egress. The type byte mirrors the
 /// `veilweave-tools` encoder: 0=direct, 1=proxyip, 2=socks5, 3=http. For
 /// non-direct types the embedded IPv4 + port are the proxy's address.
-fn build_egress(payload: &Payload) -> Egress {
+fn build_egress(payload: &Payload) -> Result<Egress> {
     let ip = || {
         format!(
             "{}.{}.{}.{}",
             payload.ipv4[0], payload.ipv4[1], payload.ipv4[2], payload.ipv4[3]
         )
     };
-    match payload.type_byte {
+    let egress = match payload.type_byte {
+        0x00 => Egress::Direct,
         0x01 => Egress::ProxyIp {
             host: ip(),
             port: payload.port,
@@ -214,12 +215,22 @@ fn build_egress(payload: &Payload) -> Egress {
             user: None,
             pass: None,
         }),
-        // 0x00 (direct) and any unknown byte fall back to direct.
-        _ => Egress::Direct,
+        _ => return Err(fb()),
+    };
+    if payload.type_byte != 0x00 && payload.port == 0 {
+        return Err(fb());
     }
+    Ok(egress)
 }
 
 pub(crate) fn parse_vless_header(buf: &[u8], env: &Env) -> Result<(VlessRequest, usize, Egress)> {
+    parse_vless_header_with(buf, |uuid| decode_payload(env, uuid))
+}
+
+fn parse_vless_header_with(
+    buf: &[u8],
+    decode: impl FnOnce(&[u8; 16]) -> Result<Payload>,
+) -> Result<(VlessRequest, usize, Egress)> {
     let mut pos = 0usize;
     if buf.is_empty() || buf[pos] != VLESS_VERSION {
         return Err(fb());
@@ -233,8 +244,8 @@ pub(crate) fn parse_vless_header(buf: &[u8], env: &Env) -> Result<(VlessRequest,
     uuid_bytes.copy_from_slice(&buf[pos..pos + 16]);
     pos += 16;
 
-    let payload = decode_payload(env, &uuid_bytes)?;
-    let egress = build_egress(&payload);
+    let payload = decode(&uuid_bytes)?;
+    let egress = build_egress(&payload)?;
 
     if buf.len() < pos + 1 {
         return Err(fb());
@@ -325,4 +336,74 @@ pub(crate) fn parse_vless_header(buf: &[u8], env: &Env) -> Result<(VlessRequest,
         pos,
         egress,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn domain_header(command: u8, domain: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut header = vec![0];
+        header.extend_from_slice(&[0x11; 16]);
+        header.push(0);
+        header.push(command);
+        header.extend_from_slice(&443u16.to_be_bytes());
+        header.push(AddrType::Domain as u8);
+        header.push(domain.len() as u8);
+        header.extend_from_slice(domain);
+        header.extend_from_slice(payload);
+        header
+    }
+
+    fn proxy_payload() -> Payload {
+        Payload {
+            type_byte: 0x01,
+            ipv4: [203, 0, 113, 9],
+            port: 443,
+        }
+    }
+
+    #[test]
+    fn fragmented_header_waits_and_complete_header_preserves_initial_upload() {
+        let request = domain_header(Command::Tcp as u8, b"example.com", b"GET /");
+        let header_len = request.len() - 5;
+        for end in 0..header_len {
+            assert!(parse_vless_header_with(&request[..end], |_| Ok(proxy_payload())).is_err());
+        }
+
+        let (parsed, consumed, egress) = parse_vless_header_with(&request, |uuid| {
+            assert_eq!(uuid, &[0x11; 16]);
+            Ok(proxy_payload())
+        })
+        .unwrap();
+        assert!(matches!(parsed.command, Command::Tcp));
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(consumed, header_len);
+        assert_eq!(&request[consumed..], b"GET /");
+        assert!(matches!(
+            egress,
+            Egress::ProxyIp { ref host, port } if host == "203.0.113.9" && port == 443
+        ));
+    }
+
+    #[test]
+    fn rejects_mux_invalid_address_and_unknown_egress_type() {
+        let mux = domain_header(Command::Mux as u8, b"example.com", b"");
+        assert!(parse_vless_header_with(&mux, |_| Ok(proxy_payload())).is_err());
+
+        let invalid_type = domain_header(Command::Tcp as u8, b"example.com", b"");
+        assert!(parse_vless_header_with(&invalid_type, |_| {
+            Ok(Payload {
+                type_byte: 0xff,
+                ..proxy_payload()
+            })
+        })
+        .is_err());
+
+        let mut invalid_address = domain_header(Command::Tcp as u8, b"example.com", b"");
+        let address_type_offset = 1 + 16 + 1 + 1 + 2;
+        invalid_address[address_type_offset] = 0xff;
+        assert!(parse_vless_header_with(&invalid_address, |_| Ok(proxy_payload())).is_err());
+    }
 }

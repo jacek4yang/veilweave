@@ -21,9 +21,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  live-e2e:
+    name: protected Cloudflare runtime proof
+    uses: ./.github/workflows/cloudflare-smoke.yml
+    with:
+      resource_prefix: vw-smoke-release
+      confirm_cleanup: DELETE-TEST-RESOURCES
+
   tools:
     name: tools · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    needs: live-e2e
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +72,7 @@ jobs:
   workers:
     name: workers · prebuilt relay + sub bundles
     runs-on: ubuntu-latest
+    needs: live-e2e
     steps:
       - uses: actions/checkout@v4
       - name: Install credential-store build dependencies
@@ -72,29 +81,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workers
-          workspaces: |
-            relay -> target
-            sub -> target
-      - name: Install worker-build
-        run: cargo install -q --locked worker-build --version 0.8.5
-      - name: Build relay worker
-        working-directory: relay
-        run: worker-build --release
-      - name: Build sub worker
-        working-directory: sub
-        run: worker-build --release
-      - name: Stage bundles
+          workspaces: tools -> target
+      - name: Download exact bundles from the protected E2E job
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-worker-bundles
+          path: stage/bundle
+      - name: Validate tested bundles
         run: |
-          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
-            worker-bundle prepare --role relay --source relay/build --out stage/bundle/relay
-          cargo run --release --locked --manifest-path tools/Cargo.toml -- \
-            worker-bundle prepare --role sub --source sub/build --out stage/bundle/sub
           cargo run --release --locked --manifest-path tools/Cargo.toml -- \
             worker-bundle validate --role relay --dir stage/bundle/relay
           cargo run --release --locked --manifest-path tools/Cargo.toml -- \

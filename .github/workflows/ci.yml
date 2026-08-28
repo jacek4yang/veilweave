@@ -37,6 +37,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check version consistency
         run: python3 scripts/check_version.py
+      - name: Check protected E2E helpers and frontend syntax
+        run: |
+          python3 -B -m unittest discover -s scripts/tests
+          node --check app/ui/js/app.js
+          node --check app/ui/js/i18n.js
 
   core-test:
     name: core · check, clippy, test

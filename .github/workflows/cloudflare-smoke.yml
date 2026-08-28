@@ -1,12 +1,29 @@
-name: Protected Cloudflare smoke
+name: Protected Cloudflare E2E
 
 on:
+  workflow_call:
+    inputs:
+      resource_prefix:
+        description: "Dedicated test prefix (must start with vw-smoke-)"
+        required: false
+        type: string
+        default: "vw-smoke-release"
+      custom_hostname:
+        description: "Optional exact hostname in the protected test zone"
+        required: false
+        type: string
+        default: ""
+      confirm_cleanup:
+        description: "Cleanup acknowledgement"
+        required: false
+        type: string
+        default: "DELETE-TEST-RESOURCES"
   workflow_dispatch:
     inputs:
       resource_prefix:
         description: "Dedicated test prefix (must start with vw-smoke-)"
         required: true
-        default: "vw-smoke-v2"
+        default: "vw-smoke-manual"
       custom_hostname:
         description: "Optional exact hostname in the protected test zone"
         required: false
@@ -14,49 +31,134 @@ on:
         description: "Type DELETE-TEST-RESOURCES"
         required: true
 
+permissions:
+  contents: read
+
 concurrency:
-  group: veilweave-cloudflare-smoke
+  group: veilweave-cloudflare-e2e
   cancel-in-progress: false
 
 jobs:
-  smoke:
+  e2e:
     if: inputs.confirm_cleanup == 'DELETE-TEST-RESOURCES' && startsWith(inputs.resource_prefix, 'vw-smoke-')
     runs-on: ubuntu-latest
     environment: cloudflare-smoke
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CF_WORKERS_SUBDOMAIN: ${{ secrets.CLOUDFLARE_WORKERS_SUBDOMAIN }}
       CF_TEST_ZONE_ID: ${{ secrets.CLOUDFLARE_TEST_ZONE_ID }}
       CF_TEST_ZONE_NAME: ${{ secrets.CLOUDFLARE_TEST_ZONE_NAME }}
-      VW_PREFIX: ${{ inputs.resource_prefix }}
+      VW_BASE_PREFIX: ${{ inputs.resource_prefix }}
       VW_CUSTOM_HOSTNAME: ${{ inputs.custom_hostname }}
+      XRAY_VERSION: "25.6.8"
+      XRAY_LINUX_64_SHA256: "51bcd3304fdbd64b58048b056da005fbaa6c83577fc351cae34024760e111e4b"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate protected environment configuration
+        shell: bash
+        run: |
+          missing=()
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing+=(CLOUDFLARE_API_TOKEN)
+          [ -n "$CF_ACCOUNT_ID" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
+          [ -n "$CF_WORKERS_SUBDOMAIN" ] || missing+=(CLOUDFLARE_WORKERS_SUBDOMAIN)
+          if [ -n "$VW_CUSTOM_HOSTNAME" ]; then
+            [ -n "$CF_TEST_ZONE_ID" ] || missing+=(CLOUDFLARE_TEST_ZONE_ID)
+            [ -n "$CF_TEST_ZONE_NAME" ] || missing+=(CLOUDFLARE_TEST_ZONE_NAME)
+          fi
+          if [ "${#missing[@]}" -ne 0 ]; then
+            for name in "${missing[@]}"; do
+              echo "::error::Protected environment cloudflare-smoke is missing secret $name"
+            done
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - name: Install test prerequisites
+
+      - name: Install build and E2E prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus-x11 gnome-keyring libdbus-1-dev pkg-config jq
+          sudo apt-get install -y --no-install-recommends \
+            dbus-x11 gnome-keyring libsecret-tools libdbus-1-dev pkg-config jq unzip
           cargo install --locked worker-build --version 0.8.5
-      - name: Build canonical test artifacts
+
+      - name: Download pinned Xray-core and verify its digest
+        run: |
+          curl --fail --show-error --silent --location \
+            "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" \
+            --output xray.zip
+          echo "${XRAY_LINUX_64_SHA256}  xray.zip" | sha256sum --check --strict
+          unzip -q xray.zip -d xray-dist
+          test -x xray-dist/xray
+          xray-dist/xray version | head -n 1 | grep -F "Xray ${XRAY_VERSION}"
+
+      - name: Build and validate exact canonical Worker artifacts
         run: |
           (cd relay && worker-build --release)
           (cd sub && worker-build --release)
-          cargo run --locked --manifest-path tools/Cargo.toml -- worker-bundle prepare --role relay --source relay/build --out smoke-bundle/relay
-          cargo run --locked --manifest-path tools/Cargo.toml -- worker-bundle prepare --role sub --source sub/build --out smoke-bundle/sub
+          cargo run --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle prepare --role relay --source relay/build --out smoke-bundle/relay
+          cargo run --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle prepare --role sub --source sub/build --out smoke-bundle/sub
+          cargo run --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle validate --role relay --dir smoke-bundle/relay
+          cargo run --locked --manifest-path tools/Cargo.toml -- \
+            worker-bundle validate --role sub --dir smoke-bundle/sub
           cargo build --locked --release --manifest-path tools/Cargo.toml
-      - name: Deploy, update, rollback, and remove the dedicated topology
+
+      - name: Deploy and prove subscription to real HTTPS traffic
         shell: bash
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/veilweave-config
         run: |
           dbus-run-session -- bash -euo pipefail <<'SCRIPT'
           eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CF_ACCOUNT_ID"
+          test -n "$CF_WORKERS_SUBDOMAIN"
+          VW_PREFIX="${VW_BASE_PREFIX:0:34}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test "${#VW_PREFIX}" -le 63
+          RELAY_SCRIPT="$VW_PREFIX-relay"
+          SUB_SCRIPT="$VW_PREFIX-sub"
+          KV_TITLE="$VW_PREFIX-sub-kv"
+          API_ROOT="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID"
+          AUTH_HEADER="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+          XRAY_PID=""
+
           mkdir -p "$XDG_CONFIG_HOME/veilweave"
+          curl -fsS -H "$AUTH_HEADER" "$API_ROOT/workers/durable_objects/namespaces" \
+            | jq -r '.result[].id' | sort > durable-before.txt
+
+          cleanup() {
+            set +e
+            if [ -n "$XRAY_PID" ]; then
+              kill "$XRAY_PID" >/dev/null 2>&1
+              wait "$XRAY_PID" >/dev/null 2>&1
+            fi
+            if [ -f smoke-status.json ] && [ -x tools/target/release/veilweave-tools ]; then
+              for deployment_id in $(jq -r '.[].id' smoke-status.json); do
+                tools/target/release/veilweave-tools delete --deployment "$deployment_id"
+              done
+            fi
+            domains=$(curl -fsS -H "$AUTH_HEADER" "$API_ROOT/workers/domains")
+            for id in $(jq -r --arg p "$VW_PREFIX" '.result[] | select(.service | startswith($p)) | .id' <<<"$domains"); do
+              curl -fsS -X DELETE -H "$AUTH_HEADER" "$API_ROOT/workers/domains/$id" >/dev/null
+            done
+            for script in "$RELAY_SCRIPT" "$SUB_SCRIPT"; do
+              curl -fsS -X DELETE -H "$AUTH_HEADER" "$API_ROOT/workers/scripts/$script" >/dev/null
+            done
+            namespaces=$(curl -fsS -H "$AUTH_HEADER" "$API_ROOT/storage/kv/namespaces?per_page=100")
+            for id in $(jq -r --arg title "$KV_TITLE" '.result[] | select(.title == $title) | .id' <<<"$namespaces"); do
+              curl -fsS -X DELETE -H "$AUTH_HEADER" "$API_ROOT/storage/kv/namespaces/$id" >/dev/null
+            done
+          }
+          trap cleanup EXIT
+
           cat > "$XDG_CONFIG_HOME/veilweave/config.toml" <<EOF
           schema_version = 2
           [[accounts]]
@@ -69,37 +171,19 @@ jobs:
           request_timeout_secs = 45
           EOF
 
-          cleanup() {
-            set +e
-            domains=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains")
-            for id in $(jq -r --arg p "$VW_PREFIX" '.result[] | select(.service | startswith($p)) | .id' <<<"$domains"); do
-              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains/$id" >/dev/null
-            done
-            for script in "$VW_PREFIX-relay" "$VW_PREFIX-sub"; do
-              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$script" >/dev/null
-            done
-            namespaces=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces?per_page=100")
-            for id in $(jq -r --arg title "$VW_PREFIX-sub-kv" '.result[] | select(.title == $title) | .id' <<<"$namespaces"); do
-              curl -fsS -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$id" >/dev/null
-            done
-          }
-          trap cleanup EXIT
-
           cat > smoke.toml <<EOF
           version = 2
           [sub]
           account = "smoke"
-          worker = "$VW_PREFIX-sub"
-          kv_title = "$VW_PREFIX-sub-kv"
+          worker = "$SUB_SCRIPT"
+          kv_title = "$KV_TITLE"
           kv_binding = "VEILWEAVE_KV"
           [sub.settings]
           max_nodes = 100
           fingerprint = "chrome"
-          disable_builtin_proxyip = false
-          proxyip_list = []
           [[relay]]
           account = "smoke"
-          worker = "$VW_PREFIX-relay"
+          worker = "$RELAY_SCRIPT"
           EOF
           if [ -n "$VW_CUSTOM_HOSTNAME" ]; then
             test -n "$CF_TEST_ZONE_ID"
@@ -116,14 +200,146 @@ jobs:
 
           tools/target/release/veilweave-tools plan --config smoke.toml --bundle-dir smoke-bundle
           tools/target/release/veilweave-tools apply --config smoke.toml --bundle-dir smoke-bundle --yes
+          echo "Deployment state persisted; validating redacted local metadata"
           tools/target/release/veilweave-tools status --json > smoke-status.json
+          SUB_ID=$(jq -er '.[] | select(.role == "sub") | .id' smoke-status.json)
+          SUB_HOST=$(jq -er '.[] | select(.role == "sub") | .primary_hostname' smoke-status.json)
+          test "$(jq '[.[] | select(.role == "relay")] | length' smoke-status.json)" -ge 1
+          echo "Redacted deployment metadata is valid; resolving the protected subscription credential"
+
+          SUB_TOKEN=""
+          for credential_attempt in $(seq 1 5); do
+            if SUB_TOKEN=$(secret-tool lookup service dev.veilweave.credentials \
+              username "deployment/$SUB_ID/subscription-token" 2>/dev/null); then
+              if [ -n "$SUB_TOKEN" ]; then
+                break
+              fi
+            fi
+            if [ "$credential_attempt" -lt 5 ]; then
+              sleep 1
+            fi
+          done
+          if [ -z "$SUB_TOKEN" ]; then
+            echo "Subscription credential was not visible in Secret Service after bounded retries" >&2
+            exit 1
+          fi
+          echo "::add-mask::$SUB_TOKEN"
+          echo "Protected subscription credential resolved"
+          SUB_URL="https://$SUB_HOST/sub?token=$SUB_TOKEN"
+
+          invalid_status=$(curl -sS -o invalid-token.txt -w '%{http_code}' \
+            "https://$SUB_HOST/sub?token=definitely-invalid")
+          test "$invalid_status" = 404
+          grep -Fx "404 Not Found" invalid-token.txt
+
+          KV_ID=$(curl -fsS -H "$AUTH_HEADER" "$API_ROOT/storage/kv/namespaces?per_page=100" \
+            | jq -er --arg title "$KV_TITLE" '.result[] | select(.title == $title) | .id')
+          for key in proxyip:active:v2 proxyip:previous:v2; do
+            curl -fsS -X DELETE -H "$AUTH_HEADER" \
+              "$API_ROOT/storage/kv/namespaces/$KV_ID/values/$key" >/dev/null
+          done
+
+          cold_status=""
+          for _ in $(seq 1 24); do
+            cold_status=$(curl -sS -o cold.txt -w '%{http_code}' "$SUB_URL&format=raw")
+            [ "$cold_status" = 503 ] && break
+            sleep 5
+          done
+          test "$cold_status" = 503
+          grep -F "ProxyIP dataset is not initialized" cold.txt
+
+          tools/target/release/veilweave-tools proxyip refresh \
+            --deployment "$SUB_ID" --json > refresh.json
+          jq -e '.source == "https://zip.cm.edu.kg/all.json" and .accepted_count > 0 and .stored_count > 0 and .country_count > 0' refresh.json
+          tools/target/release/veilweave-tools proxyip status \
+            --deployment "$SUB_ID" --json > cache-status.json
+          jq -e '.source == "https://zip.cm.edu.kg/all.json" and .validation == "valid" and .stale == false and .stored_count > 0' cache-status.json
+
+          warm_status=""
+          for _ in $(seq 1 24); do
+            warm_status=$(curl -sS -D raw.headers -o raw.txt -w '%{http_code}' \
+              "$SUB_URL&format=raw&secure=true")
+            [ "$warm_status" = 200 ] && break
+            sleep 5
+          done
+          test "$warm_status" = 200
+          python3 scripts/verify_subscription.py --input raw.txt --format raw \
+            --headers raw.headers --expect-security tls
+
+          curl -fsS -D warm.headers -o warm.txt "$SUB_URL&format=raw&secure=true"
+          python3 scripts/verify_subscription.py --input warm.txt --format raw \
+            --headers warm.headers --expect-security tls
+          test "$(awk 'BEGIN{IGNORECASE=1} /^X-ProxyIP-Revision:/{gsub("\r",""); print $2}' raw.headers)" = \
+            "$(awk 'BEGIN{IGNORECASE=1} /^X-ProxyIP-Revision:/{gsub("\r",""); print $2}' warm.headers)"
+
+          curl -fsS -D base64.headers -o base64.txt "$SUB_URL&format=base64&secure=true"
+          python3 scripts/verify_subscription.py --input base64.txt --format base64 \
+            --headers base64.headers --expect-security tls
+
+          curl -fsS -D insecure.headers -o insecure.txt "$SUB_URL&format=raw&secure=false"
+          python3 scripts/verify_subscription.py --input insecure.txt --format raw \
+            --headers insecure.headers --expect-security none
+          ! cmp -s raw.txt insecure.txt
+
+          curl -fsS -D country.headers -o country.txt "$SUB_URL&format=raw&country=JP"
+          python3 scripts/verify_subscription.py --input country.txt --format raw \
+            --headers country.headers --expect-security tls --expect-countries JP
+
+          curl -fsS -D filter.headers -o filter.txt "$SUB_URL&format=raw&filter=JP+US"
+          python3 scripts/verify_subscription.py --input filter.txt --format raw \
+            --headers filter.headers --expect-security tls --expect-countries JP,US
+
           for id in $(jq -r '.[].id' smoke-status.json); do
             tools/target/release/veilweave-tools update --deployment "$id" --bundle-dir smoke-bundle
             tools/target/release/veilweave-tools rollback --deployment "$id"
           done
+          curl -fsS -D lifecycle.headers -o lifecycle.txt "$SUB_URL&format=raw&secure=true"
+          python3 scripts/verify_subscription.py --input lifecycle.txt --format raw \
+            --headers lifecycle.headers --expect-security tls
+
+          proxy_passed=false
+          for node_index in $(seq 0 19); do
+            socks_port=$((18080 + node_index))
+            python3 scripts/verify_subscription.py --input lifecycle.txt --format raw \
+              --write-xray xray-client.json --node-index "$node_index" --socks-port "$socks_port" >/dev/null
+            xray-dist/xray run -c xray-client.json > xray.log 2>&1 &
+            XRAY_PID=$!
+            sleep 1
+            if curl --fail --silent --show-error --socks5-hostname "127.0.0.1:$socks_port" \
+                --connect-timeout 10 --max-time 25 https://example.com/ -o example.html \
+                && grep -Fq "Example Domain" example.html; then
+              if curl --fail --silent --show-error --socks5-hostname "127.0.0.1:$socks_port" \
+                  --connect-timeout 10 --max-time 30 -D cf-target.headers -o cf-target.txt \
+                  "$SUB_URL&format=raw&secure=true" \
+                  && python3 scripts/verify_subscription.py --input cf-target.txt --format raw \
+                    --headers cf-target.headers --expect-security tls >/dev/null; then
+                proxy_passed=true
+              fi
+            fi
+            kill "$XRAY_PID" >/dev/null 2>&1 || true
+            wait "$XRAY_PID" >/dev/null 2>&1 || true
+            XRAY_PID=""
+            [ "$proxy_passed" = true ] && break
+          done
+          test "$proxy_passed" = true
+          echo "E2E proof: subscription parsed; Xray ${XRAY_VERSION}; external HTTPS 200 PASS; Cloudflare-hosted proxyIP fallback HTTPS 200 PASS"
+
           cleanup
           trap - EXIT
 
-          remaining=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains")
-          test "$(jq -r --arg p "$VW_PREFIX" '[.result[] | select(.service | startswith($p))] | length' <<<"$remaining")" = 0
+          remaining_workers=$(curl -fsS -H "$AUTH_HEADER" "$API_ROOT/workers/scripts")
+          test "$(jq -r --arg p "$VW_PREFIX" '[.result[] | select(.id | startswith($p))] | length' <<<"$remaining_workers")" = 0
+          remaining_kv=$(curl -fsS -H "$AUTH_HEADER" "$API_ROOT/storage/kv/namespaces?per_page=100")
+          test "$(jq -r --arg title "$KV_TITLE" '[.result[] | select(.title == $title)] | length' <<<"$remaining_kv")" = 0
+          curl -fsS -H "$AUTH_HEADER" "$API_ROOT/workers/durable_objects/namespaces" \
+            | jq -r '.result[].id' | sort > durable-after.txt
+          test ! -s <(comm -13 durable-before.txt durable-after.txt)
           SCRIPT
+
+      - name: Upload the exact Worker bundles proven by E2E
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-worker-bundles
+          path: smoke-bundle/
+          if-no-files-found: error
+          retention-days: 7

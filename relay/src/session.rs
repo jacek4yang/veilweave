@@ -52,6 +52,28 @@ fn fb() -> Error {
     Error::RustError(String::new())
 }
 
+async fn connect_target_observed(
+    host: &str,
+    port: u16,
+    egress: &Egress,
+) -> Result<(Conn, Vec<u8>, &'static str)> {
+    match connect_target(host, port, egress).await {
+        Ok(connected) => Ok(connected),
+        Err(_) => {
+            let kind = match egress {
+                Egress::Direct => "direct",
+                Egress::ProxyIp { .. } => "proxyip",
+                Egress::Socks5(_) => "socks5",
+                Egress::Http(_) => "http",
+            };
+            console_error!(
+                "event=relay_target_connect status=failed code=RelayTargetConnectFailed egress={kind}"
+            );
+            Err(fb())
+        }
+    }
+}
+
 /// One framed upload record popped from the inbound buffer:
 /// `(5-byte record header, AEAD body as a JS view, the read nonce)`. The body is
 /// a **zero-copy view over `buf`** (see `take_record`) — WebCrypto copies its
@@ -301,6 +323,7 @@ impl DurableObject for VeilweaveSession {
         let outcome = self.pump(&wsx).await;
         self.inner.borrow_mut().pumping = false;
         if let Err(_e) = outcome {
+            console_error!("event=relay_session status=failed code=RelaySessionFailed");
             vlog!("pump error → closing 1011: {_e}");
             let _ = ws.close(Some(1011), Some("error"));
             self.cleanup().await;
@@ -456,7 +479,12 @@ impl VeilweaveSession {
                             Hdr::Parsed(req, egress, initial)
                         }
                         Err(_) if inner.acc_header.len() < 1024 => Hdr::More,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            console_error!(
+                                "event=relay_protocol status=failed code=RelayProtocolInvalid"
+                            );
+                            return Err(e);
+                        }
                     }
                 };
                 match step {
@@ -544,7 +572,12 @@ impl VeilweaveSession {
                     // Same rule as the encrypted header phase: an incomplete
                     // header waits for more bytes; past 1 KiB it is a failure.
                     Err(_) if inner.buf.len() - inner.pos < 1024 => Hdr::More,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        console_error!(
+                            "event=relay_protocol status=failed code=RelayProtocolInvalid"
+                        );
+                        return Err(e);
+                    }
                 }
             };
             match step {
@@ -626,7 +659,7 @@ impl VeilweaveSession {
             Command::Tcp => {
                 #[cfg(feature = "perf-log")]
                 let ct0 = crate::log::now_ms();
-                let (conn, leftover, _path) = connect_target(&host, port, &egress).await?;
+                let (conn, leftover, _path) = connect_target_observed(&host, port, &egress).await?;
                 vlog!(
                     "plain connect: {host}:{port} via {_path} (~{:.0}ms), {} initial / {} leftover bytes",
                     crate::log::now_ms() - ct0,
@@ -714,7 +747,7 @@ impl VeilweaveSession {
             Command::Tcp => {
                 #[cfg(feature = "perf-log")]
                 let ct0 = crate::log::now_ms();
-                let (conn, leftover, _path) = connect_target(&host, port, &egress).await?;
+                let (conn, leftover, _path) = connect_target_observed(&host, port, &egress).await?;
                 vlog!(
                     "connect: {host}:{port} via {_path} (~{:.0}ms), {} downstream leftover bytes",
                     crate::log::now_ms() - ct0,

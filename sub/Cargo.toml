@@ -16,6 +16,7 @@ js-sys        = { version = "0.3", default-features = false }
 wasm-bindgen  = { version = "0.2", default-features = false }
 wasm-bindgen-futures = { version = "0.4", default-features = false }
 worker-sys    = { version = "0.8", default-features = false }
+futures-util  = { version = "0.3", default-features = false, features = ["async-await"] }
 
 [profile.release]
 opt-level = "z"

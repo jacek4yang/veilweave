@@ -102,8 +102,7 @@ struct SubDeploymentView {
     kv_binding: String,
     max_nodes: u16,
     fingerprint: String,
-    disable_builtin_proxyip: bool,
-    proxyip_list: Vec<String>,
+    ech: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -183,8 +182,7 @@ fn deployment_view(config: &Config, deployment: &Deployment) -> DeploymentView {
             kv_binding: sub.kv_binding.clone(),
             max_nodes: sub.max_nodes,
             fingerprint: sub.fingerprint.clone(),
-            disable_builtin_proxyip: sub.disable_builtin_proxyip,
-            proxyip_list: sub.proxyip_list.clone(),
+            ech: sub.ech.clone(),
         }),
     }
 }
@@ -694,6 +692,43 @@ fn get_subscription_url(
     })
 }
 
+#[tauri::command]
+async fn get_proxyip_cache_status(
+    state: State<'_, AppState>,
+    deployment_id: String,
+) -> Result<veilweave_core::deploy::ProxyIpCacheStatus, String> {
+    let deployment_id =
+        uuid::Uuid::parse_str(&deployment_id).map_err(|_| "invalid deployment UUID")?;
+    let config = with_config(&state, |config| config.clone());
+    veilweave_core::deploy::proxyip_cache_status(
+        deployment_id,
+        &config,
+        &state.credentials,
+        state.network.clone(),
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn refresh_proxyip_cache(
+    state: State<'_, AppState>,
+    deployment_id: String,
+) -> Result<veilweave_core::deploy::ProxyIpRefreshReport, String> {
+    let _guard = acquire_operation(&state)?;
+    let deployment_id =
+        uuid::Uuid::parse_str(&deployment_id).map_err(|_| "invalid deployment UUID")?;
+    let config = with_config(&state, |config| config.clone());
+    veilweave_core::deploy::refresh_proxyip_cache(
+        deployment_id,
+        &config,
+        &state.credentials,
+        state.network.clone(),
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))
+}
+
 #[derive(Deserialize)]
 struct DeployPlanWire {
     sub: SubSpecWire,
@@ -799,9 +834,9 @@ async fn delete_deployment(
             })?;
     }
     client
-        .delete_worker(&cloudflare_account.account_id, &name)
+        .delete_managed_worker(&cloudflare_account.account_id, &name, expected)
         .await
-        .map_err(|error| format!("delete Worker failed: {error:#}"))?;
+        .map_err(|error| format!("retire Durable Object and delete Worker failed: {error:#}"))?;
     if let Some(sub) = &deployment.sub {
         client
             .delete_kv_namespace(&cloudflare_account.account_id, &sub.kv_namespace_id)
@@ -1212,6 +1247,8 @@ pub fn run() {
             random_kv_binding,
             start_deploy,
             get_subscription_url,
+            get_proxyip_cache_status,
+            refresh_proxyip_cache,
             delete_deployment,
             update_deployment,
             rollback_deployment,
@@ -1269,8 +1306,7 @@ mod tests {
                     .into(),
                 max_nodes: 100,
                 fingerprint: "chrome".into(),
-                disable_builtin_proxyip: false,
-                proxyip_list: Vec::new(),
+                ech: None,
             }),
         };
         let config = Config {
@@ -1284,5 +1320,12 @@ mod tests {
         assert!(!serialized.contains("sensitive"));
         assert!(!serialized.contains("subscription_token_ref"));
         assert!(!serialized.contains("credential_ref"));
+    }
+
+    #[test]
+    fn frontend_max_nodes_matches_the_worker_limit() {
+        let frontend = include_str!("../../ui/js/app.js");
+        assert!(frontend.contains(r#"id="dp-max-nodes" type="number" min="1" max="200""#));
+        assert!(!frontend.contains(r#"id="dp-max-nodes" type="number" min="1" max="1000""#));
     }
 }

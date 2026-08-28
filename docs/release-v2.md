@@ -1,21 +1,70 @@
-# v2 CI and release
+# CI and release gates
 
-Pull requests run formatting, checks, Clippy with warnings denied, tests for
-core/tools/relay/Sub/desktop, WebAssembly checks, a real `worker-build`,
-canonical bundle validation, secret scanning, and dependency audit. Ordinary
-PRs need no Cloudflare credentials. A protected smoke workflow may deploy only
-to explicitly configured test accounts and resource prefixes.
+Ordinary pull requests run formatting, checks, Clippy with warnings denied,
+unit tests for native and Worker crates, WebAssembly checks, real
+`worker-build`, canonical bundle validation, secret scanning, and dependency
+audit. These jobs establish compile/unit/bundle correctness; they do not claim
+that a deployed proxy transports traffic.
+
+## Protected live E2E
+
+`.github/workflows/cloudflare-smoke.yml` is manually dispatchable and reusable
+by the Release workflow. Its credentials exist only in the protected
+`cloudflare-smoke` GitHub Environment, so untrusted fork PR code cannot access
+them. Names include the Actions run ID/attempt and are confined to the dedicated
+test account. Cleanup is trapped for every exit.
+
+Configure these Environment secrets before approving a run:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_WORKERS_SUBDOMAIN`
+
+`CLOUDFLARE_TEST_ZONE_ID` and `CLOUDFLARE_TEST_ZONE_NAME` are additionally
+required only when the `custom_hostname` input is non-empty. Keep the token
+scoped to the disposable test account and only the Worker, KV, Durable Object,
+Workers Custom Domain, and DNS permissions required by the selected endpoint
+mode. The workflow performs this presence check before installing or compiling
+anything and reports missing names without printing values.
+
+The job:
+
+1. builds and validates the exact canonical relay/Sub bundles;
+2. downloads Xray-core 25.6.8 from the official XTLS release and verifies the
+   pinned Linux archive SHA-256;
+3. deploys disposable relay, Sub, KV, Durable Objects, endpoints, and Cron;
+4. verifies bootstrap from `https://zip.cm.edu.kg/all.json`;
+5. masks the subscription token before constructing any URL;
+6. proves invalid-token 404 behavior;
+7. deletes both known-good KV generations to observe a real cold 503, then
+   performs an authenticated refresh and warm reads;
+8. validates raw/Base64 headers and every VLESS URI, secure-mode separation,
+   Japan override, and Japan/US filtering;
+9. updates and rolls back every Worker;
+10. runs Xray with one generated node and completes HTTPS through SOCKS to an
+    ordinary Internet domain and a Cloudflare-hosted Worker target. The latter
+    exercises signed proxyIP decoding and direct-then-proxyIP fallback;
+11. promotes Durable Object deletion tombstones, removes Workers/KV/domains,
+    and compares Durable Object namespaces with the pre-test snapshot.
+
+No subscription body, signed UUID, Xray config, token, or relay secret is
+uploaded. The only uploaded artifact is `tested-worker-bundles`.
+
+## Stable release provenance
+
+The Release workflow calls the protected E2E as its first job. Tools and Worker
+packaging require it. The Worker packaging job downloads
+`tested-worker-bundles` from that same workflow run, validates it again, and
+uses those exact bytes for CLI archives and desktop embedding. A compile-only
+artifact cannot bypass the live gate.
 
 `VERSION` is the release version source and `scripts/check_version.py` rejects
-component drift. A `v2.0.0` tag must point at the reviewed merge commit. The
-tag-triggered Release workflow builds Workers once, validates the exact bundles
-embedded/shipped on Windows, Linux, and macOS, signs updater artifacts using the
-CI-only Tauri private key, creates `latest.json`, and publishes SHA-256 hashes
-and CycloneDX SBOMs.
+component drift. Tauri updater artifacts are signed with the CI-only private
+key; the matching public key is committed. Release outputs include updater
+metadata, per-platform artifacts, SHA-256 sums, and a CycloneDX SBOM.
 
-Before tagging, verify that the configured Tauri public key matches the CI
-private key in a protected dry run. After publishing, download every asset,
-verify `SHA256SUMS`, confirm all three updater platforms and URLs in
-`latest.json`, validate each CLI archive's Worker manifests, and perform one
-signed update from the previous desktop release. Never commit or print the
-private signing key or its password.
+Before tagging, confirm the protected test account quota and environment token
+permissions. After publishing, download every asset, verify `SHA256SUMS`, check
+all updater platform URLs/signatures, validate each CLI archive's Worker
+manifests, and test one signed update from the previous desktop release. Never
+commit or print signing credentials.

@@ -21,6 +21,7 @@ const NONCE_LEN: usize = 4;
 const PLAINTEXT_LEN: usize = 7;
 const MAC_INPUT_LEN: usize = NONCE_LEN + PLAINTEXT_LEN;
 
+#[allow(dead_code)]
 pub const TYPE_DIRECT: u8 = 0x00;
 pub const TYPE_PROXYIP: u8 = 0x01;
 #[allow(dead_code)]
@@ -92,5 +93,27 @@ impl UuidCodec {
         bytes[NONCE_LEN..NONCE_LEN + PLAINTEXT_LEN].copy_from_slice(&ciphertext);
         bytes[NONCE_LEN + PLAINTEXT_LEN..16].copy_from_slice(&mac[..MAC_LEN]);
         bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_uuid_v1_golden_vector_is_stable() {
+        let bytes = UuidCodec::new(b"veilweave-golden-v1").encode(
+            TYPE_PROXYIP,
+            [203, 0, 113, 9],
+            443,
+            &[0x01, 0x23, 0x45, 0x67],
+        );
+        assert_eq!(
+            bytes,
+            [
+                0x01, 0x23, 0x45, 0x67, 0xa4, 0xcb, 0x66, 0x0a, 0x88, 0x1b, 0xb2, 0x75, 0xd3, 0x97,
+                0x06, 0x5b,
+            ]
+        );
     }
 }

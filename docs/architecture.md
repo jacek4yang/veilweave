@@ -43,6 +43,40 @@ arrives at the edge until it lands on the target socket, and back.
                                   decode records → egress.writable
 ```
 
+## Subscription and proxyIP control path
+
+The subscription plane is intentionally separated from the relay connection
+path:
+
+```text
+https://zip.cm.edu.kg/all.json
+        -> singleton ProxyIpRefresher SQLite Durable Object
+        -> bounded validation, normalization, grouping, promotion checks
+        -> KV active + previous known-good compact generations
+        -> /sub: one KV read, small selection, fresh signed-UUID rendering
+        -> Xray-compatible VLESS URI list
+```
+
+The source document measured roughly 12.7 MiB and 17,482 usable endpoints in
+the live parser fixture. Parsing it in a Free-plan HTTP/Cron handler cannot fit
+the 10 ms CPU limit. The top-level scheduled event therefore makes one internal
+request to the named Durable Object, which both serializes refreshes and uses
+the Durable Object CPU allowance. The normal `/sub` route never invokes the
+refresher and never reads the source.
+
+Promotion writes the old active value to `proxyip:previous:v2` before replacing
+`proxyip:active:v2`. Empty/invalid/suspiciously collapsed candidates cannot
+replace known-good data. Rendering itself is uncached, so request security,
+format, country/filter, relay topology, optional ECH, fresh nonce, and dataset
+revision have no shared rendered-cache identity to get wrong.
+
+Every output entry is `TYPE_PROXYIP`: Sub signs the selected egress IPv4/port
+with that URI's relay secret. Relay decoding selects `ProxyIp`, tries the VLESS
+target directly, and uses the encoded address only when the direct Cloudflare
+socket fails (notably for Cloudflare-hosted destinations). Carrier-optimized
+entry addresses affect only how the client reaches the relay and fall back to
+the relay domain.
+
 ## WebSocket Hibernation
 
 The decisive free-plan optimization: every inbound WS frame is delivered

@@ -358,6 +358,53 @@ impl CfClient {
         self.set_workers_dev(account_id, script, true).await
     }
 
+    pub async fn get_cron_schedules(&self, account_id: &str, script: &str) -> Result<Vec<String>> {
+        let result: CronSchedules = self
+            .send(
+                self.get(&format!(
+                    "/accounts/{account_id}/workers/scripts/{script}/schedules"
+                )),
+                "get Worker Cron Triggers",
+                true,
+            )
+            .await?;
+        Ok(result
+            .schedules
+            .into_iter()
+            .map(|schedule| schedule.cron)
+            .collect())
+    }
+
+    /// Replace all Cron Triggers for a Worker. This PUT is idempotent: retrying
+    /// the exact body cannot create duplicate schedules.
+    pub async fn set_cron_schedules(
+        &self,
+        account_id: &str,
+        script: &str,
+        schedules: &[String],
+    ) -> Result<Vec<String>> {
+        let body: Vec<serde_json::Value> = schedules
+            .iter()
+            .map(|cron| serde_json::json!({ "cron": cron }))
+            .collect();
+        let result: CronSchedules = self
+            .send(
+                self.request(
+                    Method::PUT,
+                    &format!("/accounts/{account_id}/workers/scripts/{script}/schedules"),
+                )
+                .json(&body),
+                "update Worker Cron Triggers",
+                true,
+            )
+            .await?;
+        Ok(result
+            .schedules
+            .into_iter()
+            .map(|schedule| schedule.cron)
+            .collect())
+    }
+
     pub async fn create_kv_namespace(&self, account_id: &str, title: &str) -> Result<String> {
         let namespace: KvNamespace = self
             .send(
@@ -458,12 +505,7 @@ impl CfClient {
         let versions = self.list_versions(account_id, script).await?;
         versions
             .into_iter()
-            .find(|v| {
-                v.annotations
-                    .get("workers/tag")
-                    .map(|s| s.as_str())
-                    == Some(&operation_tag)
-            })
+            .find(|v| v.annotations.get("workers/tag").map(|s| s.as_str()) == Some(&operation_tag))
             .with_context(|| {
                 format!(
                     "Worker {script:?} was created but the initial version \
@@ -633,8 +675,13 @@ impl CfClient {
                 Ok(version) => versions.push(version),
                 Err(e) => {
                     eprintln!("DEBUG: failed to deserialize version[{i}]: {e}");
-                    eprintln!("DEBUG: raw version[{i}] = {}", serde_json::to_string_pretty(item).unwrap_or_default());
-                    return Err(e).context(format!("deserialize WorkerVersion from versions list at index {i}"));
+                    eprintln!(
+                        "DEBUG: raw version[{i}] = {}",
+                        serde_json::to_string_pretty(item).unwrap_or_default()
+                    );
+                    return Err(e).context(format!(
+                        "deserialize WorkerVersion from versions list at index {i}"
+                    ));
                 }
             }
         }
@@ -679,6 +726,94 @@ impl CfClient {
             true,
         )
         .await
+    }
+
+    /// Retire the Durable Object namespace owned by a Veilweave Worker before
+    /// deleting its script. Cloudflare's declarative exports require an
+    /// explicit `deleted` tombstone; deleting only the script can orphan the
+    /// namespace and its stored data.
+    pub async fn delete_managed_worker(
+        &self,
+        account_id: &str,
+        script: &str,
+        ownership: WorkerOwnership,
+    ) -> Result<()> {
+        let class_name = match ownership {
+            WorkerOwnership::VeilweaveRelay => "VeilweaveSession",
+            WorkerOwnership::VeilweaveSub => "ProxyIpRefresher",
+            WorkerOwnership::UnknownVeilweave | WorkerOwnership::Unrelated => {
+                bail!("refusing Durable Object retirement for a Worker without a known Veilweave role")
+            }
+        };
+        let operation_tag = format!("veilweave-retire:{}", uuid::Uuid::new_v4().simple());
+        let mut metadata = serde_json::json!({
+            "main_module": "retire.js",
+            "compatibility_date": COMPATIBILITY_DATE,
+            "annotations": {
+                "workers/message": format!("Veilweave retirement for {class_name}"),
+                "workers/tag": operation_tag,
+            }
+        });
+        metadata["exports"] = serde_json::json!({});
+        metadata["exports"][class_name] = serde_json::json!({
+            "type": "durable-object",
+            "state": "deleted"
+        });
+        let form = reqwest::multipart::Form::new()
+            .part(
+                "metadata",
+                reqwest::multipart::Part::text(metadata.to_string())
+                    .mime_str("application/json")?,
+            )
+            .part(
+                "retire.js",
+                reqwest::multipart::Part::bytes(
+                    b"export default {fetch(){return new Response('retiring',{status:503})}};"
+                        .to_vec(),
+                )
+                .file_name("retire.js")
+                .mime_str("application/javascript+module")?,
+            );
+        let created: Result<WorkerVersion> = self
+            .send(
+                self.request(
+                    Method::POST,
+                    &format!("/accounts/{account_id}/workers/scripts/{script}/versions"),
+                )
+                .multipart(form),
+                &format!("create Durable Object retirement version for {script:?}"),
+                false,
+            )
+            .await;
+        let version = match created {
+            Ok(version) => version,
+            Err(upload_error) if !creation_outcome_ambiguous(&upload_error) => {
+                return Err(upload_error)
+            }
+            Err(upload_error) => self
+                .list_versions(account_id, script)
+                .await
+                .ok()
+                .and_then(|versions| {
+                    versions.into_iter().find(|version| {
+                        version.annotations.get("workers/tag") == Some(&operation_tag)
+                    })
+                })
+                .ok_or_else(|| {
+                    upload_error.context(
+                        "Durable Object retirement version outcome was ambiguous and could not be reconciled",
+                    )
+                })?,
+        };
+        self.create_deployment(
+            account_id,
+            script,
+            &version.id,
+            "Veilweave Durable Object retirement",
+        )
+        .await
+        .context("promote Durable Object retirement tombstone")?;
+        self.delete_worker(account_id, script).await
     }
 
     pub async fn list_workers(&self, account_id: &str) -> Result<Vec<WorkerScript>> {
@@ -973,7 +1108,6 @@ pub struct WorkerVersion {
     pub annotations: std::collections::BTreeMap<String, String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerDeployment {
     pub id: String,
@@ -1068,15 +1202,25 @@ pub struct UsageRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CronSchedules {
+    #[serde(default)]
+    schedules: Vec<CronSchedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CronSchedule {
+    cron: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubSettings {
     #[serde(default = "default_max_nodes")]
     pub max_nodes: u16,
     #[serde(default = "default_fingerprint")]
     pub fingerprint: String,
+    /// Explicit ECH opt-in. `None` emits an empty binding and keeps ECH off.
     #[serde(default)]
-    pub disable_builtin_proxyip: bool,
-    #[serde(default)]
-    pub proxyip_list: Vec<String>,
+    pub ech: Option<String>,
 }
 
 impl Default for SubSettings {
@@ -1084,16 +1228,15 @@ impl Default for SubSettings {
         Self {
             max_nodes: default_max_nodes(),
             fingerprint: default_fingerprint(),
-            disable_builtin_proxyip: false,
-            proxyip_list: Vec::new(),
+            ech: None,
         }
     }
 }
 
 impl SubSettings {
     pub fn validate(&self) -> Result<()> {
-        if self.max_nodes == 0 || self.max_nodes > 1000 {
-            bail!("MAX_NODES must be between 1 and 1000");
+        if self.max_nodes == 0 || self.max_nodes > 200 {
+            bail!("MAX_NODES must be between 1 and 200");
         }
         if self.fingerprint.trim().is_empty()
             || !self
@@ -1103,8 +1246,10 @@ impl SubSettings {
         {
             bail!("FP must be a non-empty alphanumeric preset/custom value");
         }
-        for entry in &self.proxyip_list {
-            validate_proxyip_entry(entry)?;
+        if let Some(ech) = &self.ech {
+            if ech.trim().is_empty() || ech.len() > 512 || ech.chars().any(char::is_control) {
+                bail!("ECH must be absent or a non-empty value of at most 512 characters");
+            }
         }
         Ok(())
     }
@@ -1116,19 +1261,6 @@ fn default_max_nodes() -> u16 {
 
 fn default_fingerprint() -> String {
     "chrome".into()
-}
-
-fn validate_proxyip_entry(entry: &str) -> Result<()> {
-    let value = entry.trim();
-    if value.is_empty()
-        || value.contains(char::is_whitespace)
-        || value.contains("//")
-        || value.contains('/')
-        || value.contains('@')
-    {
-        bail!("invalid PROXYIP_LIST entry {entry:?}; expected host or host:port");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1171,16 +1303,17 @@ pub fn relay_metadata_for(
             "class_name": "VeilweaveSession"
         }
     ]);
+    // Every version must declare every provisioned class. Initial creation has
+    // an explicit state transition; later code-only versions retain the live
+    // export without replaying that transition.
+    metadata["exports"] = serde_json::json!({
+        "VeilweaveSession": {
+            "type": "durable-object",
+            "storage": "sqlite"
+        }
+    });
     if kind == VersionKind::Initial {
-        // Declarative exports create the free-plan SQLite namespace once. An
-        // update omits this block and therefore cannot replay class creation.
-        metadata["exports"] = serde_json::json!({
-            "VeilweaveSession": {
-                "type": "durable-object",
-                "storage": "sqlite",
-                "state": "created"
-            }
-        });
+        metadata["exports"]["VeilweaveSession"]["state"] = serde_json::json!("created");
     }
     Ok(metadata)
 }
@@ -1219,10 +1352,26 @@ pub fn sub_metadata_for(
         { "name": "KV_BINDING", "type": "plain_text", "text": kv_binding },
         { "name": "MAX_NODES", "type": "plain_text", "text": settings.max_nodes.to_string() },
         { "name": "FP", "type": "plain_text", "text": settings.fingerprint },
-        { "name": "DISABLE_BUILTIN_PROXYIP", "type": "plain_text", "text": settings.disable_builtin_proxyip.to_string() },
-        { "name": "PROXYIP_LIST", "type": "plain_text", "text": settings.proxyip_list.join(",") },
-        { "name": kv_binding, "type": "kv_namespace", "namespace_id": kv_namespace_id }
+        { "name": "ECH", "type": "plain_text", "text": settings.ech.clone().unwrap_or_default() },
+        { "name": kv_binding, "type": "kv_namespace", "namespace_id": kv_namespace_id },
+        {
+            "name": "PROXYIP_REFRESHER",
+            "type": "durable_object_namespace",
+            "class_name": "ProxyIpRefresher"
+        }
     ]);
+    // Every version declares the live class. Only an initial version asks for
+    // the `created` transition; updates reconcile against the existing SQLite
+    // namespace without replaying class creation.
+    metadata["exports"] = serde_json::json!({
+        "ProxyIpRefresher": {
+            "type": "durable-object",
+            "storage": "sqlite"
+        }
+    });
+    if kind == VersionKind::Initial {
+        metadata["exports"]["ProxyIpRefresher"]["state"] = serde_json::json!("created");
+    }
     Ok(metadata)
 }
 
@@ -1287,7 +1436,8 @@ mod tests {
             .find(|binding| binding["name"] == "SECRET_KEY")
             .unwrap();
         assert_eq!(inherited["type"], "inherit");
-        assert!(update.get("exports").is_none());
+        assert_eq!(update["exports"]["VeilweaveSession"]["storage"], "sqlite");
+        assert!(update["exports"]["VeilweaveSession"].get("state").is_none());
         assert!(!update.to_string().contains("secret"));
     }
 
@@ -1312,6 +1462,15 @@ mod tests {
                 .unwrap();
             assert_eq!(binding["type"], "secret_text");
         }
+        let refresher = metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binding| binding["name"] == "PROXYIP_REFRESHER")
+            .unwrap();
+        assert_eq!(refresher["type"], "durable_object_namespace");
+        assert_eq!(refresher["class_name"], "ProxyIpRefresher");
+        assert_eq!(metadata["exports"]["ProxyIpRefresher"]["storage"], "sqlite");
         assert_eq!(metadata["bindings"][4]["text"], "100");
         assert!(SubSettings {
             max_nodes: 0,
@@ -1340,6 +1499,13 @@ mod tests {
         };
         assert_eq!(binding("VEILWEAVE_NODES")["type"], "secret_text");
         assert_eq!(binding("SUBSCRIPTION_TOKEN")["type"], "inherit");
+        assert_eq!(
+            topology_update["exports"]["ProxyIpRefresher"]["storage"],
+            "sqlite"
+        );
+        assert!(topology_update["exports"]["ProxyIpRefresher"]
+            .get("state")
+            .is_none());
 
         let token_rotation = sub_metadata_for(
             VersionKind::Update,
@@ -1612,6 +1778,91 @@ mod tests {
         assert!(request.contains(r#""hostname":"relay.example.com""#));
         assert!(request.contains(r#""service":"relay-worker""#));
         assert!(!request.contains("dns_records"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cron_schedules_use_idempotent_bulk_replace_contract() {
+        let response =
+            r#"{"success":true,"errors":[],"result":{"schedules":[{"cron":"17 */6 * * *"}]}}"#;
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: response.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: response.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        assert_eq!(
+            client
+                .get_cron_schedules("account", "sub-worker")
+                .await
+                .unwrap(),
+            ["17 */6 * * *"]
+        );
+        assert_eq!(
+            client
+                .set_cron_schedules("account", "sub-worker", &["17 */6 * * *".into()])
+                .await
+                .unwrap(),
+            ["17 */6 * * *"]
+        );
+        let requests = requests.lock().unwrap();
+        assert!(String::from_utf8_lossy(&requests[0])
+            .starts_with("GET /accounts/account/workers/scripts/sub-worker/schedules HTTP/1.1"));
+        let update = String::from_utf8_lossy(&requests[1]);
+        assert!(update
+            .starts_with("PUT /accounts/account/workers/scripts/sub-worker/schedules HTTP/1.1"));
+        assert!(update.contains(r#"[{"cron":"17 */6 * * *"}]"#));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_worker_delete_promotes_durable_object_tombstone_first() {
+        let (base, requests, task) = mock_api(vec![
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{"id":"retire-version"}}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{"id":"retire-deployment","versions":[{"version_id":"retire-version","percentage":100}],"annotations":{}}}"#.into(),
+            },
+            MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"success":true,"errors":[],"result":{}}"#.into(),
+            },
+        ])
+        .await;
+        let client = CfClient::new("token").unwrap().with_api_base(base).unwrap();
+        client
+            .delete_managed_worker("account", "relay-worker", WorkerOwnership::VeilweaveRelay)
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let version = String::from_utf8_lossy(&requests[0]);
+        assert!(version
+            .starts_with("POST /accounts/account/workers/scripts/relay-worker/versions HTTP/1.1"));
+        assert!(version.contains("VeilweaveSession"));
+        assert!(version.contains("deleted"));
+        assert!(version.contains("name=\"retire.js\""));
+        let deployment = String::from_utf8_lossy(&requests[1]);
+        assert!(deployment.starts_with(
+            "POST /accounts/account/workers/scripts/relay-worker/deployments HTTP/1.1"
+        ));
+        assert!(deployment.contains(r#""version_id":"retire-version""#));
+        assert!(String::from_utf8_lossy(&requests[2])
+            .starts_with("DELETE /accounts/account/workers/scripts/relay-worker HTTP/1.1"));
         task.abort();
     }
 

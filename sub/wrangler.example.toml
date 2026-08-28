@@ -18,13 +18,24 @@ compatibility_flags = ["nodejs_compat"]
 command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 cwd = "."
 
+[triggers]
+crons = ["17 */6 * * *"]
+
 [[kv_namespaces]]
 binding = "VEILWEAVE_KV"
 id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+[[durable_objects.bindings]]
+name = "PROXYIP_REFRESHER"
+class_name = "ProxyIpRefresher"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProxyIpRefresher"]
 
 # Sensitive bindings are intentionally absent from this file.
 # Set them with Wrangler's secret commands before deployment.
 [vars]
 MAX_NODES = "100"
 FP = "chrome"
-DISABLE_BUILTIN_PROXYIP = "false"
+# ECH = "example-ech-config" # explicit opt-in only

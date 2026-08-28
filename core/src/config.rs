@@ -259,9 +259,7 @@ pub struct SubDetails {
     #[serde(default = "default_fingerprint")]
     pub fingerprint: String,
     #[serde(default)]
-    pub disable_builtin_proxyip: bool,
-    #[serde(default)]
-    pub proxyip_list: Vec<String>,
+    pub ech: Option<String>,
 }
 
 fn default_max_nodes() -> u16 {
@@ -555,8 +553,7 @@ fn migrate_v1(path: &Path, text: &str, credentials: &CredentialManager) -> Resul
                         subscription_token_ref: token_ref,
                         max_nodes: default_max_nodes(),
                         fingerprint: default_fingerprint(),
-                        disable_builtin_proxyip: false,
-                        proxyip_list: Vec::new(),
+                        ech: None,
                     })
                 }
                 None => None,
@@ -970,6 +967,46 @@ account_id = "account-second"
             status: DomainStatus::Ready,
         };
         domain.validate().unwrap();
+    }
+
+    #[test]
+    fn obsolete_proxyip_fields_load_but_are_removed_on_next_save() {
+        let legacy_v2 = r#"
+schema_version = 2
+
+[[accounts]]
+name = "personal"
+account_id = "account-123"
+credential_ref = "env:CLOUDFLARE_API_TOKEN"
+
+[[deployments]]
+id = "11111111-1111-4111-8111-111111111111"
+role = "sub"
+name = "sub-one"
+account_id = "account-123"
+secret_ref = "env:VEILWEAVE_NODES"
+created_at = "2026-08-20T00:00:00Z"
+
+[deployments.endpoint]
+mode = "workers-dev"
+primary = "workers-dev"
+workers_dev_enabled = true
+workers_dev_hostname = "sub-one.example.workers.dev"
+
+[deployments.sub]
+kv_namespace_id = "kv-id"
+kv_title = "sub-kv"
+kv_binding = "VEILWEAVE_KV"
+subscription_token_ref = "env:SUBSCRIPTION_TOKEN"
+proxyip_list = "1.2.3.4:443"
+disable_builtin_proxyip = true
+"#;
+        let config: Config = toml::from_str(legacy_v2).unwrap();
+        config.validate().unwrap();
+        let cleaned = toml::to_string_pretty(&config).unwrap();
+        assert!(!cleaned.contains("proxyip_list"));
+        assert!(!cleaned.contains("disable_builtin_proxyip"));
+        assert!(config.deployments[0].sub.as_ref().unwrap().ech.is_none());
     }
 
     #[test]

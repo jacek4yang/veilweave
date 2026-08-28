@@ -1,7 +1,11 @@
-use serde::Deserialize;
+use base64::{engine::general_purpose, Engine as _};
+use futures_util::future::{select, Either};
+use futures_util::{FutureExt, StreamExt};
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
+use std::fmt::{self, Write as FmtWrite};
+use std::time::Duration;
 use worker::*;
 
 mod apache_mock;
@@ -10,353 +14,745 @@ mod egress;
 mod encoding;
 mod geo;
 mod hmac;
-mod ip_selector;
 mod optimized_ip;
 mod path;
+mod proxyip;
+mod refresher;
+mod rng;
 mod secret;
 mod sha256;
 
 use codec::{UuidCodec, TYPE_PROXYIP};
-use egress::{parse_egress_list, EgressEntry};
+use egress::EgressEntry;
 use encoding::{format_uuid, percent_encode};
-use optimized_ip::fetch_optimized_ips;
+use proxyip::{
+    parse_cached, parse_country_code, validate_promotion, ProxyIpDataset, ProxyIpError,
+    ProxyIpErrorCode, RefreshFailure, ACTIVE_KEY, FAILURE_KEY, FETCH_TIMEOUT_SECS,
+    MAX_SOURCE_BYTES, PREVIOUS_KEY, SOURCE_URL,
+};
 
 use crate::apache_mock::apache_default_page;
 
-const MAX_NODES: usize = 100;
-const PROXYIP_API_URL: &str = "https://zip.cm.edu.kg/all.json";
-const PROXYIP_CACHE_KEY: &str = "proxyip_cache_v1";
-const PROXYIP_CACHE_DATE_KEY: &str = "proxyip_cache_date_v1";
-const CACHE_TTL_SECONDS: u64 = 86400; // 24 hours for IP data
-const SUB_CACHE_TTL_SECONDS: u64 = 3600; // 1 hour for rendered subscription
+const DEFAULT_MAX_NODES: usize = 100;
+const MAX_NODES_LIMIT: usize = 200;
+const PROFILE_UPDATE_INTERVAL_HOURS: &str = "6";
 
-// Per-request PRNG: nonce bytes, path variety, and shuffling.
 thread_local! {
+    // This PRNG is only for path variety and equivalent-candidate ordering.
+    // Signed UUID nonces come exclusively from WebCrypto in `rng`.
     static PRNG: RefCell<Xorshift64> = RefCell::new(Xorshift64::new(0xdeadbeefc0febabe));
 }
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
-    let path = url.path();
-
-    match path {
+    match url.path() {
         "/sub" => handle_sub_request(&req, &env).await,
+        "/_veilweave/proxyip/status" => handle_proxyip_status(&req, &env).await,
+        "/_veilweave/proxyip/refresh" => handle_proxyip_refresh(&req, &env).await,
         _ => apache_default_page(req),
     }
 }
 
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    // The top-level Free-plan Worker has a 10 ms CPU ceiling. Delegate the
+    // multi-megabyte source parse to one named Durable Object invocation, which
+    // has a 30-second CPU allowance and also serializes refreshes to prevent a
+    // scheduled/manual stampede.
+    let refreshed = match invoke_proxyip_refresher(&env).await {
+        Ok(response) if response.status_code() == 200 => {
+            console_log!("event=proxyip_refresh_dispatch status=ok");
+            true
+        }
+        Ok(response) => {
+            console_error!(
+                "event=proxyip_refresh_dispatch status=failed http_status={}",
+                response.status_code()
+            );
+            false
+        }
+        Err(error) => {
+            console_error!(
+                "event=proxyip_refresh_dispatch status=failed code=DurableObjectUnavailable detail={error}"
+            );
+            false
+        }
+    };
+
+    // Optional carrier-optimized Cloudflare entry addresses are deliberately a
+    // second Durable Object invocation. A provider/runtime failure here can
+    // never change the authoritative ProxyIP promotion result returned above.
+    if refreshed {
+        match invoke_proxyip_optimized_refresher(&env).await {
+            Ok(response) if response.status_code() == 200 => {
+                console_log!("event=optimized_ip_refresh_dispatch status=ok")
+            }
+            Ok(response) => console_warn!(
+                "event=optimized_ip_refresh_dispatch status=failed http_status={}",
+                response.status_code()
+            ),
+            Err(error) => {
+                console_warn!("event=optimized_ip_refresh_dispatch status=failed detail={error}")
+            }
+        }
+    }
+}
+
 async fn handle_sub_request(req: &Request, env: &Env) -> Result<Response> {
-    // Only GET requests
-    if req.method() != Method::Get {
+    if req.method() != Method::Get || !query_token_is_valid(req, env) {
         return not_found();
     }
 
-    let url = req.url()?;
-    let query = url.query().unwrap_or("");
-
-    // Validate token from query params
-    let token = extract_param(query, "token").or_else(|| extract_param(query, "t"));
-    let expected_token = env.var("SUBSCRIPTION_TOKEN").ok().map(|v| v.to_string());
-
-    if let Some(expected) = &expected_token {
-        if !expected.trim().is_empty() {
-            match token {
-                Some(t) if t == *expected => {}
-                _ => return not_found(),
-            }
-        }
-    }
-
-    // Extract optional filters
-    let filter = extract_param(query, "filter").or_else(|| extract_param(query, "c"));
-    let req_country = extract_param(query, "country").or_else(|| extract_param(query, "cc"));
-
-    // Initialize PRNG for this request
-    init_prng();
-
-    // Get KV for caching (optional). Binding name resolution: an explicit
-    // `KV_BINDING` var wins (users are encouraged to pick their own binding
-    // name), then the conventional `VEILWEAVE_KV`, then plain `KV`.
-    let kv = env
-        .var("KV_BINDING")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-        .and_then(|name| env.kv(&name).ok())
-        .or_else(|| env.kv("VEILWEAVE_KV").ok())
-        .or_else(|| env.kv("KV").ok());
-
-    // Detect user geography (Cloudflare native)
-    let user_country = extract_cf_header(req, "CF-IPCountry").unwrap_or_else(|| "XX".to_string());
-    let user_asn = extract_cf_header(req, "CF-ASN").and_then(|asn| asn.parse::<u32>().ok());
-    let user_geo = geo::detect_user_geo(&user_country, user_asn);
-
-    // ISP-aware cache: users on the same country+carrier share a rendered body.
-    let cache_key = build_geo_cache_key(
-        &user_country,
-        user_asn,
-        filter.as_deref(),
-        req_country.as_deref(),
-    );
-    if let Some(kv_ref) = kv.as_ref() {
-        if let Ok(Some(cached)) = kv_ref.get(&cache_key).text().await {
-            return build_response(&cached, true).await;
-        }
-    }
-
-    // Fetch IP list
-    let mut entries = match fetch_proxyip_list(kv.as_ref(), env).await {
-        Ok(e) => e,
-        Err(_) => return server_error(),
+    let options = match SubscriptionOptions::from_request(req) {
+        Ok(options) => options,
+        Err(message) => return client_error(&message),
+    };
+    let max_nodes = match configured_max_nodes(env) {
+        Ok(value) => value,
+        Err(message) => return unavailable(&message),
+    };
+    let Some(kv) = resolve_kv(env) else {
+        return unavailable("ProxyIP cache binding is unavailable.");
     };
 
-    // Apply country filter (only controls proxyip exit country)
-    if let Some(ref f) = filter {
-        let countries: Vec<String> = f
-            .split([',', ' ', '+'])
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        entries.retain(|e| countries.contains(&e.country));
+    let dataset = match load_known_good(&kv).await {
+        Ok(dataset) => dataset,
+        Err(error) => return unavailable(error.public_message()),
+    };
+    let now_ms = now_ms();
+    let stale = dataset.is_stale(now_ms);
+
+    let user_country =
+        extract_cf_header(req, "CF-IPCountry").and_then(|value| parse_country_code(&value).ok());
+    let user_asn = extract_cf_header(req, "CF-ASN").and_then(|value| value.parse::<u32>().ok());
+    let user_geo = geo::detect_user_geo(user_country.as_deref().unwrap_or("XX"), user_asn);
+
+    let requested = options.requested_countries();
+    let rotation_seed = selection_seed(
+        &dataset.revision,
+        user_country.as_deref(),
+        user_asn,
+        requested,
+    );
+    let entries = dataset.select(requested, user_country.as_deref(), max_nodes, rotation_seed);
+    if entries.is_empty() {
+        return unavailable("No usable proxyIP entries match the requested country selection.");
     }
 
-    // Dedup by host:port
-    let mut seen: HashSet<u64> = HashSet::with_capacity(entries.len());
-    entries.retain(|e| seen.insert(dedup_key(&e.host, e.port)));
+    let relay_nodes = load_veilweave_nodes(env);
+    if relay_nodes.is_empty() {
+        return unavailable("Relay topology is unavailable.");
+    }
+    let render_config = match RenderConfig::from_env(env, options.secure) {
+        Ok(config) => config,
+        Err(message) => return unavailable(&message),
+    };
 
-    // Pre-validate entries
-    entries.retain(|e| is_valid_egress(&e.host, e.port));
+    let optimized_ips = optimized_ip::load_cached_optimized_ips(Some(&kv))
+        .await
+        .unwrap_or_default();
+    let optimized_ip_list = get_optimized_ip_list(user_geo.carrier, &optimized_ips);
 
-    // ISP-aware IP selection for domestic users
-    let max_nodes = env
+    // One WebCrypto call supplies a path-randomization seed followed by four
+    // independent nonce bytes per node.
+    let random = match rng::random_bytes(8 + entries.len() * 4) {
+        Ok(random) => random,
+        Err(error) => {
+            console_error!("event=subscription_render status=failed code=CsprngUnavailable");
+            return unavailable(&error);
+        }
+    };
+    let mut seed_bytes = [0u8; 8];
+    seed_bytes.copy_from_slice(&random[..8]);
+    init_prng(u64::from_le_bytes(seed_bytes));
+    let raw = match build_subscription(
+        &relay_nodes,
+        &render_config,
+        &entries,
+        &optimized_ip_list,
+        &random[8..],
+    ) {
+        Ok(body) => body,
+        Err(error) => {
+            console_error!(
+                "event=subscription_render status=failed code=SubscriptionRenderFailed detail={error}"
+            );
+            return unavailable("Subscription rendering failed.");
+        }
+    };
+
+    console_log!(
+        "event=subscription_render status=ok nodes={} revision={} stale={} format={}",
+        entries.len(),
+        dataset.revision,
+        stale,
+        options.format.as_str()
+    );
+    build_subscription_response(
+        &raw,
+        options.format,
+        entries.len(),
+        &dataset.revision,
+        stale,
+    )
+}
+
+async fn handle_proxyip_status(req: &Request, env: &Env) -> Result<Response> {
+    if req.method() != Method::Get || !bearer_token_is_valid(req, env) {
+        return not_found();
+    }
+    let Some(kv) = resolve_kv(env) else {
+        return unavailable("ProxyIP cache binding is unavailable.");
+    };
+
+    let dataset = load_known_good(&kv).await.ok();
+    let last_failure = match kv.get(FAILURE_KEY).text().await {
+        Ok(Some(value)) => serde_json::from_str::<RefreshFailure>(&value).ok(),
+        _ => None,
+    };
+    let now = now_ms();
+    let status = ProxyIpStatus {
+        source: SOURCE_URL,
+        validation: if dataset.is_some() {
+            "valid"
+        } else {
+            "unavailable"
+        },
+        revision: dataset.as_ref().map(|value| value.revision.as_str()),
+        last_success_ms: dataset.as_ref().map(|value| value.refreshed_at_ms),
+        age_ms: dataset
+            .as_ref()
+            .map(|value| now.saturating_sub(value.refreshed_at_ms)),
+        stale: dataset.as_ref().is_some_and(|value| value.is_stale(now)),
+        accepted_count: dataset.as_ref().map(|value| value.accepted_count),
+        rejected_count: dataset.as_ref().map(|value| value.rejected_count),
+        stored_count: dataset.as_ref().map(|value| value.stored_count),
+        country_count: dataset.as_ref().map(|value| value.countries.len()),
+        last_failure,
+    };
+    json_response(&status, 200)
+}
+
+async fn handle_proxyip_refresh(req: &Request, env: &Env) -> Result<Response> {
+    if req.method() != Method::Post || !bearer_token_is_valid(req, env) {
+        return not_found();
+    }
+    match invoke_proxyip_refresher(env).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            console_error!(
+                "event=proxyip_refresh_dispatch status=failed code=DurableObjectUnavailable detail={error}"
+            );
+            unavailable("ProxyIP refresh service is unavailable.")
+        }
+    }
+}
+
+async fn invoke_proxyip_refresher(env: &Env) -> Result<Response> {
+    invoke_refresher_route(env, "refresh").await
+}
+
+async fn invoke_proxyip_optimized_refresher(env: &Env) -> Result<Response> {
+    invoke_refresher_route(env, "optimized").await
+}
+
+async fn invoke_refresher_route(env: &Env, route: &str) -> Result<Response> {
+    let namespace = env.durable_object("PROXYIP_REFRESHER")?;
+    let stub = namespace
+        .id_from_name("authoritative-all-json")?
+        .get_stub()?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let request = Request::new_with_init(&format!("https://veilweave.internal/{route}"), &init)?;
+    stub.fetch_with_request(request).await
+}
+
+async fn load_known_good(kv: &KvStore) -> Result<ProxyIpDataset, ProxyIpError> {
+    for key in [ACTIVE_KEY, PREVIOUS_KEY] {
+        if let Ok(Some(value)) = kv.get(key).text().await {
+            match parse_cached(&value) {
+                Ok(dataset) => {
+                    if key == PREVIOUS_KEY {
+                        console_warn!(
+                            "event=proxyip_cache status=fallback reason=active_missing_or_invalid"
+                        );
+                    }
+                    return Ok(dataset);
+                }
+                Err(error) => console_error!(
+                    "event=proxyip_cache status=invalid key={} code={}",
+                    key,
+                    error.code.as_str()
+                ),
+            }
+        }
+    }
+    Err(ProxyIpError::new(
+        ProxyIpErrorCode::DatasetUnavailable,
+        "no known-good proxyIP generation exists",
+    ))
+}
+
+async fn refresh_and_record(kv: &KvStore) -> Result<ProxyIpDataset, ProxyIpError> {
+    match refresh_proxyip(kv).await {
+        Ok(dataset) => {
+            let _ = kv.delete(FAILURE_KEY).await;
+            Ok(dataset)
+        }
+        Err(error) => {
+            let failure = refresh_failure(&error);
+            if let Ok(value) = serde_json::to_string(&failure) {
+                if let Ok(put) = kv.put(FAILURE_KEY, value) {
+                    let _ = put.execute().await;
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn refresh_failure(error: &ProxyIpError) -> RefreshFailure {
+    RefreshFailure {
+        at_ms: now_ms(),
+        code: error.code.as_str().to_string(),
+        message: truncate_diagnostic(&error.detail),
+    }
+}
+
+async fn refresh_proxyip(kv: &KvStore) -> Result<ProxyIpDataset, ProxyIpError> {
+    let active_raw = kv.get(ACTIVE_KEY).text().await.ok().flatten();
+    let active = active_raw
+        .as_deref()
+        .and_then(|value| parse_cached(value).ok());
+    let previous_raw = if active.is_none() {
+        kv.get(PREVIOUS_KEY).text().await.ok().flatten()
+    } else {
+        None
+    };
+    let previous = active.clone().or_else(|| {
+        previous_raw
+            .as_deref()
+            .and_then(|value| parse_cached(value).ok())
+    });
+
+    let fetched = fetch_proxyip_source(
+        previous
+            .as_ref()
+            .and_then(|dataset| dataset.source_etag.as_deref()),
+    )
+    .await?;
+    let candidate = match fetched {
+        SourceFetch::NotModified => {
+            let mut dataset = previous.clone().ok_or_else(|| {
+                ProxyIpError::new(
+                    ProxyIpErrorCode::DatasetUnavailable,
+                    "source returned 304 but no known-good cache exists",
+                )
+            })?;
+            dataset.refreshed_at_ms = now_ms();
+            dataset
+        }
+        SourceFetch::Modified { bytes, etag } => {
+            ProxyIpDataset::from_source(&bytes, now_ms(), etag)?
+        }
+    };
+    validate_promotion(previous.as_ref(), &candidate)?;
+
+    let candidate_raw = serde_json::to_string(&candidate).map_err(|error| {
+        ProxyIpError::new(
+            ProxyIpErrorCode::DatasetInvalid,
+            format!("compact dataset serialization failed: {error}"),
+        )
+    })?;
+    let known_good_raw = active_raw.as_deref().or(previous_raw.as_deref());
+    if let Some(value) = known_good_raw {
+        kv.put(PREVIOUS_KEY, value)
+            .map_err(|error| cache_write_error("prepare previous generation", error))?
+            .execute()
+            .await
+            .map_err(|error| cache_write_error("prepare previous generation", error))?;
+    }
+    kv.put(ACTIVE_KEY, candidate_raw)
+        .map_err(|error| cache_write_error("promote active generation", error))?
+        .execute()
+        .await
+        .map_err(|error| cache_write_error("promote active generation", error))?;
+    Ok(candidate)
+}
+
+enum SourceFetch {
+    NotModified,
+    Modified {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
+}
+
+async fn fetch_proxyip_source(etag: Option<&str>) -> Result<SourceFetch, ProxyIpError> {
+    let controller = AbortController::default();
+    let signal = controller.signal();
+    let fetch = fetch_proxyip_source_inner(etag, &signal).boxed_local();
+    let timeout = Delay::from(Duration::from_secs(FETCH_TIMEOUT_SECS)).boxed_local();
+
+    let result = match select(fetch, timeout).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => {
+            controller.abort();
+            Err(ProxyIpError::new(
+                ProxyIpErrorCode::Timeout,
+                format!("source fetch exceeded {FETCH_TIMEOUT_SECS} seconds"),
+            ))
+        }
+    };
+    result
+}
+
+async fn fetch_proxyip_source_inner(
+    etag: Option<&str>,
+    signal: &AbortSignal,
+) -> Result<SourceFetch, ProxyIpError> {
+    // Use worker-rs's simple constructor: Cloudflare's runtime rejects the
+    // otherwise standards-valid custom redirect/cache RequestInit options on
+    // deployed Workers. Fetch applies its bounded default redirect policy; the
+    // final response still has to pass strict status, size, schema, and dataset
+    // validation before it can be promoted.
+    let mut request = Request::new(SOURCE_URL, Method::Get).map_err(fetch_error)?;
+    let headers = request.headers_mut().map_err(fetch_error)?;
+    for (name, value) in source_request_headers(etag) {
+        headers.set(name, &value).map_err(fetch_error)?;
+    }
+    let mut response = Fetch::Request(request)
+        .send_with_signal(signal)
+        .await
+        .map_err(fetch_error)?;
+
+    if response.status_code() == 304 {
+        return Ok(SourceFetch::NotModified);
+    }
+    if response.status_code() != 200 {
+        return Err(ProxyIpError::new(
+            ProxyIpErrorCode::HttpStatus,
+            format!("source returned HTTP {}", response.status_code()),
+        ));
+    }
+
+    if let Ok(Some(length)) = response.headers().get("Content-Length") {
+        if length
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|length| length > MAX_SOURCE_BYTES)
+        {
+            return Err(ProxyIpError::new(
+                ProxyIpErrorCode::Oversized,
+                format!("source Content-Length exceeds {MAX_SOURCE_BYTES} bytes"),
+            ));
+        }
+    }
+    let response_etag = response.headers().get("ETag").ok().flatten();
+    let mut bytes = Vec::new();
+    let mut stream = response.stream().map_err(fetch_error)?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(fetch_error)?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_SOURCE_BYTES {
+            return Err(ProxyIpError::new(
+                ProxyIpErrorCode::Oversized,
+                format!("source body exceeds {MAX_SOURCE_BYTES} bytes"),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(SourceFetch::Modified {
+        bytes,
+        etag: response_etag,
+    })
+}
+
+fn source_request_headers(etag: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("Accept", "application/json, text/plain;q=0.8".to_string())];
+    if let Some(etag) = etag {
+        headers.push(("If-None-Match", etag.to_string()));
+    }
+    headers
+}
+
+fn fetch_error(error: impl fmt::Display) -> ProxyIpError {
+    ProxyIpError::new(ProxyIpErrorCode::FetchFailed, error.to_string())
+}
+
+fn cache_write_error(operation: &str, error: impl fmt::Display) -> ProxyIpError {
+    ProxyIpError::new(
+        ProxyIpErrorCode::CacheWriteFailed,
+        format!("{operation}: {error}"),
+    )
+}
+
+fn resolve_kv(env: &Env) -> Option<KvStore> {
+    env.var("KV_BINDING")
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|binding| env.kv(&binding).ok())
+        .or_else(|| env.kv("VEILWEAVE_KV").ok())
+        .or_else(|| env.kv("KV").ok())
+}
+
+fn query_token_is_valid(req: &Request, env: &Env) -> bool {
+    let Some(expected) = subscription_token(env) else {
+        return false;
+    };
+    let Ok(url) = req.url() else {
+        return false;
+    };
+    url.query_pairs()
+        .find(|(key, _)| key == "token" || key == "t")
+        .is_some_and(|(_, value)| constant_time_eq(value.as_bytes(), expected.as_bytes()))
+}
+
+fn bearer_token_is_valid(req: &Request, env: &Env) -> bool {
+    let Some(expected) = subscription_token(env) else {
+        return false;
+    };
+    let Ok(Some(header)) = req.headers().get("Authorization") else {
+        return false;
+    };
+    let Some(value) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    constant_time_eq(value.as_bytes(), expected.as_bytes())
+}
+
+fn subscription_token(env: &Env) -> Option<String> {
+    env.var("SUBSCRIPTION_TOKEN")
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let max = left.len().max(right.len());
+    for index in 0..max {
+        difference |= left.get(index).copied().unwrap_or(0) as usize
+            ^ right.get(index).copied().unwrap_or(0) as usize;
+    }
+    difference == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Raw,
+    Base64,
+}
+
+impl OutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Base64 => "base64",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubscriptionOptions {
+    country: Option<String>,
+    filter: Vec<String>,
+    secure: bool,
+    format: OutputFormat,
+}
+
+impl SubscriptionOptions {
+    fn from_request(req: &Request) -> Result<Self, String> {
+        let url = req
+            .url()
+            .map_err(|_| "Invalid subscription URL.".to_string())?;
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        Self::from_pairs(&pairs)
+    }
+
+    fn from_pairs(pairs: &[(String, String)]) -> Result<Self, String> {
+        let value = |names: &[&str]| {
+            pairs
+                .iter()
+                .find(|(key, _)| names.contains(&key.as_str()))
+                .map(|(_, value)| value.as_str())
+        };
+        let country = value(&["country", "cc"])
+            .map(parse_country_code)
+            .transpose()?;
+        let filter = match value(&["filter", "c"]) {
+            Some(raw) => parse_filter(raw)?,
+            None => Vec::new(),
+        };
+        if country.is_some() && !filter.is_empty() {
+            return Err("country and filter cannot be combined.".to_string());
+        }
+        let secure = match value(&["secure"]) {
+            None | Some("1") | Some("true") => true,
+            Some("0") | Some("false") => false,
+            Some(_) => return Err("secure must be true, false, 1, or 0.".to_string()),
+        };
+        let format = match value(&["format"]) {
+            None | Some("raw") | Some("vless") => OutputFormat::Raw,
+            Some("base64") => OutputFormat::Base64,
+            Some(_) => return Err("format must be raw or base64.".to_string()),
+        };
+        Ok(Self {
+            country,
+            filter,
+            secure,
+            format,
+        })
+    }
+
+    fn requested_countries(&self) -> Option<&[String]> {
+        if let Some(country) = self.country.as_ref() {
+            Some(std::slice::from_ref(country))
+        } else if self.filter.is_empty() {
+            None
+        } else {
+            Some(&self.filter)
+        }
+    }
+}
+
+fn parse_filter(raw: &str) -> Result<Vec<String>, String> {
+    let mut countries = Vec::new();
+    let mut seen = HashSet::new();
+    for part in raw
+        .split(|character: char| character == ',' || character == '+' || character.is_whitespace())
+    {
+        if part.is_empty() {
+            continue;
+        }
+        let country = parse_country_code(part)?;
+        if seen.insert(country.clone()) {
+            countries.push(country);
+        }
+    }
+    if countries.is_empty() {
+        return Err("filter must contain at least one ISO country code.".to_string());
+    }
+    Ok(countries)
+}
+
+fn configured_max_nodes(env: &Env) -> Result<usize, String> {
+    let raw = env
         .var("MAX_NODES")
         .ok()
-        .and_then(|v| v.to_string().parse::<usize>().ok())
-        .unwrap_or(MAX_NODES);
-    entries = ip_selector::select_best_ips(&user_geo, &entries, max_nodes);
-
-    // Shuffle within country groups for distribution
-    if !entries.is_empty() {
-        shuffle_within_groups(&mut entries);
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| DEFAULT_MAX_NODES.to_string());
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| "MAX_NODES is not a valid integer.".to_string())?;
+    if !(1..=MAX_NODES_LIMIT).contains(&value) {
+        return Err(format!(
+            "MAX_NODES must be between 1 and {MAX_NODES_LIMIT}."
+        ));
     }
-
-    // Load veilweave relay nodes (for load balancing & HA)
-    let veilweave_nodes = load_veilweave_nodes(env);
-    if veilweave_nodes.is_empty() {
-        return server_error();
-    }
-
-    let secure = extract_param(query, "secure")
-        .map(|s| s == "1" || s == "true")
-        .unwrap_or(true);
-
-    // Fetch carrier-optimized entry IPs (优选IP); empty on failure → domain fallback.
-    let optimized_ips = fetch_optimized_ips(kv.as_ref()).await.unwrap_or_default();
-
-    let body = build_subscription(
-        env,
-        &veilweave_nodes,
-        secure,
-        filter.as_deref(),
-        req_country.as_deref(),
-        &entries,
-        &user_geo,
-        &optimized_ips,
-    )
-    .await;
-
-    // Cache the result
-    if let Some(kv_ref) = kv.as_ref() {
-        if let Ok(put) = kv_ref.put(&cache_key, &body) {
-            let _ = put.expiration_ttl(SUB_CACHE_TTL_SECONDS).execute().await;
-        }
-    }
-
-    build_response(&body, false).await
+    Ok(value)
 }
 
-async fn fetch_proxyip_list(kv: Option<&KvStore>, env: &Env) -> Result<Vec<EgressEntry>> {
-    // Check cache first
-    if let Some(kv_ref) = kv {
-        if let Ok(Some(cached)) = kv_ref.get(PROXYIP_CACHE_KEY).text().await {
-            if let Ok(Some(date_str)) = kv_ref.get(PROXYIP_CACHE_DATE_KEY).text().await {
-                let today = today_ymd();
-                if date_str == today {
-                    return Ok(parse_cached_proxyip(&cached));
-                }
-            }
-        }
-    }
-
-    // Cache miss or expired: fetch from API
-    let builtin_disabled = env
-        .var("DISABLE_BUILTIN_PROXYIP")
-        .map(|v| v.to_string() == "true")
-        .unwrap_or(false);
-
-    let mut entries = Vec::new();
-
-    if !builtin_disabled {
-        let mut resp = Fetch::Request(Request::new(PROXYIP_API_URL, Method::Get)?)
-            .send()
-            .await?;
-
-        if resp.status_code() == 200 {
-            let json_text = resp.text().await?;
-            if let Ok(parsed) = serde_json::from_str::<ProxyipApiResponse>(&json_text) {
-                for item in parsed.data {
-                    let port = item.port.first().copied().unwrap_or(item.meta.port);
-                    let country = normalize_country(&item.meta.country);
-                    entries.push(EgressEntry {
-                        host: item.ip,
-                        port,
-                        country,
-                    });
-                }
-            }
-        }
-    }
-
-    // Also load from inline env vars if present
-    if let Ok(list) = env.var("PROXYIP_LIST") {
-        entries.extend(parse_egress_list(&list.to_string()));
-    }
-
-    // Cache the result
-    if let Some(kv_ref) = kv {
-        let cache_text = serialize_proxyip_cache(&entries);
-        let today = today_ymd();
-        if let Ok(put) = kv_ref.put(PROXYIP_CACHE_KEY, &cache_text) {
-            let _ = put.expiration_ttl(CACHE_TTL_SECONDS).execute().await;
-        }
-        if let Ok(put) = kv_ref.put(PROXYIP_CACHE_DATE_KEY, &today) {
-            let _ = put.expiration_ttl(CACHE_TTL_SECONDS).execute().await;
-        }
-    }
-
-    Ok(entries)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_subscription(
-    env: &Env,
-    relay_nodes: &[RelayNode],
+struct RenderConfig {
     secure: bool,
-    filter: Option<&str>,
-    _req_country: Option<&str>,
-    entries: &[EgressEntry],
-    user_geo: &geo::UserGeo,
-    optimized_ips: &optimized_ip::OptimizedIPs,
-) -> String {
-    let security = if secure { "tls" } else { "none" };
+    fingerprint: String,
+    alpn: String,
+    ech: Option<String>,
+}
 
-    // VLESS Encryption (`mlkem768x25519plus`) is carried per node in the combined
-    // VEILWEAVE_NODES secret: when a node's blob holds an X25519 public key, its
-    // links advertise post-quantum, forward-secret in-stream encryption end-to-end
-    // (client ⇄ worker), so even Cloudflare — which terminates the outer TLS —
-    // cannot read the tunnelled traffic. Nodes without a key emit `encryption=none`.
-
-    let fp = env
-        .var("FP")
-        .map(|v| v.to_string())
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "chrome".to_string());
-
-    // ALPN suffix — default to http/1.1 (matches veilweave-tools). Empty disables.
-    let alpn = env
-        .var("ALPN")
-        .map(|v| v.to_string())
-        .ok()
-        .unwrap_or_else(|| "http/1.1".to_string());
-    let mut alpn_suffix = String::new();
-    if secure && !alpn.trim().is_empty() {
-        let _ = write!(alpn_suffix, "&alpn={}", percent_encode(&alpn));
-    }
-
-    // ECH suffix — default matches veilweave-tools. Set ECH="" to disable.
-    let ech = env
-        .var("ECH")
-        .map(|v| v.to_string())
-        .ok()
-        .unwrap_or_else(|| "cloudflare-ech.com+https://dns.alidns.com/dns-query".to_string());
-    let mut ech_suffix = String::new();
-    if secure && !ech.trim().is_empty() {
-        let _ = write!(ech_suffix, "&ech={}", percent_encode(&ech));
-    }
-
-    // Optimized entry IPs for this carrier (rotated across nodes for availability).
-    let optimized_ip_list = get_optimized_ip_list(user_geo.carrier, optimized_ips);
-
-    let cap = entries.len().min(MAX_NODES);
-    if cap == 0 || relay_nodes.is_empty() {
-        let fallback_host = relay_nodes
-            .first()
-            .map(|n| n.domain.as_str())
-            .unwrap_or("veilweave.example.com");
-        let fallback_enc = relay_nodes
-            .first()
-            .map(|n| n.enc_param.as_str())
-            .unwrap_or("none");
-        return format!(
-            "vless://00000000-0000-0000-0000-000000000000@{}:443?encryption={}&security={}&type=ws&host={}#{}",
-            percent_encode(fallback_host),
-            fallback_enc,
-            security,
-            percent_encode(fallback_host),
-            percent_encode(&format!(
-                "No nodes available{}",
-                filter.map(|f| format!(" (filter: {})", f)).unwrap_or_default()
-            ))
-        );
-    }
-
-    let entry_port: u16 = if secure { 443 } else { 80 };
-
-    let mut out = String::with_capacity(cap * 256);
-    let mut country_counters: HashMap<String, usize> = HashMap::new();
-
-    for (idx, proxy_entry) in entries[..cap].iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
+impl RenderConfig {
+    fn from_env(env: &Env, secure: bool) -> Result<Self, String> {
+        let fingerprint = env
+            .var("FP")
+            .ok()
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "chrome".to_string());
+        if !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("FP contains unsupported characters.".to_string());
         }
+        let alpn = env
+            .var("ALPN")
+            .ok()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "http/1.1".to_string());
+        let ech = env
+            .var("ECH")
+            .ok()
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        if let Some(ech) = &ech {
+            if ech.len() > 512 || ech.chars().any(char::is_control) {
+                return Err("ECH configuration is invalid.".to_string());
+            }
+        }
+        Ok(Self {
+            secure,
+            fingerprint,
+            alpn,
+            ech,
+        })
+    }
+}
 
-        // Round-robin the relay node; its codec signs this node's UUID.
-        let relay = &relay_nodes[idx % relay_nodes.len()];
+fn build_subscription(
+    relay_nodes: &[RelayNode],
+    config: &RenderConfig,
+    entries: &[EgressEntry],
+    optimized_ip_list: &[String],
+    nonce_bytes: &[u8],
+) -> Result<String, String> {
+    if relay_nodes.is_empty() || entries.is_empty() {
+        return Err("no relay or proxyIP entries are available".to_string());
+    }
+    if nonce_bytes.len() != entries.len() * 4 {
+        return Err("nonce byte count does not match node count".to_string());
+    }
 
-        // Egress baked into the UUID: an IPv4 proxyip if parseable, else direct.
-        let (type_byte, octets, egress_port) = match try_parse_ipv4_octets(&proxy_entry.host) {
-            Some(o) => (TYPE_PROXYIP, o, proxy_entry.port),
-            None => (codec::TYPE_DIRECT, [0u8, 0, 0, 0], 0u16),
-        };
-        let nonce = next_nonce();
-        let uuid_bytes = relay.codec.encode(type_byte, octets, egress_port, &nonce);
-        let uuid = format_uuid(&uuid_bytes);
+    let security = if config.secure { "tls" } else { "none" };
+    let entry_port = if config.secure { 443 } else { 80 };
+    let mut output = String::with_capacity(entries.len() * 256);
+    let mut country_counters = HashMap::<String, usize>::new();
 
-        // Entry connection address: a carrier-optimized CF IP, else the relay
-        // domain itself (always routable). host/SNI are always the relay domain so
-        // Cloudflare routes to the right worker.
+    for (index, proxy_entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let relay = &relay_nodes[index % relay_nodes.len()];
+        let octets = parse_ipv4_octets(&proxy_entry.host)
+            .ok_or_else(|| "prepared proxyIP entry is not IPv4".to_string())?;
+        let mut nonce = [0u8; 4];
+        nonce.copy_from_slice(&nonce_bytes[index * 4..index * 4 + 4]);
+        let uuid = format_uuid(
+            &relay
+                .codec
+                .encode(TYPE_PROXYIP, octets, proxy_entry.port, &nonce),
+        );
+
         let entry_host = if optimized_ip_list.is_empty() {
             relay.domain.as_str()
         } else {
-            optimized_ip_list[idx % optimized_ip_list.len()].as_str()
+            optimized_ip_list[index % optimized_ip_list.len()].as_str()
         };
-
-        let path = PRNG.with(|p| path::realistic_ws_path(&mut p.borrow_mut()));
-        // Name reflects the proxyip's location — that is what `filter` selects on,
-        // so the user sees the egress country of each node.
-        let cc = if proxy_entry.country.is_empty() {
+        let path = PRNG.with(|state| path::realistic_ws_path(&mut state.borrow_mut()));
+        let country = if proxy_entry.country.is_empty() {
             "XX"
         } else {
             &proxy_entry.country
         };
-        let counter = country_counters.entry(cc.to_string()).or_insert(0);
+        let counter = country_counters.entry(country.to_string()).or_insert(0);
         *counter += 1;
-        let label = format!("{}-{:02}", cc, counter);
+        let label = format!("{}-{:02}", country, counter);
 
-        let _ = write!(
-            out,
+        write!(
+            output,
             "vless://{}@{}:{}?encryption={}&security={}&type=ws&host={}&path={}",
             uuid,
             entry_host,
@@ -365,29 +761,52 @@ async fn build_subscription(
             security,
             percent_encode(&relay.domain),
             percent_encode(&path)
-        );
+        )
+        .map_err(|_| "formatting subscription URI failed".to_string())?;
 
-        if secure {
-            let _ = write!(out, "&sni={}&fp={}", percent_encode(&relay.domain), fp);
-            out.push_str(&alpn_suffix);
-            out.push_str(&ech_suffix);
-            out.push_str("&insecure=0&allowInsecure=0");
+        if config.secure {
+            write!(
+                output,
+                "&sni={}&fp={}",
+                percent_encode(&relay.domain),
+                percent_encode(&config.fingerprint)
+            )
+            .map_err(|_| "formatting TLS parameters failed".to_string())?;
+            if !config.alpn.trim().is_empty() {
+                write!(output, "&alpn={}", percent_encode(&config.alpn))
+                    .map_err(|_| "formatting ALPN failed".to_string())?;
+            }
+            if let Some(ech) = &config.ech {
+                write!(output, "&ech={}", percent_encode(ech))
+                    .map_err(|_| "formatting ECH failed".to_string())?;
+            }
+            output.push_str("&insecure=0&allowInsecure=0");
         }
-
-        let _ = write!(out, "#{}", percent_encode(&label));
+        write!(output, "#{}", percent_encode(&label))
+            .map_err(|_| "formatting node label failed".to_string())?;
     }
-
-    out
+    Ok(output)
 }
 
-async fn build_response(body: &str, cached: bool) -> Result<Response> {
+fn build_subscription_response(
+    raw: &str,
+    format: OutputFormat,
+    node_count: usize,
+    revision: &str,
+    stale: bool,
+) -> Result<Response> {
+    let body = match format {
+        OutputFormat::Raw => raw.to_string(),
+        OutputFormat::Base64 => general_purpose::STANDARD.encode(raw.as_bytes()),
+    };
     let headers = Headers::new();
     headers.set("Content-Type", "text/plain; charset=utf-8")?;
-    headers.set("Profile-Update-Interval", "6")?;
-    let node_count = body.lines().filter(|l| !l.is_empty()).count();
+    headers.set("Cache-Control", "private, no-store")?;
+    headers.set("Profile-Update-Interval", PROFILE_UPDATE_INTERVAL_HOURS)?;
+    headers.set("X-Veilweave-Format", format.as_str())?;
     headers.set("X-Node-Count", &node_count.to_string())?;
-    headers.set("X-Cache", if cached { "HIT" } else { "MISS" })?;
-
+    headers.set("X-ProxyIP-Revision", revision)?;
+    headers.set("X-ProxyIP-Stale", if stale { "true" } else { "false" })?;
     Ok(Response::ok(body)?.with_headers(headers))
 }
 
@@ -395,120 +814,41 @@ fn not_found() -> Result<Response> {
     Response::error("404 Not Found", 404)
 }
 
-fn server_error() -> Result<Response> {
-    Response::error("500 Server Error", 500)
+fn client_error(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", "text/plain; charset=utf-8")?;
+    headers.set("Cache-Control", "no-store")?;
+    Ok(Response::error(message, 400)?.with_headers(headers))
 }
 
-fn extract_param(query: &str, key: &str) -> Option<String> {
-    for part in query.split('&') {
-        if let Some((k, v)) = part.split_once('=') {
-            if k == key {
-                return url_decode(v);
-            }
-        }
-    }
-    None
+fn unavailable(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", "text/plain; charset=utf-8")?;
+    headers.set("Cache-Control", "no-store")?;
+    headers.set("Retry-After", "60")?;
+    Ok(Response::error(message, 503)?.with_headers(headers))
+}
+
+fn json_response<T: Serialize>(value: &T, status: u16) -> Result<Response> {
+    let body = serde_json::to_string(value)?;
+    let headers = Headers::new();
+    headers.set("Content-Type", "application/json; charset=utf-8")?;
+    headers.set("Cache-Control", "no-store")?;
+    Ok(Response::from_body(ResponseBody::Body(body.into_bytes()))?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 fn extract_cf_header(req: &Request, header: &str) -> Option<String> {
-    req.headers()
-        .get(header)
-        .ok()
-        .flatten()
-        .map(|v| v.to_string())
+    req.headers().get(header).ok().flatten()
 }
 
-fn url_decode(s: &str) -> Option<String> {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(hex as char);
-                    i += 3;
-                    continue;
-                }
-                return None;
-            }
-            b'+' => {
-                out.push(' ');
-                i += 1;
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
-            }
-        }
-    }
-    Some(out)
+fn now_ms() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
 }
 
-fn build_geo_cache_key(
-    user_country: &str,
-    user_asn: Option<u32>,
-    filter: Option<&str>,
-    req_country: Option<&str>,
-) -> String {
-    let mut h = 0u64;
-
-    // Include user country in cache key
-    for b in user_country.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as u64);
-    }
-
-    // Include user ASN (ISP) in cache key for better locality
-    if let Some(asn) = user_asn {
-        h ^= 0x9e3779b97f4a7c17;
-        h = h.wrapping_mul(31).wrapping_add(asn as u64);
-    }
-
-    // Include filters
-    if let Some(f) = filter {
-        h ^= 0x9e3779b97f4a7c18;
-        for b in f.bytes() {
-            h = h.wrapping_mul(31).wrapping_add(b as u64);
-        }
-    }
-
-    if let Some(c) = req_country {
-        h ^= 0x9e3779b97f4a7c19;
-        for b in c.bytes() {
-            h = h.wrapping_mul(31).wrapping_add(b as u64);
-        }
-    }
-
-    format!("sub_geo2:{:016x}:{}", h, today_ymd())
-}
-
-fn today_ymd() -> String {
-    let now = js_sys::Date::new_0();
-    format!(
-        "{:04}-{:02}-{:02}",
-        now.get_utc_full_year(),
-        now.get_utc_month() + 1,
-        now.get_utc_date()
-    )
-}
-
-fn init_prng() {
-    let seed = js_sys::Date::now() as u64;
-    PRNG.with(|p| *p.borrow_mut() = Xorshift64::new(seed));
-}
-
-#[allow(dead_code)]
-fn fast_random(max: u32) -> u32 {
-    if max == 0 {
-        return 0;
-    }
-    PRNG.with(|p| p.borrow_mut().next_range(max as u64) as u32)
-}
-
-/// Four fresh nonce bytes for UUID encoding, drawn from the per-request PRNG.
-fn next_nonce() -> [u8; 4] {
-    let r = PRNG.with(|p| p.borrow_mut().next());
-    [(r >> 24) as u8, (r >> 16) as u8, (r >> 8) as u8, r as u8]
+fn init_prng(seed: u64) {
+    PRNG.with(|state| *state.borrow_mut() = Xorshift64::new(seed));
 }
 
 struct Xorshift64 {
@@ -517,331 +857,338 @@ struct Xorshift64 {
 
 impl Xorshift64 {
     fn new(seed: u64) -> Self {
-        let mut s = seed;
-        if s == 0 {
-            s = 0xdeadbeefc0febabe;
+        Self {
+            state: if seed == 0 { 0xdeadbeefc0febabe } else { seed },
         }
-        Self { state: s }
     }
+
     fn next(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
     }
+
     fn next_range(&mut self, max: u64) -> u64 {
         if max == 0 {
-            return 0;
-        }
-        self.next() % max
-    }
-}
-
-fn dedup_key(host: &str, port: u16) -> u64 {
-    if let Some(ip) = try_parse_ipv4_u32(host) {
-        return ((ip as u64) << 16) | (port as u64);
-    }
-    fnv1a_hash(host, port)
-}
-
-fn try_parse_ipv4_u32(s: &str) -> Option<u32> {
-    try_parse_ipv4_octets(s).map(u32::from_be_bytes)
-}
-
-fn try_parse_ipv4_octets(s: &str) -> Option<[u8; 4]> {
-    let mut octets = [0u8; 4];
-    let mut idx = 0usize;
-    let mut current = 0u16;
-    for b in s.bytes() {
-        match b {
-            b'0'..=b'9' => {
-                current = current.checked_mul(10)?.checked_add((b - b'0') as u16)?;
-                if current > 255 {
-                    return None;
-                }
-            }
-            b'.' => {
-                if idx >= 3 {
-                    return None;
-                }
-                octets[idx] = current as u8;
-                idx += 1;
-                current = 0;
-            }
-            _ => return None,
-        }
-    }
-    if idx != 3 || current > 255 {
-        return None;
-    }
-    octets[3] = current as u8;
-    Some(octets)
-}
-
-fn fnv1a_hash(host: &str, port: u16) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in host.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h ^= (port >> 8) as u64;
-    h = h.wrapping_mul(0x100000001b3);
-    h ^= (port & 0xff) as u64;
-    h = h.wrapping_mul(0x100000001b3);
-    h
-}
-
-fn is_valid_egress(host: &str, port: u16) -> bool {
-    // Only CF TLS ports
-    if !matches!(port, 443 | 2053 | 2083 | 2087 | 2096 | 8443) {
-        return false;
-    }
-
-    // IPv6: accept anything except loopback
-    if host.starts_with('[') {
-        return true;
-    }
-
-    // IPv4: reject private/reserved ranges
-    match try_parse_ipv4_octets(host) {
-        Some([a, b, c, _]) => {
-            // Reserved/private ranges
-            !(a == 0
-                || a == 10
-                || a == 127
-                || (a == 169 && b == 254)
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 168)
-                || (a == 192 && b == 0 && c == 0)
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113)
-                || (a == 198 && (b == 18 || b == 19))
-                || a >= 224)
-        }
-        None => true, // Treat as domain name
-    }
-}
-
-fn shuffle_within_groups(entries: &mut [EgressEntry]) {
-    if entries.is_empty() {
-        return;
-    }
-    let mut rng = Xorshift64::new(PRNG.with(|p| p.borrow_mut().next()));
-
-    let mut start = 0;
-    for i in 1..=entries.len() {
-        if i == entries.len() || entries[i].country != entries[start].country {
-            for j in (start + 1..i).rev() {
-                let k = rng.next_range((j - start + 1) as u64) as usize + start;
-                entries.swap(j, k);
-            }
-            start = i;
+            0
+        } else {
+            self.next() % max
         }
     }
 }
 
-fn split_host_port(host_port: &str, default_port: u16) -> (String, u16) {
-    if host_port.starts_with('[') {
-        if let Some(bracket) = host_port.rfind(']') {
-            let host = host_port[..=bracket].to_string();
-            let rest = &host_port[bracket + 1..];
-            if let Some(port_str) = rest.strip_prefix(':') {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    return (host, port);
-                }
-            }
-            return (host, default_port);
-        }
+fn selection_seed(
+    revision: &str,
+    country: Option<&str>,
+    asn: Option<u32>,
+    requested: Option<&[String]>,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in revision
+        .bytes()
+        .chain(country.unwrap_or("").bytes())
+        .chain(asn.unwrap_or(0).to_be_bytes())
+        .chain(
+            requested
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.bytes()),
+        )
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-
-    if let Some(colon) = host_port.rfind(':') {
-        let (host, port_str) = host_port.split_at(colon);
-        if let Ok(port) = port_str[1..].parse::<u16>() {
-            return (host.to_string(), port);
-        }
-    }
-
-    (host_port.to_string(), default_port)
+    hash
 }
 
-fn parse_cached_proxyip(text: &str) -> Vec<EgressEntry> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let mut parts = line.splitn(2, '#');
-            let hostport = parts.next()?;
-            let country = parts.next().unwrap_or("").to_uppercase();
-            let (host, port) = split_host_port(hostport, 443);
-            Some(EgressEntry {
-                host,
-                port,
-                country,
-            })
-        })
-        .collect()
+fn parse_ipv4_octets(value: &str) -> Option<[u8; 4]> {
+    Some(value.parse::<std::net::Ipv4Addr>().ok()?.octets())
 }
 
-fn serialize_proxyip_cache(entries: &[EgressEntry]) -> String {
-    let mut out = String::with_capacity(entries.len() * 40);
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let _ = write!(out, "{}:{}#{}", e.host, e.port, e.country);
-    }
-    out
+fn truncate_diagnostic(detail: &str) -> String {
+    detail.chars().take(256).collect()
 }
 
-#[derive(Deserialize)]
-struct ProxyipApiResponse {
-    #[serde(rename = "data")]
-    data: Vec<ProxyipEntry>,
+#[derive(Serialize)]
+struct ProxyIpStatus<'a> {
+    source: &'static str,
+    validation: &'static str,
+    revision: Option<&'a str>,
+    last_success_ms: Option<u64>,
+    age_ms: Option<u64>,
+    stale: bool,
+    accepted_count: Option<usize>,
+    rejected_count: Option<usize>,
+    stored_count: Option<usize>,
+    country_count: Option<usize>,
+    last_failure: Option<RefreshFailure>,
 }
 
-#[derive(Deserialize)]
-struct ProxyipEntry {
-    #[serde(rename = "ip")]
-    ip: String,
-    #[serde(rename = "port")]
-    port: Vec<u16>,
-    #[serde(rename = "meta")]
-    meta: ProxyipMeta,
+#[derive(Serialize)]
+struct RefreshResult<'a> {
+    source: &'static str,
+    revision: &'a str,
+    accepted_count: usize,
+    rejected_count: usize,
+    stored_count: usize,
+    country_count: usize,
 }
 
-#[derive(Deserialize)]
-struct ProxyipMeta {
-    #[serde(rename = "country")]
-    country: String,
-    #[serde(rename = "_port")]
-    port: u16,
-}
-
-fn normalize_country(raw: &str) -> String {
-    let raw = raw.trim().to_uppercase();
-    match raw.as_str() {
-        "UK" | "UNITED KINGDOM" => "GB".to_string(),
-        "UNITED STATES" | "USA" => "US".to_string(),
-        "GERMANY" => "DE".to_string(),
-        "JAPAN" => "JP".to_string(),
-        "HONG KONG" => "HK".to_string(),
-        "SINGAPORE" => "SG".to_string(),
-        "NETHERLANDS" => "NL".to_string(),
-        "FRANCE" => "FR".to_string(),
-        "SOUTH KOREA" => "KR".to_string(),
-        "TAIWAN" => "TW".to_string(),
-        "AUSTRALIA" => "AU".to_string(),
-        "CANADA" => "CA".to_string(),
-        "BRAZIL" => "BR".to_string(),
-        "INDIA" => "IN".to_string(),
-        _ => {
-            if raw.len() == 2 && raw.chars().all(|c| c.is_ascii_alphabetic()) {
-                raw
-            } else {
-                "XX".to_string()
-            }
-        }
-    }
-}
-
-/// Entry IPs for this carrier (deduped, order preserved). Unknown/foreign carriers
-/// get the union of all lists so they still receive working entry IPs.
-fn get_optimized_ip_list(carrier: geo::Carrier, ips: &optimized_ip::OptimizedIPs) -> Vec<String> {
-    use geo::Carrier::*;
-    let mut list = match carrier {
-        CT => ips.ct.clone(),
-        CU => ips.cu.clone(),
-        CMCC => ips.cmcc.clone(),
-        Other => {
-            let mut all = Vec::with_capacity(ips.ct.len() + ips.cu.len() + ips.cmcc.len());
-            all.extend(ips.ct.iter().cloned());
-            all.extend(ips.cu.iter().cloned());
-            all.extend(ips.cmcc.iter().cloned());
-            all
-        }
-    };
-
-    let mut seen = HashSet::new();
-    list.retain(|ip| seen.insert(ip.clone()));
-    list
-}
-
-/// The VLESS `encryption` value for a node's X25519 public key: the single best
-/// profile (native + 1rtt + hybrid ML-KEM-768/X25519). Matches `veilweave-tools`.
 fn enc_param_from_pubkey(pubkey: [u8; 32]) -> String {
-    use base64::{engine::general_purpose, Engine as _};
     format!(
         "mlkem768x25519plus.native.1rtt.{}",
         general_purpose::URL_SAFE_NO_PAD.encode(pubkey)
     )
 }
 
-/// A veilweave relay node: the domain Cloudflare routes on (host/SNI), the per-node
-/// UUID codec built from that node's secret, and the VLESS `encryption` value to
-/// advertise (derived from the same secret's X25519 public key, or `none`).
 struct RelayNode {
     domain: String,
     codec: UuidCodec,
     enc_param: String,
 }
 
-/// Parse `VEILWEAVE_NODES` into relay nodes. Format per node:
-///   `domain|secret`  (preferred — explicit per-node combined secret)
-///   `domain`         (falls back to the shared `SECRET_KEY` env var)
-/// The secret is a `veilweave-tools gen-secret` sub blob (UUID secret + X25519
-/// public key) or a legacy raw secret (encryption off). Nodes are comma-separated;
-/// nodes without any resolvable secret are skipped.
 fn load_veilweave_nodes(env: &Env) -> Vec<RelayNode> {
-    let nodes_str = env
+    let nodes_value = env
         .var("VEILWEAVE_NODES")
         .ok()
-        .map(|v| v.to_string())
+        .map(|value| value.to_string())
         .unwrap_or_default();
-
     let shared_key = env
         .var("SECRET_KEY")
         .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty());
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
 
-    let mut nodes = Vec::new();
-    for node_spec in nodes_str.split(',') {
-        let spec = node_spec.trim();
-        if spec.is_empty() {
-            continue;
-        }
+    nodes_value
+        .split(',')
+        .filter_map(|node_spec| {
+            let spec = node_spec.trim();
+            if spec.is_empty() {
+                return None;
+            }
+            let (domain, key) = match spec.split_once('|') {
+                Some((domain, key)) => (domain.trim(), Some(key.trim().to_string())),
+                None => (spec, shared_key.clone()),
+            };
+            if !is_valid_hostname(domain) {
+                return None;
+            }
+            let key = key.filter(|value| !value.is_empty())?;
+            let parsed = secret::parse(&key);
+            let enc_param = parsed
+                .sub_public()
+                .map(enc_param_from_pubkey)
+                .unwrap_or_else(|| "none".to_string());
+            Some(RelayNode {
+                domain: domain.to_ascii_lowercase(),
+                codec: UuidCodec::new(&parsed.uuid_key),
+                enc_param,
+            })
+        })
+        .collect()
+}
 
-        // Split off an optional per-node secret after '|'. The domain never
-        // contains '|', so this is unambiguous.
-        let (domain, key) = match spec.split_once('|') {
-            Some((d, k)) => (d.trim().to_string(), Some(k.trim().to_string())),
-            None => (spec.to_string(), shared_key.clone()),
-        };
+fn is_valid_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 253 || !hostname.contains('.') {
+        return false;
+    }
+    hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
 
-        let key = match key {
-            Some(k) if !k.is_empty() => k,
-            _ => continue, // no key for this node → cannot sign UUIDs → skip
-        };
+fn get_optimized_ip_list(carrier: geo::Carrier, ips: &optimized_ip::OptimizedIPs) -> Vec<String> {
+    use geo::Carrier::*;
+    let mut list = match carrier {
+        CT => ips.ct.clone(),
+        CU => ips.cu.clone(),
+        CMCC => ips.cmcc.clone(),
+        Other => ips
+            .ct
+            .iter()
+            .chain(&ips.cu)
+            .chain(&ips.cmcc)
+            .cloned()
+            .collect(),
+    };
+    let mut seen = HashSet::new();
+    list.retain(|value| seen.insert(value.clone()));
+    list
+}
 
-        // The combined blob yields the UUID codec key and (for sub blobs) the
-        // X25519 public key to publish; a legacy raw secret keeps encryption off.
-        let parsed = secret::parse(&key);
-        let enc_param = parsed
-            .sub_public()
-            .map(enc_param_from_pubkey)
-            .unwrap_or_else(|| "none".to_string());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        nodes.push(RelayNode {
-            domain,
-            codec: UuidCodec::new(&parsed.uuid_key),
-            enc_param,
-        });
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
-    nodes
+    #[test]
+    fn query_formats_filters_and_country_are_explicit() {
+        let options = SubscriptionOptions::from_pairs(&pairs(&[
+            ("format", "base64"),
+            ("filter", "jp,US jp"),
+            ("secure", "false"),
+        ]))
+        .unwrap();
+        assert_eq!(options.format, OutputFormat::Base64);
+        assert_eq!(options.filter, vec!["JP", "US"]);
+        assert!(!options.secure);
+
+        let plus = SubscriptionOptions::from_pairs(&pairs(&[("filter", "jp+US+JP")])).unwrap();
+        assert_eq!(plus.filter, vec!["JP", "US"]);
+
+        assert!(
+            SubscriptionOptions::from_pairs(&pairs(&[("country", "JP"), ("filter", "US"),]))
+                .is_err()
+        );
+        assert!(SubscriptionOptions::from_pairs(&pairs(&[("filter", "USA")])).is_err());
+        assert!(SubscriptionOptions::from_pairs(&pairs(&[("format", "yaml")])).is_err());
+    }
+
+    #[test]
+    fn signed_uuid_render_uses_matching_relay_and_has_no_fake_node() {
+        let relays = vec![
+            RelayNode {
+                domain: "relay-a.example.com".into(),
+                codec: UuidCodec::new(b"relay-a-secret"),
+                enc_param: "none".into(),
+            },
+            RelayNode {
+                domain: "relay-b.example.com".into(),
+                codec: UuidCodec::new(b"relay-b-secret"),
+                enc_param: "none".into(),
+            },
+        ];
+        let entries = vec![
+            EgressEntry {
+                host: "8.8.8.8".into(),
+                port: 443,
+                country: "US".into(),
+            },
+            EgressEntry {
+                host: "9.9.9.9".into(),
+                port: 8443,
+                country: "JP".into(),
+            },
+        ];
+        init_prng(1);
+        let raw = build_subscription(
+            &relays,
+            &RenderConfig {
+                secure: true,
+                fingerprint: "chrome".into(),
+                alpn: "http/1.1".into(),
+                ech: None,
+            },
+            &entries,
+            &[],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        .unwrap();
+        let nodes: Vec<&str> = raw.lines().collect();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].contains("@relay-a.example.com:443"));
+        assert!(nodes[1].contains("@relay-b.example.com:443"));
+        assert!(!raw.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(!raw.contains("&ech="));
+    }
+
+    #[test]
+    fn tls_ech_is_explicit_and_plain_ws_has_no_tls_parameters() {
+        let relays = vec![RelayNode {
+            domain: "relay.example.com".into(),
+            codec: UuidCodec::new(b"relay-secret"),
+            enc_param: "none".into(),
+        }];
+        let entries = vec![EgressEntry {
+            host: "8.8.8.8".into(),
+            port: 443,
+            country: "US".into(),
+        }];
+
+        init_prng(1);
+        let tls = build_subscription(
+            &relays,
+            &RenderConfig {
+                secure: true,
+                fingerprint: "chrome".into(),
+                alpn: "http/1.1".into(),
+                ech: Some("config+https://dns.example/dns-query".into()),
+            },
+            &entries,
+            &[],
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+        assert!(tls.contains("security=tls"));
+        assert!(tls.contains("&ech=config%2Bhttps%3A%2F%2Fdns.example%2Fdns-query"));
+
+        init_prng(1);
+        let plain = build_subscription(
+            &relays,
+            &RenderConfig {
+                secure: false,
+                fingerprint: "chrome".into(),
+                alpn: "http/1.1".into(),
+                ech: Some("ignored-in-plaintext".into()),
+            },
+            &entries,
+            &[],
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+        assert!(plain.contains("@relay.example.com:80"));
+        assert!(plain.contains("security=none"));
+        assert!(!plain.contains("&sni="));
+        assert!(!plain.contains("&ech="));
+        assert!(!plain.contains("allowInsecure"));
+    }
+
+    #[test]
+    fn base64_contract_encodes_the_complete_raw_list() {
+        let raw = "vless://one\nvless://two";
+        let encoded = general_purpose::STANDARD.encode(raw.as_bytes());
+        assert_eq!(
+            general_purpose::STANDARD.decode(encoded).unwrap(),
+            raw.as_bytes()
+        );
+    }
+
+    #[test]
+    fn source_request_uses_only_fetch_compatible_headers() {
+        assert_eq!(
+            source_request_headers(None),
+            vec![("Accept", "application/json, text/plain;q=0.8".to_string())]
+        );
+        assert_eq!(
+            source_request_headers(Some("\"generation-a\"")),
+            vec![
+                ("Accept", "application/json, text/plain;q=0.8".to_string()),
+                ("If-None-Match", "\"generation-a\"".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn constant_time_comparison_and_hostname_validation_are_strict() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"different"));
+        assert!(is_valid_hostname("relay.example.com"));
+        assert!(!is_valid_hostname("https://relay.example.com"));
+        assert!(!is_valid_hostname("localhost"));
+    }
 }
