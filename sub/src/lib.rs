@@ -60,17 +60,42 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // multi-megabyte source parse to one named Durable Object invocation, which
     // has a 30-second CPU allowance and also serializes refreshes to prevent a
     // scheduled/manual stampede.
-    match invoke_proxyip_refresher(&env).await {
+    let refreshed = match invoke_proxyip_refresher(&env).await {
         Ok(response) if response.status_code() == 200 => {
-            console_log!("event=proxyip_refresh_dispatch status=ok")
+            console_log!("event=proxyip_refresh_dispatch status=ok");
+            true
         }
-        Ok(response) => console_error!(
-            "event=proxyip_refresh_dispatch status=failed http_status={}",
-            response.status_code()
-        ),
-        Err(error) => console_error!(
-            "event=proxyip_refresh_dispatch status=failed code=DurableObjectUnavailable detail={error}"
-        ),
+        Ok(response) => {
+            console_error!(
+                "event=proxyip_refresh_dispatch status=failed http_status={}",
+                response.status_code()
+            );
+            false
+        }
+        Err(error) => {
+            console_error!(
+                "event=proxyip_refresh_dispatch status=failed code=DurableObjectUnavailable detail={error}"
+            );
+            false
+        }
+    };
+
+    // Optional carrier-optimized Cloudflare entry addresses are deliberately a
+    // second Durable Object invocation. A provider/runtime failure here can
+    // never change the authoritative ProxyIP promotion result returned above.
+    if refreshed {
+        match invoke_proxyip_optimized_refresher(&env).await {
+            Ok(response) if response.status_code() == 200 => {
+                console_log!("event=optimized_ip_refresh_dispatch status=ok")
+            }
+            Ok(response) => console_warn!(
+                "event=optimized_ip_refresh_dispatch status=failed http_status={}",
+                response.status_code()
+            ),
+            Err(error) => {
+                console_warn!("event=optimized_ip_refresh_dispatch status=failed detail={error}")
+            }
+        }
     }
 }
 
@@ -225,13 +250,21 @@ async fn handle_proxyip_refresh(req: &Request, env: &Env) -> Result<Response> {
 }
 
 async fn invoke_proxyip_refresher(env: &Env) -> Result<Response> {
+    invoke_refresher_route(env, "refresh").await
+}
+
+async fn invoke_proxyip_optimized_refresher(env: &Env) -> Result<Response> {
+    invoke_refresher_route(env, "optimized").await
+}
+
+async fn invoke_refresher_route(env: &Env, route: &str) -> Result<Response> {
     let namespace = env.durable_object("PROXYIP_REFRESHER")?;
     let stub = namespace
         .id_from_name("authoritative-all-json")?
         .get_stub()?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
-    let request = Request::new_with_init("https://veilweave.internal/refresh", &init)?;
+    let request = Request::new_with_init(&format!("https://veilweave.internal/{route}"), &init)?;
     stub.fetch_with_request(request).await
 }
 
@@ -268,11 +301,7 @@ async fn refresh_and_record(kv: &KvStore) -> Result<ProxyIpDataset, ProxyIpError
             Ok(dataset)
         }
         Err(error) => {
-            let failure = RefreshFailure {
-                at_ms: now_ms(),
-                code: error.code.as_str().to_string(),
-                message: truncate_diagnostic(&error.detail),
-            };
+            let failure = refresh_failure(&error);
             if let Ok(value) = serde_json::to_string(&failure) {
                 if let Ok(put) = kv.put(FAILURE_KEY, value) {
                     let _ = put.execute().await;
@@ -280,6 +309,14 @@ async fn refresh_and_record(kv: &KvStore) -> Result<ProxyIpDataset, ProxyIpError
             }
             Err(error)
         }
+    }
+}
+
+fn refresh_failure(error: &ProxyIpError) -> RefreshFailure {
+    RefreshFailure {
+        at_ms: now_ms(),
+        code: error.code.as_str().to_string(),
+        message: truncate_diagnostic(&error.detail),
     }
 }
 

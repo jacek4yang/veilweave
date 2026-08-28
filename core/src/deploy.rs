@@ -1631,10 +1631,23 @@ async fn refresh_proxyip_dataset(
         .with_context(|| format!("proxyIP dataset refresh failed for {hostname}"))?;
     if response.status() != StatusCode::OK {
         let status = response.status();
-        let failure = proxyip_status(network, hostname, token)
+        let response_is_json = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"));
+        let direct_failure = response
+            .bytes()
             .await
             .ok()
-            .and_then(|status| status.last_failure);
+            .and_then(|body| parse_proxyip_refresh_failure(response_is_json, &body));
+        let failure = match direct_failure {
+            Some(failure) => Some(failure),
+            None => proxyip_status(network, hostname, token)
+                .await
+                .ok()
+                .and_then(|status| status.last_failure),
+        };
         bail!(
             "{}",
             proxyip_refresh_failure_message(status, failure.as_ref())
@@ -1655,6 +1668,20 @@ async fn refresh_proxyip_dataset(
         bail!("proxyIP refresh completed but the promoted known-good cache could not be verified");
     }
     Ok(refreshed)
+}
+
+fn parse_proxyip_refresh_failure(
+    response_is_json: bool,
+    body: &[u8],
+) -> Option<ProxyIpRefreshFailure> {
+    if !response_is_json || body.is_empty() || body.len() > MAX_MANAGEMENT_RESPONSE_BYTES {
+        return None;
+    }
+    let failure = serde_json::from_slice::<ProxyIpRefreshFailure>(body).ok()?;
+    if failure.code.is_empty() || failure.message.is_empty() {
+        return None;
+    }
+    Some(failure)
 }
 
 fn proxyip_refresh_failure_message(
@@ -2502,6 +2529,20 @@ mod tests {
             proxyip_refresh_failure_message(StatusCode::SERVICE_UNAVAILABLE, None),
             "proxyIP refresh endpoint returned HTTP 503 Service Unavailable; no structured Worker diagnostic was recorded"
         );
+
+        let parsed = parse_proxyip_refresh_failure(
+            true,
+            br#"{"at_ms":1,"code":"ProxyIpDatasetInvalid","message":"bad source"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.code, "ProxyIpDatasetInvalid");
+        assert_eq!(parsed.message, "bad source");
+        assert!(parse_proxyip_refresh_failure(false, b"{}").is_none());
+        assert!(parse_proxyip_refresh_failure(
+            true,
+            &vec![b'x'; MAX_MANAGEMENT_RESPONSE_BYTES + 1]
+        )
+        .is_none());
     }
 
     #[tokio::test]
