@@ -200,15 +200,31 @@ jobs:
 
           tools/target/release/veilweave-tools plan --config smoke.toml --bundle-dir smoke-bundle
           tools/target/release/veilweave-tools apply --config smoke.toml --bundle-dir smoke-bundle --yes
+          echo "Deployment state persisted; validating redacted local metadata"
           tools/target/release/veilweave-tools status --json > smoke-status.json
           SUB_ID=$(jq -er '.[] | select(.role == "sub") | .id' smoke-status.json)
           SUB_HOST=$(jq -er '.[] | select(.role == "sub") | .primary_hostname' smoke-status.json)
           test "$(jq '[.[] | select(.role == "relay")] | length' smoke-status.json)" -ge 1
+          echo "Redacted deployment metadata is valid; resolving the protected subscription credential"
 
-          SUB_TOKEN=$(secret-tool lookup service dev.veilweave.credentials \
-            username "deployment/$SUB_ID/subscription-token")
-          test -n "$SUB_TOKEN"
+          SUB_TOKEN=""
+          for credential_attempt in $(seq 1 5); do
+            if SUB_TOKEN=$(secret-tool lookup service dev.veilweave.credentials \
+              username "deployment/$SUB_ID/subscription-token" 2>/dev/null); then
+              if [ -n "$SUB_TOKEN" ]; then
+                break
+              fi
+            fi
+            if [ "$credential_attempt" -lt 5 ]; then
+              sleep 1
+            fi
+          done
+          if [ -z "$SUB_TOKEN" ]; then
+            echo "Subscription credential was not visible in Secret Service after bounded retries" >&2
+            exit 1
+          fi
           echo "::add-mask::$SUB_TOKEN"
+          echo "Protected subscription credential resolved"
           SUB_URL="https://$SUB_HOST/sub?token=$SUB_TOKEN"
 
           invalid_status=$(curl -sS -o invalid-token.txt -w '%{http_code}' \
