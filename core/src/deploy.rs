@@ -1629,6 +1629,17 @@ async fn refresh_proxyip_dataset(
         .await
         .map_err(reqwest::Error::without_url)
         .with_context(|| format!("proxyIP dataset refresh failed for {hostname}"))?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let failure = proxyip_status(network, hostname, token)
+            .await
+            .ok()
+            .and_then(|status| status.last_failure);
+        bail!(
+            "{}",
+            proxyip_refresh_failure_message(status, failure.as_ref())
+        );
+    }
     let refreshed: ProxyIpRefreshReport =
         parse_management_response(response, "proxyIP refresh").await?;
     if refreshed.source != "https://zip.cm.edu.kg/all.json"
@@ -1644,6 +1655,22 @@ async fn refresh_proxyip_dataset(
         bail!("proxyIP refresh completed but the promoted known-good cache could not be verified");
     }
     Ok(refreshed)
+}
+
+fn proxyip_refresh_failure_message(
+    status: StatusCode,
+    failure: Option<&ProxyIpRefreshFailure>,
+) -> String {
+    match failure {
+        Some(failure) => format!(
+            "proxyIP refresh endpoint returned HTTP {status}; Worker diagnostic {}: {}",
+            failure.code,
+            failure.message.replace(['\r', '\n'], " ")
+        ),
+        None => format!(
+            "proxyIP refresh endpoint returned HTTP {status}; no structured Worker diagnostic was recorded"
+        ),
+    }
 }
 
 async fn parse_management_response<T: for<'de> Deserialize<'de>>(
@@ -2458,6 +2485,23 @@ mod tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("did not become healthy"));
         assert!(rendered.contains("HTTP 404 Not Found"));
+    }
+
+    #[test]
+    fn proxyip_refresh_failure_reports_only_structured_worker_diagnostic() {
+        let failure = ProxyIpRefreshFailure {
+            at_ms: 1,
+            code: "ProxyIpFetchHttpStatus".into(),
+            message: "source returned HTTP 403\r\nsecond line".into(),
+        };
+        assert_eq!(
+            proxyip_refresh_failure_message(StatusCode::SERVICE_UNAVAILABLE, Some(&failure)),
+            "proxyIP refresh endpoint returned HTTP 503 Service Unavailable; Worker diagnostic ProxyIpFetchHttpStatus: source returned HTTP 403  second line"
+        );
+        assert_eq!(
+            proxyip_refresh_failure_message(StatusCode::SERVICE_UNAVAILABLE, None),
+            "proxyIP refresh endpoint returned HTTP 503 Service Unavailable; no structured Worker diagnostic was recorded"
+        );
     }
 
     #[tokio::test]
