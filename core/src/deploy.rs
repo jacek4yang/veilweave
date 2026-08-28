@@ -1328,6 +1328,17 @@ const CUSTOM_DOMAIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// Interval between policy-aware HTTPS checks during provisioning.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// A newly enabled workers.dev route can briefly return Cloudflare's 404 even
+/// after the deployment API has promoted the Worker version.
+#[cfg(not(test))]
+const WORKERS_DEV_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const WORKERS_DEV_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const WORKERS_DEV_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const WORKERS_DEV_CHECK_INTERVAL: Duration = Duration::from_millis(5);
+
 const MAX_MANAGEMENT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_RELAY_READINESS_BYTES: usize = 256 * 1024;
 
@@ -1395,58 +1406,24 @@ async fn verify_endpoint(
         format!("verifying https://{hostname}"),
     ));
 
-    // Custom DNS sockets would bypass explicit SOCKS/HTTP proxy policy. Poll
-    // the HTTPS endpoint through the configured transport instead; a valid
-    // response proves DNS, TLS, and Worker routing are all ready on that path.
-    if certificate_provisioning {
-        let deadline = Instant::now() + CUSTOM_DOMAIN_TIMEOUT;
-        let mut attempt = 0u32;
-
-        loop {
-            attempt += 1;
-            match probe_endpoint(network, hostname, role).await {
-                Ok(()) => {
-                    log(LogLine::new(
-                        LogKind::Info,
-                        DeployStage::Verifying,
-                        format!(
-                            "endpoint {hostname} became ready after {}s (attempt {attempt})",
-                            CUSTOM_DOMAIN_TIMEOUT
-                                .saturating_sub(deadline.saturating_duration_since(Instant::now()))
-                                .as_secs()
-                        ),
-                    ));
-                    break;
-                }
-                Err(error) if Instant::now() >= deadline => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "Custom Domain {hostname} did not become healthy within {} seconds",
-                            CUSTOM_DOMAIN_TIMEOUT.as_secs()
-                        )
-                    });
-                }
-                Err(_) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    log(LogLine::new(
-                        LogKind::Step,
-                        DeployStage::WaitingForEndpoint,
-                        format!(
-                            "{hostname}: waiting for DNS/TLS/Worker readiness ({}s remaining, attempt {attempt})",
-                            remaining.as_secs()
-                        ),
-                    ));
-                    tokio::time::sleep(CHECK_INTERVAL.min(remaining)).await;
-                }
-            }
-        }
+    // DNS sockets would bypass explicit SOCKS/HTTP proxy policy. Poll HTTPS
+    // through the configured transport instead; both Custom Domains and newly
+    // enabled workers.dev routes can lag behind a successful deployment API
+    // response and briefly return Cloudflare's generic 404.
+    let (timeout, interval, readiness_kind) = if certificate_provisioning {
+        (CUSTOM_DOMAIN_TIMEOUT, CHECK_INTERVAL, "DNS/TLS/Worker")
     } else {
+        (
+            WORKERS_DEV_TIMEOUT,
+            WORKERS_DEV_CHECK_INTERVAL,
+            "workers.dev routing/Worker",
+        )
+    };
+    poll_endpoint_readiness(hostname, timeout, interval, readiness_kind, log, || {
         probe_endpoint(network, hostname, role)
-            .await
-            .with_context(|| {
-                format!("endpoint {hostname} failed role-aware readiness verification")
-            })?;
-    }
+    })
+    .await
+    .with_context(|| format!("endpoint {hostname} failed role-aware readiness verification"))?;
 
     match role {
         EndpointRole::Relay => {
@@ -1462,6 +1439,61 @@ async fn verify_endpoint(
         EndpointRole::Subscription { token } => {
             ensure_proxyip_dataset(network, hostname, token, log).await?;
             verify_subscription_endpoint(network, hostname, token, log).await
+        }
+    }
+}
+
+async fn poll_endpoint_readiness<Probe, ProbeFuture>(
+    hostname: &str,
+    timeout: Duration,
+    interval: Duration,
+    readiness_kind: &str,
+    log: &mut (dyn FnMut(LogLine) + Send),
+    mut probe: Probe,
+) -> Result<()>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = Result<()>>,
+{
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match probe().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    log(LogLine::new(
+                        LogKind::Info,
+                        DeployStage::Verifying,
+                        format!(
+                            "endpoint {hostname} became ready after {}s (attempt {attempt})",
+                            started.elapsed().as_secs()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "{hostname} did not become healthy within {} seconds ({readiness_kind})",
+                        timeout.as_secs()
+                    )
+                });
+            }
+            Err(_) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                log(LogLine::new(
+                    LogKind::Step,
+                    DeployStage::WaitingForEndpoint,
+                    format!(
+                        "{hostname}: waiting for {readiness_kind} readiness ({}s remaining, attempt {attempt})",
+                        remaining.as_secs()
+                    ),
+                ));
+                tokio::time::sleep(interval.min(remaining)).await;
+            }
         }
     }
 }
@@ -2282,6 +2314,7 @@ mod tests {
     use super::*;
     use crate::credentials::{CredentialManager, MemoryCredentialStore};
     use crate::network::NetworkConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -2379,6 +2412,52 @@ mod tests {
             transaction.records[0].disposition,
             ResourceDisposition::PreExisting
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_readiness_retries_transient_cloudflare_404() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let probe_attempts = Arc::clone(&attempts);
+        let mut logs = Vec::new();
+        poll_endpoint_readiness(
+            "relay.example.workers.dev",
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            "workers.dev routing/Worker",
+            &mut |line| logs.push(line),
+            move || {
+                let attempt = probe_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if attempt < 3 {
+                        Err(anyhow::anyhow!("HTTP 404 Not Found"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(format!("{logs:?}").contains("WaitingForEndpoint"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_readiness_preserves_persistent_failure() {
+        let mut logs = Vec::new();
+        let error = poll_endpoint_readiness(
+            "relay.example.workers.dev",
+            Duration::ZERO,
+            Duration::ZERO,
+            "workers.dev routing/Worker",
+            &mut |line| logs.push(line),
+            || async { Err(anyhow::anyhow!("HTTP 404 Not Found")) },
+        )
+        .await
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("did not become healthy"));
+        assert!(rendered.contains("HTTP 404 Not Found"));
     }
 
     #[tokio::test]
