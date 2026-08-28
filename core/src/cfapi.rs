@@ -1303,16 +1303,17 @@ pub fn relay_metadata_for(
             "class_name": "VeilweaveSession"
         }
     ]);
+    // Every version must declare every provisioned class. Initial creation has
+    // an explicit state transition; later code-only versions retain the live
+    // export without replaying that transition.
+    metadata["exports"] = serde_json::json!({
+        "VeilweaveSession": {
+            "type": "durable-object",
+            "storage": "sqlite"
+        }
+    });
     if kind == VersionKind::Initial {
-        // Declarative exports create the free-plan SQLite namespace once. An
-        // update omits this block and therefore cannot replay class creation.
-        metadata["exports"] = serde_json::json!({
-            "VeilweaveSession": {
-                "type": "durable-object",
-                "storage": "sqlite",
-                "state": "created"
-            }
-        });
+        metadata["exports"]["VeilweaveSession"]["state"] = serde_json::json!("created");
     }
     Ok(metadata)
 }
@@ -1359,16 +1360,18 @@ pub fn sub_metadata_for(
             "class_name": "ProxyIpRefresher"
         }
     ]);
-    // Declarative exports are safe on every version: Cloudflare provisions the
-    // SQLite namespace when absent (including upgrades from pre-refresher Sub
-    // Workers) and matches the existing namespace on later code-only updates.
+    // Every version declares the live class. Only an initial version asks for
+    // the `created` transition; updates reconcile against the existing SQLite
+    // namespace without replaying class creation.
     metadata["exports"] = serde_json::json!({
         "ProxyIpRefresher": {
             "type": "durable-object",
-            "storage": "sqlite",
-            "state": "created"
+            "storage": "sqlite"
         }
     });
+    if kind == VersionKind::Initial {
+        metadata["exports"]["ProxyIpRefresher"]["state"] = serde_json::json!("created");
+    }
     Ok(metadata)
 }
 
@@ -1433,7 +1436,8 @@ mod tests {
             .find(|binding| binding["name"] == "SECRET_KEY")
             .unwrap();
         assert_eq!(inherited["type"], "inherit");
-        assert!(update.get("exports").is_none());
+        assert_eq!(update["exports"]["VeilweaveSession"]["storage"], "sqlite");
+        assert!(update["exports"]["VeilweaveSession"].get("state").is_none());
         assert!(!update.to_string().contains("secret"));
     }
 
@@ -1496,9 +1500,12 @@ mod tests {
         assert_eq!(binding("VEILWEAVE_NODES")["type"], "secret_text");
         assert_eq!(binding("SUBSCRIPTION_TOKEN")["type"], "inherit");
         assert_eq!(
-            topology_update["exports"]["ProxyIpRefresher"]["state"],
-            "created"
+            topology_update["exports"]["ProxyIpRefresher"]["storage"],
+            "sqlite"
         );
+        assert!(topology_update["exports"]["ProxyIpRefresher"]
+            .get("state")
+            .is_none());
 
         let token_rotation = sub_metadata_for(
             VersionKind::Update,
