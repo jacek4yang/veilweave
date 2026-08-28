@@ -1339,6 +1339,15 @@ const WORKERS_DEV_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const WORKERS_DEV_CHECK_INTERVAL: Duration = Duration::from_millis(5);
 
+#[cfg(not(test))]
+const PROXYIP_PROMOTION_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PROXYIP_PROMOTION_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const PROXYIP_PROMOTION_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const PROXYIP_PROMOTION_INTERVAL: Duration = Duration::from_millis(5);
+
 const MAX_MANAGEMENT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_RELAY_READINESS_BYTES: usize = 256 * 1024;
 
@@ -1663,11 +1672,51 @@ async fn refresh_proxyip_dataset(
     {
         bail!("proxyIP refresh returned an unusable dataset summary");
     }
-    let confirmed = proxyip_status(network, hostname, token).await?;
-    if !confirmed.is_usable() || confirmed.revision.as_deref() != Some(&refreshed.revision) {
-        bail!("proxyIP refresh completed but the promoted known-good cache could not be verified");
-    }
+    let expected_revision = refreshed.revision.clone();
+    poll_proxyip_promotion(
+        PROXYIP_PROMOTION_TIMEOUT,
+        PROXYIP_PROMOTION_INTERVAL,
+        || async {
+            let confirmed = proxyip_status(network, hostname, token).await?;
+            Ok(confirmed.is_usable()
+                && confirmed.revision.as_deref() == Some(expected_revision.as_str()))
+        },
+    )
+    .await?;
     Ok(refreshed)
+}
+
+async fn poll_proxyip_promotion<Probe, ProbeFuture>(
+    timeout: Duration,
+    interval: Duration,
+    mut probe: Probe,
+) -> Result<()>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = Result<bool>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe().await {
+            Ok(true) => return Ok(()),
+            Ok(false) if Instant::now() >= deadline => {
+                bail!(
+                    "proxyIP refresh completed but the promoted known-good cache did not become visible within {} seconds",
+                    timeout.as_secs()
+                )
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context(format!(
+                    "proxyIP refresh completed but promotion could not be verified within {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(false) | Err(_) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(interval.min(remaining)).await;
+            }
+        }
+    }
 }
 
 fn parse_proxyip_refresh_failure(
@@ -2512,6 +2561,27 @@ mod tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("did not become healthy"));
         assert!(rendered.contains("HTTP 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn proxyip_promotion_confirmation_retries_kv_visibility_lag() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let probe_attempts = attempts.clone();
+        poll_proxyip_promotion(Duration::from_secs(1), Duration::ZERO, move || {
+            let probe_attempts = probe_attempts.clone();
+            async move { Ok(probe_attempts.fetch_add(1, Ordering::SeqCst) >= 2) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn proxyip_promotion_confirmation_rejects_persistent_mismatch() {
+        let error = poll_proxyip_promotion(Duration::ZERO, Duration::ZERO, || async { Ok(false) })
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("did not become visible"));
     }
 
     #[test]
