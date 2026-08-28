@@ -4,6 +4,15 @@ All notable changes to veilweave are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-08-28
+
+### Changed
+
+- Production-hardening release with automatic authoritative ProxyIP acquisition from `https://zip.cm.edu.kg/all.json`.
+- Added transactional ProxyIP cache generations, six-hour serialized refresh, cold bootstrap, and known-good fallback.
+- Hardened subscriptions, health verification, signed UUID handling, ECH defaults, filtering, and node limits.
+- Added protected live Cloudflare E2E proving real Xray VLESS/WebSocket traffic for DIRECT and forced ProxyIP fallback paths.
+
 ## [Unreleased]
 
 ### Added
