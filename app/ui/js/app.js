@@ -533,7 +533,7 @@
         <hr class="divider" />
         <div class="section-label">${t("dp.advanced")}</div>
         <div class="grid-2">
-          <div class="field"><label class="field-label">MAX_NODES</label><input id="dp-max-nodes" type="number" min="1" max="1000" value="${esc(d.sub.settings?.max_nodes || 100)}" /></div>
+          <div class="field"><label class="field-label">MAX_NODES</label><input id="dp-max-nodes" type="number" min="1" max="200" value="${esc(d.sub.settings?.max_nodes || 100)}" /></div>
           <div class="field"><label class="field-label">FP</label><select id="dp-fingerprint">${["chrome", "firefox", "safari", "ios", "android", "edge", "random", "randomized"].map((fp) => `<option value="${fp}" ${fp === (d.sub.settings?.fingerprint || "chrome") ? "selected" : ""}>${fp}</option>`).join("")}</select></div>
           <div class="field"><label class="field-label">ECH</label><input id="dp-ech" value="${esc(d.sub.settings?.ech || "")}" placeholder="${t("dp.echPlaceholder")}" /></div>
         </div>

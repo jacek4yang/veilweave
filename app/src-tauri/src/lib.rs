@@ -1321,4 +1321,11 @@ mod tests {
         assert!(!serialized.contains("subscription_token_ref"));
         assert!(!serialized.contains("credential_ref"));
     }
+
+    #[test]
+    fn frontend_max_nodes_matches_the_worker_limit() {
+        let frontend = include_str!("../../ui/js/app.js");
+        assert!(frontend.contains(r#"id="dp-max-nodes" type="number" min="1" max="200""#));
+        assert!(!frontend.contains(r#"id="dp-max-nodes" type="number" min="1" max="1000""#));
+    }
 }
