@@ -419,8 +419,7 @@ async fn fetch_proxyip_source_inner(
     let mut init = RequestInit::new();
     init.with_method(Method::Get)
         .with_headers(headers)
-        .with_redirect(RequestRedirect::Error)
-        .with_cache(CacheMode::NoStore);
+        .with_redirect(RequestRedirect::Error);
     let request = Request::new_with_init(SOURCE_URL, &init).map_err(fetch_error)?;
     let mut response = Fetch::Request(request)
         .send_with_signal(signal)
