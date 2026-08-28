@@ -1,0 +1,170 @@
+name: Bootstrap v2.1.0 release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v2.1.0-once.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  prepare-and-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare v2.1.0 versions atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          OLD = "2.0.2"
+          NEW = "2.1.0"
+          root = Path(".")
+
+          version_path = root / "VERSION"
+          current = version_path.read_text(encoding="utf-8").strip()
+          if current not in {OLD, NEW}:
+              raise SystemExit(f"unexpected VERSION {current!r}; expected {OLD!r} or {NEW!r}")
+          version_path.write_text(NEW + "\n", encoding="utf-8")
+
+          cargo_tomls = [
+              "core/Cargo.toml",
+              "tools/Cargo.toml",
+              "relay/Cargo.toml",
+              "sub/Cargo.toml",
+              "app/src-tauri/Cargo.toml",
+          ]
+          for rel in cargo_tomls:
+              path = root / rel
+              text = path.read_text(encoding="utf-8")
+              lines = text.splitlines(keepends=True)
+              in_package = False
+              changed = False
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if stripped.startswith("[") and stripped.endswith("]"):
+                      in_package = stripped == "[package]"
+                      continue
+                  if in_package and re.match(r'^\s*version\s*=\s*"[^"]+"\s*$', line):
+                      prefix = line[: len(line) - len(line.lstrip())]
+                      newline = "\n" if line.endswith("\n") else ""
+                      lines[i] = f'{prefix}version = "{NEW}"{newline}'
+                      changed = True
+                      break
+              if not changed:
+                  raise SystemExit(f"could not update [package] version in {rel}")
+              path.write_text("".join(lines), encoding="utf-8")
+
+          lock_targets = {
+              "core/Cargo.lock": {"veilweave-core"},
+              "tools/Cargo.lock": {"veilweave-core", "veilweave-tools"},
+              "relay/Cargo.lock": {"veilweave"},
+              "sub/Cargo.lock": {"veilweave-sub"},
+              "app/src-tauri/Cargo.lock": {"veilweave-app", "veilweave-core"},
+          }
+          for rel, names in lock_targets.items():
+              path = root / rel
+              text = path.read_text(encoding="utf-8")
+              for name in names:
+                  pattern = re.compile(
+                      rf'(\[\[package\]\]\nname = "{re.escape(name)}"\nversion = ")[^"]+("\n)'
+                  )
+                  text, count = pattern.subn(rf'\g<1>{NEW}\g<2>', text, count=1)
+                  if count != 1:
+                      raise SystemExit(f"could not update {name} in {rel}")
+              path.write_text(text, encoding="utf-8")
+
+          package_json_path = root / "app/package.json"
+          package_json = json.loads(package_json_path.read_text(encoding="utf-8"))
+          package_json["version"] = NEW
+          package_json_path.write_text(json.dumps(package_json, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          package_lock_path = root / "app/package-lock.json"
+          package_lock = json.loads(package_lock_path.read_text(encoding="utf-8"))
+          package_lock["version"] = NEW
+          package_lock["packages"][""]["version"] = NEW
+          package_lock_path.write_text(json.dumps(package_lock, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          tauri_path = root / "app/src-tauri/tauri.conf.json"
+          tauri = json.loads(tauri_path.read_text(encoding="utf-8"))
+          tauri["version"] = NEW
+          tauri_path.write_text(json.dumps(tauri, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          changelog_path = root / "CHANGELOG.md"
+          changelog = changelog_path.read_text(encoding="utf-8")
+          heading = f"## [{NEW}]"
+          if heading not in changelog:
+              section = (
+                  f"## [{NEW}] - 2026-08-28\n\n"
+                  "### Changed\n\n"
+                  "- Production-hardening release with automatic authoritative ProxyIP acquisition from `https://zip.cm.edu.kg/all.json`.\n"
+                  "- Added transactional ProxyIP cache generations, six-hour serialized refresh, cold bootstrap, and known-good fallback.\n"
+                  "- Hardened subscriptions, health verification, signed UUID handling, ECH defaults, filtering, and node limits.\n"
+                  "- Added protected live Cloudflare E2E proving real Xray VLESS/WebSocket traffic for DIRECT and forced ProxyIP fallback paths.\n\n"
+              )
+              match = re.search(r"(?m)^## \[", changelog)
+              if match:
+                  changelog = changelog[:match.start()] + section + changelog[match.start():]
+              else:
+                  changelog = changelog.rstrip() + "\n\n" + section
+              changelog_path.write_text(changelog, encoding="utf-8")
+          PY
+
+          python3 scripts/check_version.py
+          git diff --check
+
+      - name: Commit release preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION CHANGELOG.md \
+            core/Cargo.toml core/Cargo.lock \
+            tools/Cargo.toml tools/Cargo.lock \
+            relay/Cargo.toml relay/Cargo.lock \
+            sub/Cargo.toml sub/Cargo.lock \
+            app/package.json app/package-lock.json \
+            app/src-tauri/Cargo.toml app/src-tauri/Cargo.lock app/src-tauri/tauri.conf.json
+          if git diff --cached --quiet; then
+            echo "v2.1.0 version preparation already present"
+          else
+            git commit -m "chore(release): prepare v2.1.0"
+            git push origin HEAD:main
+          fi
+
+      - name: Wait for main to expose the release commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected="$(git rev-parse HEAD)"
+          for _ in $(seq 1 30); do
+            actual="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+            if [ "$actual" = "$expected" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "main did not converge to release commit $expected" >&2
+          exit 1
+
+      - name: Dispatch canonical v2.1.0 release workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag=v2.1.0
+          echo "Dispatched release.yml for v2.1.0"
