@@ -376,14 +376,8 @@ async fn fetch_proxyip_source_inner(
     signal: &AbortSignal,
 ) -> Result<SourceFetch, ProxyIpError> {
     let headers = Headers::new();
-    headers
-        .set("Accept", "application/json, text/plain;q=0.8")
-        .map_err(fetch_error)?;
-    headers
-        .set("User-Agent", "Veilweave-Sub/2 proxyip-refresh")
-        .map_err(fetch_error)?;
-    if let Some(etag) = etag {
-        headers.set("If-None-Match", etag).map_err(fetch_error)?;
+    for (name, value) in source_request_headers(etag) {
+        headers.set(name, &value).map_err(fetch_error)?;
     }
     let mut init = RequestInit::new();
     init.with_method(Method::Get)
@@ -435,6 +429,14 @@ async fn fetch_proxyip_source_inner(
         bytes,
         etag: response_etag,
     })
+}
+
+fn source_request_headers(etag: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("Accept", "application/json, text/plain;q=0.8".to_string())];
+    if let Some(etag) = etag {
+        headers.push(("If-None-Match", etag.to_string()));
+    }
+    headers
 }
 
 fn fetch_error(error: impl fmt::Display) -> ProxyIpError {
@@ -1126,6 +1128,21 @@ mod tests {
         assert_eq!(
             general_purpose::STANDARD.decode(encoded).unwrap(),
             raw.as_bytes()
+        );
+    }
+
+    #[test]
+    fn source_request_uses_only_fetch_compatible_headers() {
+        assert_eq!(
+            source_request_headers(None),
+            vec![("Accept", "application/json, text/plain;q=0.8".to_string())]
+        );
+        assert_eq!(
+            source_request_headers(Some("\"generation-a\"")),
+            vec![
+                ("Accept", "application/json, text/plain;q=0.8".to_string()),
+                ("If-None-Match", "\"generation-a\"".to_string()),
+            ]
         );
     }
 
