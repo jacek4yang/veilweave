@@ -1447,7 +1447,7 @@ async fn verify_endpoint(
         }
         EndpointRole::Subscription { token } => {
             ensure_proxyip_dataset(network, hostname, token, log).await?;
-            verify_subscription_endpoint(network, hostname, token, log).await
+            verify_subscription_endpoint(network, hostname, token, timeout, interval, log).await
         }
     }
 }
@@ -1458,30 +1458,69 @@ async fn poll_endpoint_readiness<Probe, ProbeFuture>(
     interval: Duration,
     readiness_kind: &str,
     log: &mut (dyn FnMut(LogLine) + Send),
-    mut probe: Probe,
+    probe: Probe,
 ) -> Result<()>
 where
     Probe: FnMut() -> ProbeFuture,
     ProbeFuture: std::future::Future<Output = Result<()>>,
 {
+    poll_endpoint_stability(hostname, timeout, interval, readiness_kind, 1, log, probe).await
+}
+
+async fn poll_endpoint_stability<Probe, ProbeFuture, ProbeOutput>(
+    hostname: &str,
+    timeout: Duration,
+    interval: Duration,
+    readiness_kind: &str,
+    required_successes: u32,
+    log: &mut (dyn FnMut(LogLine) + Send),
+    mut probe: Probe,
+) -> Result<ProbeOutput>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = Result<ProbeOutput>>,
+{
+    if required_successes == 0 {
+        bail!("endpoint readiness requires at least one successful probe");
+    }
     let started = Instant::now();
     let deadline = started + timeout;
     let mut attempt = 0u32;
+    let mut consecutive_successes = 0u32;
     loop {
         attempt += 1;
         match probe().await {
-            Ok(()) => {
-                if attempt > 1 {
-                    log(LogLine::new(
-                        LogKind::Info,
-                        DeployStage::Verifying,
-                        format!(
-                            "endpoint {hostname} became ready after {}s (attempt {attempt})",
-                            started.elapsed().as_secs()
-                        ),
-                    ));
+            Ok(output) => {
+                consecutive_successes += 1;
+                if consecutive_successes >= required_successes {
+                    if attempt > 1 {
+                        log(LogLine::new(
+                            LogKind::Info,
+                            DeployStage::Verifying,
+                            format!(
+                                "endpoint {hostname} remained healthy after {}s ({required_successes} consecutive confirmations, attempt {attempt})",
+                                started.elapsed().as_secs()
+                            ),
+                        ));
+                    }
+                    return Ok(output);
                 }
-                return Ok(());
+                if Instant::now() >= deadline {
+                    bail!(
+                        "{hostname} did not remain healthy for {required_successes} consecutive confirmations within {} seconds ({readiness_kind})",
+                        timeout.as_secs()
+                    );
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                log(LogLine::new(
+                    LogKind::Step,
+                    DeployStage::WaitingForEndpoint,
+                    format!(
+                        "{hostname}: confirming stable {readiness_kind} readiness ({consecutive_successes}/{required_successes}, {}s remaining, attempt {attempt})",
+                        remaining.as_secs()
+                    ),
+                ));
+                tokio::time::sleep(interval.min(remaining)).await;
             }
             Err(error) if Instant::now() >= deadline => {
                 return Err(error).with_context(|| {
@@ -1492,6 +1531,7 @@ where
                 });
             }
             Err(_) => {
+                consecutive_successes = 0;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 log(LogLine::new(
                     LogKind::Step,
@@ -1505,6 +1545,32 @@ where
             }
         }
     }
+}
+
+async fn probe_subscription_endpoint(
+    network: &NetworkManager,
+    hostname: &str,
+    token: &str,
+) -> Result<usize> {
+    let response = network
+        .snapshot()
+        .client()
+        .get(format!("https://{hostname}/sub"))
+        .query(&[("token", token), ("format", "raw")])
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("subscription endpoint {hostname} is unreachable"))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("read subscription verification response")?;
+    let verified = subscription::verify_response(status, &headers, &body)
+        .with_context(|| format!("subscription endpoint {hostname} is not usable"))?;
+    Ok(verified.node_count)
 }
 
 async fn probe_endpoint(
@@ -1785,32 +1851,27 @@ async fn verify_subscription_endpoint(
     network: &NetworkManager,
     hostname: &str,
     token: &str,
+    timeout: Duration,
+    interval: Duration,
     log: &mut (dyn FnMut(LogLine) + Send),
 ) -> Result<()> {
-    let response = network
-        .snapshot()
-        .client()
-        .get(format!("https://{hostname}/sub"))
-        .query(&[("token", token), ("format", "raw")])
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("subscription endpoint {hostname} is unreachable"))?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response
-        .bytes()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .context("read subscription verification response")?;
-    let verified = subscription::verify_response(status, &headers, &body)
-        .with_context(|| format!("subscription endpoint {hostname} is not usable"))?;
+    let node_count = poll_endpoint_stability(
+        hostname,
+        timeout,
+        interval,
+        "structurally valid subscription",
+        3,
+        log,
+        || probe_subscription_endpoint(network, hostname, token),
+    )
+    .await
+    .with_context(|| format!("subscription endpoint {hostname} did not become stable"))?;
     log(LogLine::new(
         LogKind::Info,
         DeployStage::Verifying,
         format!(
             "subscription {hostname}: HTTP 200, {} structurally valid VLESS nodes",
-            verified.node_count
+            node_count
         ),
     ));
     Ok(())
@@ -2543,6 +2604,37 @@ mod tests {
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(format!("{logs:?}").contains("WaitingForEndpoint"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_stability_resets_after_a_transient_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let probe_attempts = Arc::clone(&attempts);
+        let mut logs = Vec::new();
+        poll_endpoint_stability(
+            "sub.example.workers.dev",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            "structurally valid subscription",
+            3,
+            &mut |line| logs.push(line),
+            move || {
+                let attempt = probe_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if attempt == 3 {
+                        Err(anyhow::anyhow!("HTTP 404 Not Found"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 6);
+        let rendered = format!("{logs:?}");
+        assert!(rendered.contains("confirming stable"));
+        assert!(rendered.contains("3 consecutive confirmations"));
     }
 
     #[tokio::test]
